@@ -2,7 +2,8 @@
 
 1. Load math training examples from DeepMath-103K.
 2. Prompt a small Qwen model to produce a reasoning trace and final answer.
-3. Use math-verify to parse and compare final answers.
+3. Extract the boxed answer and compare against gold with eval.utils.is_equiv
+   (same extraction/verification as eval.run_eval).
 4. Save only incorrect or unparseable model responses as JSONL.
 """
 
@@ -16,26 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from datasets import load_dataset
-from math_verify import parse, verify
 from vllm import LLM, SamplingParams
 
-
-DEFAULT_DATASET = "zwhe99/DeepMath-103K"
-DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
+from eval.utils import extract_boxed_answer, is_equiv
 
 
 SYSTEM_PROMPT = (
-    "You are a careful math solver. Solve the problem step by step. "
-    "End your response with a single line of the form: Final answer: \\boxed{...}"
+    "You are a helpful math assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
 )
-
-
-USER_PROMPT_TEMPLATE = """Solve the following math problem.
-
-Problem:
-{question}
-
-Show your reasoning, then give the final answer in \\boxed{{...}}."""
 
 
 @dataclass
@@ -47,9 +37,10 @@ class IncorrectTrace:
     model: str
     question: str
     gold_answer: str
-    predicted_answer_text: str
-    prediction: str | None
-    trace: str
+    pred_answer: str | None
+    response: str
+    correct: bool
+    num_tokens_generated: int
     verification_status: str
     difficulty: float | None = None
     topic: str | None = None
@@ -61,8 +52,7 @@ class Counters:
     generated: int = 0
     saved_incorrect: int = 0
     correct: int = 0
-    gold_parse_failed: int = 0
-    prediction_parse_failed: int = 0
+    extraction_failures: int = 0
     generation_failed: int = 0
     skipped_existing: int = 0
 
@@ -71,9 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect incorrect Qwen traces on DeepMath-103K."
     )
-    parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--dataset", default= "zwhe99/DeepMath-103K")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument(
         "--output",
         default="data/incorrect_traces/deepmath_qwen_incorrect.jsonl",
@@ -95,11 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-new-tokens", type=int, default=16384)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--dtype",
-        choices=("auto", "float16", "bfloat16", "float32"),
-        default="auto",
-    )
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
@@ -140,24 +125,15 @@ def load_seen_problem_ids(path: Path) -> set[str]:
     return seen
 
 
-def build_prompt(tokenizer: Any, question: str) -> str:
+def build_prompt(tokenizer, question, template_tok=None) -> str:
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(question=question)},
+        {"role": "user", "content": question},
     ]
-
-    if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    return (
-        f"System: {SYSTEM_PROMPT}\n\n"
-        f"User: {USER_PROMPT_TEMPLATE.format(question=question)}\n\n"
-        "Assistant:"
-    )
+    tok = template_tok or tokenizer
+    kwargs = {"tokenize": False, "add_generation_prompt": True}
+    return tok.apply_chat_template(messages, **kwargs)
 
 
 def load_llm_and_tokenizer(args: argparse.Namespace) -> tuple[LLM, Any]:
@@ -165,7 +141,6 @@ def load_llm_and_tokenizer(args: argparse.Namespace) -> tuple[LLM, Any]:
 
     llm = LLM(
         args.model,
-        dtype=args.dtype,
         tensor_parallel_size=args.tensor_parallel_size,
         seed=args.seed,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -181,66 +156,12 @@ def generate_batch(
     prompts: list[str],
     max_new_tokens: int,
     seed: int,
-) -> list[str]:
+) -> list:
     sampling_params = SamplingParams(
         max_tokens=max_new_tokens,
         seed=seed,
     )
-    outputs = llm.generate(prompts, sampling_params)
-    return [output.outputs[0].text.strip() for output in outputs]
-
-
-def extract_last_braced_value(text: str, command: str) -> str | None:
-    start = text.rfind(command)
-    if start < 0:
-        return None
-
-    brace_start = text.find("{", start + len(command))
-    if brace_start < 0:
-        return None
-
-    depth = 0
-    for idx in range(brace_start, len(text)):
-        char = text[idx]
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : idx + 1]
-    return None
-
-
-def extract_final_answer_text(trace: str) -> str:
-    for command in ("\\boxed", "\\fbox"):
-        braced = extract_last_braced_value(trace, command)
-        if braced is not None:
-            return braced
-
-    final_lines = [
-        line.strip()
-        for line in trace.splitlines()
-        if "final answer" in line.lower() or "answer:" in line.lower()
-    ]
-    if final_lines:
-        return final_lines[-1]
-
-    return trace
-
-
-def math_verify_prediction(gold_answer: str, trace: str) -> tuple[str, str, str | None]:
-    gold = parse(gold_answer)
-    if not gold:
-        return "gold_parse_failed", "", None
-
-    predicted_answer_text = extract_final_answer_text(trace)
-    prediction = parse(predicted_answer_text)
-    if not prediction:
-        return "prediction_parse_failed", predicted_answer_text, None
-
-    is_correct = verify(gold, prediction)
-    prediction_text = str(prediction[-1]) if isinstance(prediction, list) else str(prediction)
-    return ("correct" if is_correct else "incorrect"), predicted_answer_text, prediction_text
+    return llm.generate(prompts, sampling_params)
 
 
 def write_record(path: Path, record: IncorrectTrace) -> None:
@@ -259,7 +180,7 @@ def process_batch(
     prompts = [build_prompt(tokenizer, row["question"]) for _, row in rows]
 
     try:
-        traces = generate_batch(
+        outputs = generate_batch(
             llm=llm,
             prompts=prompts,
             max_new_tokens=args.max_new_tokens,
@@ -270,21 +191,23 @@ def process_batch(
         print(f"generation_failed batch_size={len(rows)} error={exc}", file=sys.stderr)
         return
 
-    for (row_index, row), trace in zip(rows, traces, strict=True):
+    for (row_index, row), output in zip(rows, outputs, strict=True):
         counters.generated += 1
         problem_id = f"{args.split}:{row_index}"
-        status, predicted_answer_text, prediction = math_verify_prediction(
-            str(row["final_answer"]), trace
-        )
 
-        if status == "gold_parse_failed":
-            counters.gold_parse_failed += 1
-            continue
-        if status == "correct":
+        completion = output.outputs[0]
+        response = completion.text
+        gold_answer = str(row["final_answer"])
+        pred_answer = extract_boxed_answer(response)
+        correct = is_equiv(pred_answer, gold_answer) if pred_answer else False
+
+        if correct:
             counters.correct += 1
             continue
-        if status == "prediction_parse_failed":
-            counters.prediction_parse_failed += 1
+
+        if pred_answer is None:
+            counters.extraction_failures += 1
+        status = "no_answer" if pred_answer is None else "incorrect"
 
         record = IncorrectTrace(
             dataset=args.dataset,
@@ -293,10 +216,11 @@ def process_batch(
             row_index=row_index,
             model=args.model,
             question=str(row["question"]),
-            gold_answer=str(row["final_answer"]),
-            predicted_answer_text=predicted_answer_text,
-            prediction=prediction,
-            trace=trace,
+            gold_answer=gold_answer,
+            pred_answer=pred_answer,
+            response=response,
+            correct=correct,
+            num_tokens_generated=len(completion.token_ids),
             verification_status=status,
             difficulty=row.get("difficulty"),
             topic=row.get("topic"),

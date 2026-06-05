@@ -16,7 +16,7 @@ import os
 import time
 from collections import defaultdict
 from vllm import LLM, SamplingParams
-from utils import (
+from .utils import (
     extract_boxed_answer,
     is_equiv,
     DATASET_REGISTRY_EVAL,
@@ -46,16 +46,13 @@ def format_prompt_raw(problem: str) -> str:
     return RAW_PROMPT + problem + RAW_COT
 
 
-def build_prompt(problem: str, prompt_mode: str, tokenizer, template_tok=None,
-                 enable_thinking=None) -> str:
+def build_prompt(problem: str, prompt_mode: str, tokenizer, template_tok=None) -> str:
     """Build a prompt string from a problem, respecting prompt_mode."""
     if prompt_mode == "raw":
         return format_prompt_raw(problem)
     messages = format_prompt_chat(problem)
     tok = template_tok or tokenizer
     kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
     return tok.apply_chat_template(messages, **kwargs)
 
 
@@ -69,10 +66,7 @@ def evaluate_model(
     max_tokens: int = 2048,
     temperature: float = 0.0,
     tensor_parallel_size: int = 1,
-    max_model_len: int | None = 4096,
     chat_template_tokenizer=None,
-    enable_thinking: bool | None = None,
-    dtype: str = "bfloat16",
     prompt_mode: str = "chat",
 ) -> dict:
     """Run evaluation and return results dict."""
@@ -81,15 +75,11 @@ def evaluate_model(
     print(f"Problems:   {len(problems)}")
     print(f"{'='*60}")
 
-    # TODO : fix_mistral_regex=True?
     llm_kwargs = dict(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
-        dtype=dtype,
     )
-    if max_model_len is not None:
-        llm_kwargs["max_model_len"] = max_model_len
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
@@ -102,8 +92,8 @@ def evaluate_model(
     prompts = []
     for p in problems:
         prompts.append(build_prompt(
-            p["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
-        ))
+            p["problem"], prompt_mode, tokenizer, template_tok)
+        )
 
     # Generate
     t0 = time.time()
@@ -275,8 +265,8 @@ def save_results(eval_output: dict, output_dir: str):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate models on math benchmarks")
     parser.add_argument(
-        "--model", nargs="+", required=True,
-        help="HuggingFace model name(s) or local checkpoint path(s)",
+        "--model", type=str, required=True,
+        help="HuggingFace model name or local checkpoint path",
     )
     parser.add_argument(
         "--dataset", default="math500", choices=list(DATASET_REGISTRY_EVAL.keys()),
@@ -291,11 +281,9 @@ def main():
                         choices=["chat", "raw"],
                         help="Prompt format: 'chat' uses system+user chat template, "
                              "'raw' uses plain CoT string (matches Power-SMC reference for base models)")
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--max_tokens", type=int, default=32000)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_model_len", type=int, default=8192,
-                        help="Max context length for vLLM KV cache. Use 0 for model default.")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
     parser.add_argument("--seed", type=int, default=42,
@@ -344,10 +332,7 @@ def main():
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=args.max_model_len or None,
         chat_template_tokenizer=chat_template_tokenizer,
-        enable_thinking=args.enable_thinking,
-        dtype=args.dtype,
         prompt_mode=args.prompt_mode,
     )
     print_report(eval_output)

@@ -127,12 +127,12 @@ def _fix_a_slash_b(string):
 
 
 def _remove_right_units(string):
-    if "\\text{ " in string:
-        splits = string.split("\\text{ ")
-        assert len(splits) == 2
-        return splits[0]
-    else:
-        return string
+    # Strip a trailing units annotation such as "\\text{ inches}" or
+    # "\\mbox{ cm}^2" (with or without the leading space inside the brace).
+    for marker in ("\\text{ ", "\\mbox{ ", "\\text{", "\\mbox{"):
+        if marker in string:
+            return string.split(marker)[0]
+    return string
 
 
 def _fix_sqrt(string):
@@ -161,6 +161,12 @@ def _strip_string(string):
     string = string.replace("^{\\circ}", "")
     string = string.replace("^\\circ", "")
     string = string.replace("\\$", "")
+    # Drop ordinal suffixes (e.g. "12^{\\text{th}}" -> "12") before unit
+    # stripping, so the "\\text{" inside them isn't mistaken for a unit.
+    string = re.sub(r"\^?\{?\\text\{(st|nd|rd|th)\}\}?", "", string)
+    # Drop a leading set-membership prefix (e.g. "x \\in [-2,7]" -> "[-2,7]").
+    # The negative lookahead keeps this from matching "\\infty".
+    string = re.sub(r"^\s*[a-zA-Z]\s*\\in(?![a-zA-Z])\s*", "", string)
     string = _remove_right_units(string)
     string = string.replace("\\%", "")
     string = string.replace(r"\%", "")
@@ -175,6 +181,10 @@ def _strip_string(string):
             string = string.split("=")[1]
     string = _fix_sqrt(string)
     string = string.replace(" ", "")
+    # Drop a trailing base subscript on base-conversion answers
+    # (e.g. "40_9" or "4210_{5}" -> "40" / "4210"). The digit lookbehind keeps
+    # this from collapsing variable subscripts like "x_2".
+    string = re.sub(r"(?<=[0-9])_\{?[0-9]+\}?$", "", string)
     string = _fix_fracs(string)
     if string == "0.5":
         string = "\\frac{1}{2}"
@@ -216,7 +226,56 @@ def _sympy_parse(expr: str):
     )
 
 
+def _read_brace_group(s: str, i: int) -> tuple[str | None, int]:
+    """Given s[i] == '{', return (inner_content, index_after_matching_'}')."""
+    if i >= len(s) or s[i] != "{":
+        return None, i
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == "{":
+            depth += 1
+        elif s[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return s[i + 1 : j], j + 1
+    return None, i
+
+
+def _parenthesize_compound_fracs(expr: str) -> str:
+    """Rewrite ``\\frac{A}{B}`` as ``((A)/(B))`` when A or B is a compound
+    expression (contains +/-), so latex2text doesn't drop the grouping
+    (e.g. ``\\frac{11+9a}{20}`` -> ``11+9a/20``). Simple fractions are left
+    untouched so they keep their existing normalization path.
+    """
+    for cmd in ("\\dfrac", "\\tfrac", "\\frac"):
+        start = 0
+        while True:
+            idx = expr.find(cmd, start)
+            if idx < 0:
+                break
+            j = idx + len(cmd)
+            while j < len(expr) and expr[j] == " ":
+                j += 1
+            num, j = _read_brace_group(expr, j)
+            if num is None:
+                start = idx + len(cmd)
+                continue
+            while j < len(expr) and expr[j] == " ":
+                j += 1
+            den, j2 = _read_brace_group(expr, j)
+            if den is None:
+                start = idx + len(cmd)
+                continue
+            if any(op in num for op in "+-") or any(op in den for op in "+-"):
+                expr = expr[:idx] + f"(({num})/({den}))" + expr[j2:]
+                start = idx  # re-scan to catch fracs nested in num/den
+            else:
+                start = idx + len(cmd)
+    return expr
+
+
 def _parse_latex(expr: str) -> str:
+    expr = _parenthesize_compound_fracs(expr)
     expr = expr.replace("\\tfrac", "\\frac")
     expr = expr.replace("\\dfrac", "\\frac")
     expr = expr.replace("\\frac", " \\frac")
@@ -566,6 +625,33 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
             "level": level,
             "subject": row["subject"],
             "unique_id": row.get("unique_id", ""),
+        })
+    return out
+
+
+@register_dataset_eval("deepmath")
+def load_deepmath_eval(levels: list[int] | None = None) -> list[dict]:
+    """Load zwhe99/DeepMath-103K for evaluation (one row per question).
+
+    DeepMath is a train-only split, so this evaluates on training problems.
+    ``difficulty`` (a float) is rounded into the integer ``level`` field so the
+    by-level report and ``--levels`` filter behave like the other datasets, and
+    ``topic`` populates ``subject``.
+    """
+    ds = load_dataset("zwhe99/DeepMath-103K", split="train")
+    out = []
+    for idx, row in enumerate(ds):
+        difficulty = row.get("difficulty")
+        level = int(round(float(difficulty))) if difficulty is not None else 0
+        if levels and level not in levels:
+            continue
+        out.append({
+            "problem": row["question"],
+            "answer": str(row["final_answer"]),
+            "solution": "",
+            "level": level,
+            "subject": row.get("topic") or "",
+            "unique_id": f"deepmath_{idx}",
         })
     return out
 
