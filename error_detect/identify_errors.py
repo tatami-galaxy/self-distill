@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -106,12 +105,6 @@ def parse_args() -> argparse.Namespace:
     # Judge: stronger model on a local vLLM OpenAI-compatible server.
     parser.add_argument("--judge-port", type=int, required=True)
     parser.add_argument("--judge-model", required=True)
-    parser.add_argument(
-        "--judge-concurrency",
-        type=int,
-        default=16,
-        help="Max in-flight judge requests per batch.",
-    )
     return parser.parse_args()
 
 
@@ -225,30 +218,17 @@ def make_judge(args: argparse.Namespace):
     model = args.judge_model
     print(f"Judge model: {model}", file=sys.stderr)
 
-    def judge_one(messages: list[dict[str, str]]) -> str:
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail soft, treat as parse failure
-            print(f"judge request failed: {exc}", file=sys.stderr)
-            return ""
+    def judge(messages: list[dict[str, str]]) -> str:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
         # If the judge is a reasoning model, chain-of-thought lands in
         # message.reasoning_content (with a vLLM reasoning parser) or inline as
         # <think>...</think> in content; parse_critique tolerates both.
         return resp.choices[0].message.content or ""
 
-    def judge_batch(batch_messages: list[list[dict[str, str]]]) -> list[str]:
-        # The vLLM OpenAI server batches concurrent requests internally, so we
-        # just fire them in parallel; pool.map preserves input order.
-        if not batch_messages:
-            return []
-        workers = min(len(batch_messages), args.judge_concurrency)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(judge_one, batch_messages))
-
-    return judge_batch
+    return judge
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +395,9 @@ def main() -> None:
             self_texts = self_critique_batch(
                 llm, [item.self_prompt for item in batch], args
             )
-            judge_texts = judge([item.messages for item in batch])
-            print(judge_texts[0])
-            print(len(judge_texts))
-            quit()
-            for item, self_text, judge_text in zip(
-                batch, self_texts, judge_texts, strict=True
-            ):
-                self_crit = parse_critique(self_text, len(item.steps))
+            for item, text in zip(batch, self_texts, strict=True):
+                self_crit = parse_critique(text, len(item.steps))
+                judge_text = judge(item.messages)
                 judge_crit = parse_critique(judge_text, len(item.steps))
                 record = score_and_record(item, self_crit, judge_crit, args, counters)
                 out.write(json.dumps(record, ensure_ascii=False) + "\n")
