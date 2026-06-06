@@ -18,7 +18,7 @@ from collections import defaultdict
 from vllm import LLM, SamplingParams
 from .utils import (
     extract_boxed_answer,
-    is_equiv,
+    grade_answer,
     DATASET_REGISTRY_EVAL,
 )
 
@@ -64,7 +64,6 @@ def evaluate_model(
     model_name: str,
     problems: list[dict],
     max_tokens: int = 2048,
-    temperature: float = 0.0,
     tensor_parallel_size: int = 1,
     chat_template_tokenizer=None,
     prompt_mode: str = "chat",
@@ -83,7 +82,6 @@ def evaluate_model(
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
-        temperature=temperature,
         max_tokens=max_tokens,
     )
 
@@ -107,7 +105,7 @@ def evaluate_model(
         completion = output.outputs[0]
         response = completion.text
         pred_answer = extract_boxed_answer(response)
-        correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
+        correct = grade_answer(pred_answer, prob["answer"], prob.get("problem", ""))
         results.append({
             **prob,
             "response": response,
@@ -282,7 +280,6 @@ def main():
                         help="Prompt format: 'chat' uses system+user chat template, "
                              "'raw' uses plain CoT string (matches Power-SMC reference for base models)")
     parser.add_argument("--max_tokens", type=int, default=32000)
-    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
@@ -330,7 +327,6 @@ def main():
         model_name=args.model,
         problems=problems,
         max_tokens=args.max_tokens,
-        temperature=args.temperature,
         tensor_parallel_size=args.tensor_parallel_size,
         chat_template_tokenizer=chat_template_tokenizer,
         prompt_mode=args.prompt_mode,

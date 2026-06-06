@@ -440,13 +440,106 @@ def _split_tuple(expr: str):
     return elems
 
 
-def is_equiv(pred: str, gold: str) -> bool:
-    """Check equivalence using the Power-SMC reference grader.
+_AFFIRMATIVE = {"yes", "true"}
+_NEGATIVE = {"no", "false"}
 
-    Two-tier normalization:
-    1. Hendrycks MATH normalization (fast string match)
-    2. Grader normalization + sympy simplification (fallback)
+
+def _canonical_bool(s: str | None) -> bool | None:
+    """Map an affirmative/negative answer to a bool, else None.
+
+    Handles ``\\text{Yes}``, ``True``, and leading-clause forms like
+    ``"Yes, the matrix is positive semidefinite"``. Numeric proxies such as
+    ``1``/``0`` are deliberately *not* treated as booleans.
     """
+    if s is None:
+        return None
+    t = re.sub(r"\\(?:text|mathrm|mbox|textbf)\s*\{([^}]*)\}", r"\1", s)
+    t = t.strip().strip("$").strip().lower()
+    t = t.split(",")[0].strip().rstrip(".")
+    if t in _AFFIRMATIVE:
+        return True
+    if t in _NEGATIVE:
+        return False
+    return None
+
+
+def _canonical_infinity(s: str | None) -> str | None:
+    """Map a bare (optionally signed) infinity answer to "+inf"/"-inf", else None.
+
+    Matches the whole answer only, so compound expressions like ``\\infty/2``
+    are left to the normal grader. Unsigned infinity is treated as ``+inf``
+    (``\\infty`` == ``+\\infty``); comparing here avoids sympy's ``oo - oo = nan``.
+    """
+    if s is None:
+        return None
+    t = s.strip().strip("$").replace("\\left", "").replace("\\right", "").strip().lower()
+    m = re.fullmatch(r"([+-]?)\s*(?:\\infty|\\inf|infinity|inf|oo)", t)
+    if m is None:
+        return None
+    return "-inf" if m.group(1) == "-" else "+inf"
+
+
+# Tokens that make a scalar sympy comparison unsound: tuples/lists, equations,
+# and matrix/transpose-valued answers (sympy treats the symbols as commuting
+# scalars, which spuriously equates e.g. left- vs right-pseudoinverse formulas).
+_LATEX_SYMPY_UNSAFE = (
+    ",", ";", "=", "^t", "^{t}", "\\top", "\\begin{",
+    "pmatrix", "bmatrix", "vmatrix", "\\mathbf", "\\mathbb", "\\det",
+)
+
+
+def _latex_sympy_equiv(pred: str, gold: str) -> bool:
+    """Equivalence via a real LaTeX parser + sympy (handles notation the
+    string grader can't, e.g. ``\\binom{2n}{n}`` == ``(2n)!/(n!)^2`` and
+    commutative products like ``\\pi\\sqrt 2`` == ``\\sqrt 2\\pi``).
+
+    Used only as an additional True-path, so it can never turn a match into a
+    non-match. Skips answers (tuples, equations, matrices) where comparing
+    sympy scalars would be unsound. Any parse/simplify failure means "not
+    equivalent".
+    """
+    for s in (pred, gold):
+        low = s.lower()
+        if any(tok in low for tok in _LATEX_SYMPY_UNSAFE):
+            return False
+    try:
+        from sympy.parsing.latex import parse_latex
+    except Exception:
+        return False
+    try:
+        diff = sympy.simplify(parse_latex(gold) - parse_latex(pred))
+        return diff == 0
+    except Exception:
+        return False
+
+
+def is_equiv(pred: str, gold: str) -> bool:
+    """Check answer equivalence.
+
+    Order of checks:
+    1. Affirmative/negative synonyms (Yes == True, No == False).
+    2. The Power-SMC reference grader (Hendrycks + grader/sympy normalization).
+    3. A LaTeX-parser + sympy fallback for notation the string grader misses.
+    """
+    if pred is None:
+        return False
+
+    bp, bg = _canonical_bool(pred), _canonical_bool(gold)
+    if bp is not None and bg is not None:
+        return bp == bg
+
+    ip, ig = _canonical_infinity(pred), _canonical_infinity(gold)
+    if ip is not None and ig is not None:
+        return ip == ig
+
+    if _is_equiv_core(pred, gold):
+        return True
+
+    return _latex_sympy_equiv(pred, gold)
+
+
+def _is_equiv_core(pred: str, gold: str) -> bool:
+    """The two-tier Power-SMC reference grader (string + sympy normalization)."""
     if pred is None:
         return False
 
@@ -489,6 +582,66 @@ def is_equiv(pred: str, gold: str) -> bool:
                     return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Multiple-choice handling
+# ---------------------------------------------------------------------------
+
+_MC_MARKER = re.compile(r"\(([A-E])\)")
+
+
+def parse_mc_options(problem: str) -> dict[str, str]:
+    """Parse an inline multiple-choice option list into a {letter: value} map.
+
+    Handles AMC-style options such as
+    ``\\text{(A)}\\ 9\\qquad\\text{(B)}\\ 10 ...``. Returns {} unless the
+    problem contains at least three options whose letters run consecutively
+    from A (a guard against matching stray ``(A)`` / ``(B)`` references).
+    """
+    markers = list(_MC_MARKER.finditer(problem))
+    if len(markers) < 3:
+        return {}
+    letters = [m.group(1) for m in markers]
+    if letters != [chr(ord("A") + i) for i in range(len(letters))]:
+        return {}
+
+    options: dict[str, str] = {}
+    for i, m in enumerate(markers):
+        start = m.end()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(problem)
+        value = problem[start:end]
+        value = re.sub(r"\\text\{|\\textbf\{|\\mathrm\{|\\mathbf\{", "", value)
+        value = value.replace("\\qquad", " ").replace("\\quad", " ")
+        value = value.replace("\\,", " ").replace("\\ ", " ")
+        value = value.replace("\\(", "").replace("\\)", "").replace("$", "")
+        value = value.strip().lstrip("}").strip().strip(".,;:").strip()
+        if value and len(value) < 60:
+            options[m.group(1)] = value
+    return options if len(options) >= 3 else {}
+
+
+def grade_answer(pred: str | None, gold: str, problem: str = "") -> bool:
+    """Equivalence check that also reconciles multiple-choice letters/values.
+
+    Falls back to plain :func:`is_equiv`. When ``problem`` carries a parseable
+    option list, a lone option letter (in either the prediction or the gold) is
+    expanded to its value first, so the model is credited whether it answered
+    with the letter or the underlying value.
+    """
+    if pred is None:
+        return False
+    if is_equiv(pred, gold):
+        return True
+
+    options = parse_mc_options(problem) if problem else {}
+    if options:
+        def expand(x: str) -> str:
+            return options.get(x.strip().strip("$").strip(), x)
+
+        if is_equiv(expand(pred), expand(gold)):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
