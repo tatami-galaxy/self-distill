@@ -1,0 +1,101 @@
+"""Shared helpers for OPD/OPSD token-level credit assignment.
+
+The per-token credit is the sampled-token log-ratio
+
+    A_t = log pi_teacher(y_t | context) - log pi_student(y_t | x, y_<t)
+
+For OPD the teacher is a separate model; only the teacher swaps for OPSD. Both
+log-probs are read off vLLM ``prompt_logprobs`` (a teacher-forcing prefill at
+temperature 1) so the student and teacher are scored apples-to-apples at T=1,
+regardless of the sampling temperature used to draw the rollout. See design.md.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
+
+# Same prompt the eval/collection pipelines use (eval/run_eval.py).
+SYSTEM_PROMPT = (
+    "You are a helpful math assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
+)
+
+
+def build_prompt_ids(
+    tokenizer: Any, problem: str, enable_thinking: bool = True
+) -> list[int]:
+    """Render system+user chat prompt to token ids (with generation prompt).
+
+    ``enable_thinking`` is forwarded to the chat template when supported (Qwen3);
+    templates that don't accept it are called without it.
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem},
+    ]
+    # transformers 5.x returns a BatchEncoding (dict) when tokenize=True; older
+    # versions return a plain list. return_dict=False normalizes to a list, and we
+    # still guard for the dict form below.
+    kwargs = {"tokenize": True, "add_generation_prompt": True, "return_dict": False}
+    try:
+        ids = tokenizer.apply_chat_template(
+            messages, enable_thinking=enable_thinking, **kwargs
+        )
+    except TypeError:
+        ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
+        )
+    if isinstance(ids, dict):  # BatchEncoding
+        ids = ids["input_ids"]
+    return [int(t) for t in ids]
+
+
+def token_strings(tokenizer: Any, token_ids: list[int]) -> list[str]:
+    """Per-token surface strings for display (single-token decode).
+
+    Keyed to ``token_id``; the numeric signal is exact regardless. Rare
+    multi-byte chars split across tokens may render imperfectly — acceptable for
+    visualization only.
+    """
+    return tokenizer.batch_decode([[t] for t in token_ids])
+
+
+def score_prompt_logprobs(
+    llm: LLM,
+    sequences: list[tuple[list[int], int]],
+    topk: int,
+) -> list[list[dict]]:
+    """Teacher-force score a batch of token sequences at T=1.
+
+    Each item in ``sequences`` is ``(full_ids, start)`` where ``full_ids`` is
+    ``prompt_ids + completion_ids`` and ``start = len(prompt_ids)``. Returns, per
+    sequence, a list (length ``len(full_ids) - start``) of per-position dicts:
+
+        {"chosen_lp": float, "topk": [[token_id, logprob], ...]}
+
+    ``chosen_lp`` is the log-prob of the actually-present token at that position
+    (vLLM always includes it in ``prompt_logprobs`` even if outside the top-k).
+    """
+    sampling = SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=topk)
+    prompts = [TokensPrompt(prompt_token_ids=ids) for ids, _ in sequences]
+    outputs = llm.generate(prompts, sampling)
+
+    results: list[list[dict]] = []
+    for (full_ids, start), output in zip(sequences, outputs, strict=True):
+        plps = output.prompt_logprobs  # len == len(full_ids); plps[0] is None
+        per_token: list[dict] = []
+        for pos in range(start, len(full_ids)):
+            dist = plps[pos]
+            tid = full_ids[pos]
+            chosen_lp = float(dist[tid].logprob)
+            ranked = sorted(
+                ((int(k), float(v.logprob)) for k, v in dist.items()),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:topk]
+            per_token.append({"chosen_lp": chosen_lp, "topk": [[k, lp] for k, lp in ranked]})
+        results.append(per_token)
+    return results
