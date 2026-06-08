@@ -539,7 +539,7 @@ def is_equiv(pred: str, gold: str) -> bool:
 
 
 def _is_equiv_core(pred: str, gold: str) -> bool:
-    """The two-tier Power-SMC reference grader (string + sympy normalization)."""
+    """The two-tier grader (string + sympy normalization)."""
     if pred is None:
         return False
 

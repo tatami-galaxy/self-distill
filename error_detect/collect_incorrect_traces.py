@@ -2,8 +2,9 @@
 
 1. Load math training examples from DeepMath-103K.
 2. Prompt a small Qwen model to produce a reasoning trace and final answer.
-3. Extract the boxed answer and compare against gold with eval.utils.is_equiv
-   (same extraction/verification as eval.run_eval).
+3. Extract the boxed answer and compare against gold with eval.utils.grade_answer
+   (same extraction/verification as eval.run_eval, incl. multiple-choice,
+   boolean, infinity, and LaTeX-sympy handling).
 4. Save only incorrect or unparseable model responses as JSONL.
 """
 
@@ -19,7 +20,7 @@ from typing import Any
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
-from eval.utils import extract_boxed_answer, is_equiv
+from eval.utils import extract_boxed_answer, grade_answer
 
 
 SYSTEM_PROMPT = (
@@ -72,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-samples",
         type=int,
-        default=1000,
+        default=10000,
         help="Maximum dataset rows to attempt after start-index filtering.",
     )
     parser.add_argument(
@@ -82,8 +83,7 @@ def parse_args() -> argparse.Namespace:
         help="Stop once this many incorrect traces have been saved.",
     )
     parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-new-tokens", type=int, default=16384)
+    parser.add_argument("--max-new-tokens", type=int, default=32000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--tensor-parallel-size",
@@ -169,7 +169,7 @@ def write_record(path: Path, record: IncorrectTrace) -> None:
         handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
 
-def process_batch(
+def process_rows(
     args: argparse.Namespace,
     llm: LLM,
     tokenizer: Any,
@@ -177,6 +177,7 @@ def process_batch(
     rows: list[tuple[int, dict[str, Any]]],
     counters: Counters,
 ) -> None:
+    """Generate for all rows in one vLLM call, then score and save incorrects."""
     prompts = [build_prompt(tokenizer, row["question"]) for _, row in rows]
 
     try:
@@ -188,7 +189,7 @@ def process_batch(
         )
     except Exception as exc:  # noqa: BLE001
         counters.generation_failed += len(rows)
-        print(f"generation_failed batch_size={len(rows)} error={exc}", file=sys.stderr)
+        print(f"generation_failed n={len(rows)} error={exc}", file=sys.stderr)
         return
 
     for (row_index, row), output in zip(rows, outputs, strict=True):
@@ -199,7 +200,7 @@ def process_batch(
         response = completion.text
         gold_answer = str(row["final_answer"])
         pred_answer = extract_boxed_answer(response)
-        correct = is_equiv(pred_answer, gold_answer) if pred_answer else False
+        correct = grade_answer(pred_answer, gold_answer, str(row["question"]))
 
         if correct:
             counters.correct += 1
@@ -228,6 +229,12 @@ def process_batch(
         write_record(output_path, record)
         counters.saved_incorrect += 1
 
+        if (
+            args.target_incorrect is not None
+            and counters.saved_incorrect >= args.target_incorrect
+        ):
+            break
+
 
 def print_summary(counters: Counters) -> None:
     print(json.dumps(asdict(counters), indent=2), file=sys.stderr)
@@ -246,7 +253,7 @@ def main() -> None:
     stop_index = min(stop_index, len(dataset))
 
     counters = Counters()
-    batch: list[tuple[int, dict[str, Any]]] = []
+    rows: list[tuple[int, dict[str, Any]]] = []
 
     for row_index in range(args.start_index, stop_index):
         row = dict(dataset[row_index])
@@ -259,25 +266,10 @@ def main() -> None:
         if "question" not in row or "final_answer" not in row:
             raise KeyError("Expected dataset columns 'question' and 'final_answer'.")
 
-        batch.append((row_index, row))
-        if len(batch) < args.batch_size:
-            continue
+        rows.append((row_index, row))
 
-        process_batch(args, llm, tokenizer, output_path, batch, counters)
-        batch = []
-        print_summary(counters)
-
-        if (
-            args.target_incorrect is not None
-            and counters.saved_incorrect >= args.target_incorrect
-        ):
-            break
-
-    if batch and (
-        args.target_incorrect is None
-        or counters.saved_incorrect < args.target_incorrect
-    ):
-        process_batch(args, llm, tokenizer, output_path, batch, counters)
+    if rows:
+        process_rows(args, llm, tokenizer, output_path, rows, counters)
 
     print_summary(counters)
 
