@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_EVAL))
     p.add_argument("--levels", nargs="*", type=int, default=None)
     p.add_argument("--num-samples", type=int, default=64)
-    p.add_argument("--temperature", type=float, default=1.0)  # trl grpo config default
-    p.add_argument("--top-p", type=float, default=1.0) # trl grpo config default
+    p.add_argument("--temperature", type=float, default=1.0)  # trl grpoconfig default
+    p.add_argument("--top-p", type=float, default=1.0) # trl grpoconfig default
     p.add_argument("--max-tokens", type=int, default=32000)
     p.add_argument("--topk", type=int, default=20, help="top-k logprobs to store per token")
     p.add_argument("--seed", type=int, default=42)
@@ -144,7 +144,7 @@ def main() -> None:
             comp_ids = list(comp.token_ids)
             if not comp_ids:  # empty generation
                 continue
-
+            # sampled (temp 1.0) token lp, topk lp
             per_token = read_generation_logprobs(output, topk=args.topk)
             strs = token_strings(tokenizer, comp_ids)
             tokens = [

@@ -72,6 +72,8 @@ def read_generation_logprobs(output: Any, topk: int) -> list[dict]:
     per_token: list[dict] = []
     for tid, dist in zip(token_ids, pos_logprobs, strict=True):
         chosen_lp = float(dist[tid].logprob)
+        # vLLM returns the top-k PLUS the sampled token when it falls outside the
+        # top-k (dict size topk+1), and dict order isn't guaranteed.
         ranked = sorted(
             ((int(k), float(v.logprob)) for k, v in dist.items()),
             key=lambda kv: kv[1],
