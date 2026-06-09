@@ -76,8 +76,21 @@ logprobs (both models, aligned on the union of supports) regardless — cheap in
 
 ## Scoring conventions
 
-- **Score at T=1, sample at T>0.** Rollouts are sampled with temperature; KL/ratio is
-  computed on the models' true (T=1) distributions, consistently for both models.
+- **Sample AND score at T=1, top_p=1 (no truncation).** On-policy credit requires the
+  rollout to be drawn from the *same* π_θ whose log-prob enters A_t, so the sampled A_t
+  is an unbiased estimate of −KL(π_θ‖π_T). Any temperature/top_p/top_k truncation biases
+  that estimate — this is why TRL GRPO and on-policy RL default to T=1, top_p=1. (Earlier
+  T=0.6/top_p=0.95 was the Qwen inference-recommended setting; it sharpens/truncates the
+  sampling distribution and creates a sampling-vs-scoring mismatch — wrong for this study.)
+  Tradeoff: T=1 rollouts are messier (more repetition/derailing, more max_tokens
+  truncation) but faithfully reflect the on-policy distribution training would see.
+- **Student log-probs come from the generation output, not a re-score.** At T=1, top_p=1
+  vLLM's generation log-probs already equal the true (T=1) distribution — verified
+  identical to a `prompt_logprobs` re-score (max abs diff ≈ 0.23 on a single token from
+  prefill-vs-decode kernel numerics; mean ≈ 0.01, negligible vs the ±17 A_t scale). So
+  no separate student scoring pass — more efficient, and arguably more faithful (it's the
+  exact distribution the token was sampled from). The teacher still uses `prompt_logprobs`
+  (it teacher-forces the student's tokens; no generation).
 - **Same prompt rendering.** Same-family ⇒ reuse the student's rendered prompt
   verbatim for the teacher. Only completion tokens get a signal (prompt is context).
 - **Sign:** A_t > 0 ⇒ teacher endorses the sampled token more than student

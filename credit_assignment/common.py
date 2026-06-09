@@ -63,6 +63,24 @@ def token_strings(tokenizer: Any, token_ids: list[int]) -> list[str]:
     return tokenizer.batch_decode([[t] for t in token_ids])
 
 
+def read_generation_logprobs(output: Any, topk: int) -> list[dict]:
+    """Per-token ``{chosen_lp, topk}`` from a vLLM *generation* output.
+    """
+    comp = output.outputs[0]
+    token_ids = comp.token_ids
+    pos_logprobs = comp.logprobs  # list[dict[int, Logprob]], len == len(token_ids)
+    per_token: list[dict] = []
+    for tid, dist in zip(token_ids, pos_logprobs, strict=True):
+        chosen_lp = float(dist[tid].logprob)
+        ranked = sorted(
+            ((int(k), float(v.logprob)) for k, v in dist.items()),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:topk]
+        per_token.append({"chosen_lp": chosen_lp, "topk": [[k, lp] for k, lp in ranked]})
+    return per_token
+
+
 def score_prompt_logprobs(
     llm: LLM,
     sequences: list[tuple[list[int], int]],
