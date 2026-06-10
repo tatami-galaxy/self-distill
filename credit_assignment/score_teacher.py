@@ -13,21 +13,31 @@ The student rollout is reused as-is; only the teacher changes. Full-distribution
 KL is deferred (top-k log-probs for both models are stored for that later).
 
 Run from the repo root, e.g.:
+    PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES=6,7 \
     python -m credit_assignment.score_teacher \
         --rollouts data/credit_assignment/rollouts_Qwen_Qwen3-1.7B_deepmath.jsonl \
-        --teacher Qwen/Qwen3-30B-A3B-Thinking-2507 --tensor-parallel-size 2
+        --teacher Qwen/Qwen3-30B-A3B-Thinking-2507 --tensor-parallel-size 2 \
+        --max-model-len 33000
+
+Notes for the 30B-A3B MoE teacher:
+  - PATH must include the venv bin so FlashInfer's JIT can find `ninja`.
+  - Needs tensor-parallel-size >= 2 (weights ~60 GB) and leave headroom for the
+    FlashInfer workspace + CUDA-graph capture, hence the 0.80 memory default.
+  - --max-model-len must exceed the longest prompt+completion in the rollouts
+    (rollouts go up to 32k generated tokens).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
 from vllm import LLM
 
-from credit_assignment.common import score_prompt_logprobs
+from credit_assignment.common import expected_advantage, score_prompt_logprobs
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,8 +48,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-batch-size", type=int, default=8)
     p.add_argument("--output", default=None,
                    help="JSONL path (default advantages_opd_<teacher>_revkl_<rolloutstem>.jsonl)")
-    p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--tensor-parallel-size", type=int, default=2)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.80,
+                   help="Kept below ~0.85 to leave room for the FlashInfer MoE "
+                        "workspace + CUDA-graph capture (0.9 OOMs the 30B-A3B teacher).")
     p.add_argument("--max-model-len", type=int, default=None)
     return p.parse_args()
 
@@ -103,10 +115,30 @@ def main() -> None:
                     teacher_lp = tscore["chosen_lp"]
                     tok["teacher_lp"] = teacher_lp
                     tok["teacher_topk"] = tscore["topk"]
-                    tok["A_t"] = teacher_lp - tok["student_lp"]
+                    # Sampled-token advantage (1-sample REINFORCE coefficient).
+                    a_t = teacher_lp - tok["student_lp"]
+                    tok["A_t"] = a_t
+                    # Student-weighted expected advantage = -KL_t: the per-position
+                    # pull the *dense* OPD/OPSD gradient responds to (top-k approx).
+                    abar = expected_advantage(tok.get("student_topk"), tscore["topk"])
+                    tok["Abar_t"] = abar
+                    # Dense-training logit change of the sampled token (proportional;
+                    # learning rate dropped): pi_student(y_t) * (A_t - Abar_t). Sign =
+                    # whether this token is up/down-weighted under training.
+                    tok["reweight_t"] = (
+                        math.exp(tok["student_lp"]) * (a_t - abar)
+                        if abar is not None else None
+                    )
                 rec["teacher_model"] = args.teacher
-                rec["credit"] = {"method": "opd", "divergence": "reverse_kl",
-                                 "signal": "sampled_token_logratio"}
+                rec["credit"] = {
+                    "method": "opd",
+                    "divergence": "reverse_kl",
+                    "signals": {
+                        "A_t": "sampled-token log-ratio  log pi_T(y_t) - log pi_S(y_t)",
+                        "Abar_t": "sum_v pi_S(v)[log pi_T(v) - log pi_S(v)] = -KL_t (top-k approx)",
+                        "reweight_t": "pi_S(y_t) * (A_t - Abar_t): dense-training reweight of y_t",
+                    },
+                }
                 handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 n_written += 1
 

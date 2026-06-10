@@ -12,6 +12,7 @@ regardless of the sampling temperature used to draw the rollout. See design.md.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from vllm import LLM, SamplingParams
@@ -81,6 +82,34 @@ def read_generation_logprobs(output: Any, topk: int) -> list[dict]:
         )[:topk]
         per_token.append({"chosen_lp": chosen_lp, "topk": [[k, lp] for k, lp in ranked]})
     return per_token
+
+
+def expected_advantage(
+    student_topk: list[list], teacher_topk: list[list]
+) -> float | None:
+    """Top-k approximation of the student-weighted expected advantage
+
+        Abar_t = sum_v pi_student(v) * (log pi_teacher(v) - log pi_student(v))
+               = -KL(pi_student || pi_teacher)_t        (<= 0)
+
+    This is the per-position quantity the *dense* OPD/OPSD gradient responds to
+    (the sampled-token A_t is its unbiased 1-sample estimate). Summed over the
+    student's top-k support (where pi_student concentrates its mass). A
+    student-top-k token absent from the teacher's top-k has its teacher log-prob
+    floored at the teacher's k-th (smallest) value — an upper bound on the true
+    value, so this slightly *under*-estimates the KL magnitude. The student tail
+    outside top-k is dropped (small mass). Returns None if either top-k is empty.
+    """
+    if not student_topk or not teacher_topk:
+        return None
+    teacher_lp = {int(tid): lp for tid, lp in teacher_topk}
+    teacher_floor = min(lp for _, lp in teacher_topk)
+    abar = 0.0
+    for tid, s_lp in student_topk:
+        p = math.exp(s_lp)
+        t_lp = teacher_lp.get(int(tid), teacher_floor)
+        abar += p * (t_lp - s_lp)
+    return abar
 
 
 def score_prompt_logprobs(

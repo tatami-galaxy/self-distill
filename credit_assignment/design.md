@@ -96,6 +96,36 @@ logprobs (both models, aligned on the union of supports) regardless — cheap in
 - **Sign:** A_t > 0 ⇒ teacher endorses the sampled token more than student
   (reinforce); A_t < 0 ⇒ teacher dislikes it (suppress / "blame").
 
+## Three per-token signals (what training would actually do)
+
+The sampled-token A_t is the credit for *this* rollout (the 1-sample REINFORCE
+coefficient). But the *dense* OPD/OPSD loss (GKD/GOLD/TM reverse-KL) has gradient
+
+    ∇L_t = -Σ_v π_S(v) A_t(v) ∇log π_S(v),   A_t(v) = log π_T(v) - log π_S(v)
+
+so the per-position quantity it responds to is the **student-weighted expected
+advantage**
+
+    Ābar_t = Σ_v π_S(v) A_t(v) = -KL(π_S ‖ π_T)_t   (≤ 0; the full per-token reverse KL).
+
+A_t(y_t) is the unbiased 1-sample estimate of Ābar_t (equal in expectation, noisy
+per-token). The sampled token's *actual* logit change under dense training is
+
+    Δz_{y_t} ∝ π_S(y_t) · (A_t - Ābar_t)        ("reweight_t")
+
+— note it needs Ābar_t as a baseline, because softmax reweighting is competitive
+(a token with A_t>0 but below the mean is down-weighted). So we store three signals
+per token (`score_teacher.py`), selectable in `visualize.py --color-by`:
+- **A_t** — sampled-token advantage (this trajectory's realized credit).
+- **Abar_t** — expected advantage = −KL_t (dense per-position pull; top-k approx via
+  `common.expected_advantage`, summing over the student's top-k support, teacher
+  log-prob floored at its k-th value for tokens missing from the teacher top-k).
+- **reweight_t** — π_S(y_t)·(A_t − Ābar_t), how much the sampled token is up/down-weighted.
+
+Abar_t/reweight_t need both models' top-k → **keep top-k stored** (reverses the lean
+toward sampled-only). Exact (untruncated) Abar_t needs a full-logit HF pass; the top-k
+sum is an approximation — measure sensitivity to k.
+
 ## Forward-looking caveats (training phase, not now)
 
 - In OPSD the teacher shares weights with the student ⇒ A_t's teacher is

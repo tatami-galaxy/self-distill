@@ -30,8 +30,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-incorrect", type=int, default=4)
     p.add_argument("--problem-ids", nargs="*", default=None,
                    help="Explicit problem_ids to render (overrides n-correct/n-incorrect).")
+    p.add_argument("--color-by", default="A_t",
+                   choices=["A_t", "Abar_t", "reweight_t"],
+                   help="Per-token field to color by: A_t (sampled-token advantage), "
+                        "Abar_t (expected advantage = -KL_t, dense per-position pull), "
+                        "reweight_t (dense-training reweight of the sampled token).")
     p.add_argument("--clip-percentile", type=float, default=95.0,
-                   help="Per-sequence |A_t| percentile mapped to full color saturation.")
+                   help="Per-sequence percentile of |signal| mapped to full color saturation.")
     p.add_argument("--output", default=None, help="HTML path (default alongside advantages).")
     return p.parse_args()
 
@@ -81,20 +86,25 @@ def color_for(a: float, scale: float) -> str:
     return f"rgb({r},{g},{b})"
 
 
-def render_tokens(record: dict, clip_q: float) -> str:
+def _fmt(x) -> str:
+    return f"{x:+.3f}" if isinstance(x, (int, float)) else "n/a"
+
+
+def render_tokens(record: dict, clip_q: float, field: str) -> str:
     tokens = record["tokens"]
-    a_vals = [t["A_t"] for t in tokens]
-    scale = _percentile([abs(a) for a in a_vals], clip_q)
+    vals = [t.get(field) for t in tokens]
+    scale = _percentile([abs(v) for v in vals if isinstance(v, (int, float))], clip_q)
 
     spans = []
     for t in tokens:
-        a = t["A_t"]
-        bg = color_for(a, scale)
+        v = t.get(field)
+        bg = color_for(v, scale) if isinstance(v, (int, float)) else "rgb(245,245,245)"
         surf = t["token_str"]
         # Show newlines as a visible glyph + an actual break so layout is readable.
         display = html.escape(surf).replace("\n", "↵\n")
         tip = (
-            f"A_t={a:+.3f}  teacher_lp={t['teacher_lp']:.3f}  "
+            f"A_t={_fmt(t.get('A_t'))}  Abar_t={_fmt(t.get('Abar_t'))}  "
+            f"reweight_t={_fmt(t.get('reweight_t'))}  teacher_lp={t['teacher_lp']:.3f}  "
             f"student_lp={t['student_lp']:.3f}  id={t['token_id']}"
         )
         spans.append(
@@ -103,7 +113,7 @@ def render_tokens(record: dict, clip_q: float) -> str:
     return "".join(spans)
 
 
-def render_record(record: dict, clip_q: float) -> str:
+def render_record(record: dict, clip_q: float, field: str) -> str:
     badge = "✓ correct" if record.get("correct") else "✗ incorrect"
     badge_cls = "ok" if record.get("correct") else "bad"
     header = (
@@ -115,7 +125,7 @@ def render_record(record: dict, clip_q: float) -> str:
         f'<b>tokens</b> {record.get("num_completion_tokens", len(record["tokens"]))}</div>'
     )
     problem = f'<div class="problem">{html.escape(record["problem"])}</div>'
-    body = f'<div class="trace">{render_tokens(record, clip_q)}</div>'
+    body = f'<div class="trace">{render_tokens(record, clip_q, field)}</div>'
     return f'<section>{header}{problem}{body}</section>'
 
 
@@ -151,17 +161,24 @@ def main() -> None:
     if not chosen:
         raise SystemExit("No records selected to render.")
 
+    field = args.color_by
+    field_desc = {
+        "A_t": "<code>A_t = log π_T(y_t) − log π_S(y_t)</code> (sampled-token advantage): "
+               "green = teacher endorses (A_t&gt;0), red = blames (A_t&lt;0)",
+        "Abar_t": "<code>Ābar_t = Σ_v π_S(v)[log π_T(v) − log π_S(v)] = −KL_t</code> "
+                  "(dense per-position pull; ≤0 so shades of red = stronger pull)",
+        "reweight_t": "<code>reweight_t = π_S(y_t)·(A_t − Ābar_t)</code> "
+                      "(dense-training reweight of y_t): green = up-weighted, red = down-weighted",
+    }[field]
     legend = (
-        '<div class="legend">Per-token credit '
-        '<code>A_t = teacher_lp − student_lp</code>: '
-        '<span class="sw"></span> red = teacher blames (A_t&lt;0), '
-        'green = teacher endorses (A_t&gt;0). '
-        f'Color saturates at the per-trace p{args.clip_percentile:g} of |A_t|.</div>'
+        f'<div class="legend">Coloring by <b>{field}</b>: {field_desc}. '
+        '<span class="sw"></span> '
+        f'Color saturates at the per-trace p{args.clip_percentile:g} of |{field}|.</div>'
     )
-    sections = "\n".join(render_record(r, args.clip_percentile) for r in chosen)
+    sections = "\n".join(render_record(r, args.clip_percentile, field) for r in chosen)
     doc = (
         HTML_HEAD
-        + f"<h1>OPD token credit — {html.escape(adv_path.name)}</h1>"
+        + f"<h1>OPD token credit ({field}) — {html.escape(adv_path.name)}</h1>"
         + legend
         + sections
         + "</body></html>"
