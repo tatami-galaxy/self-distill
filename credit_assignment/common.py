@@ -26,16 +26,27 @@ SYSTEM_PROMPT = (
 
 
 def build_prompt_ids(
-    tokenizer: Any, problem: str, enable_thinking: bool = True
+    tokenizer: Any,
+    problem: str,
+    enable_thinking: bool = True,
+    privileged_info: str | None = None,
 ) -> list[int]:
     """Render system+user chat prompt to token ids (with generation prompt).
 
     ``enable_thinking`` is forwarded to the chat template when supported (Qwen3);
     templates that don't accept it are called without it.
+
+    ``privileged_info`` (OPSD only) is appended to the user turn so the model
+    scores the *same* completion under privileged context f. The unprivileged
+    prompt (``privileged_info=None``) reproduces exactly what generate_rollouts
+    used, so the OPSD baseline log-probs (``student_lp``) carry over unchanged and
+    only the privileged pass is recomputed. The generation prompt is identical in
+    both cases, so the teacher-forced completion attaches at the same boundary.
     """
+    user_content = problem if privileged_info is None else f"{problem}\n\n{privileged_info}"
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
+        {"role": "user", "content": user_content},
     ]
     # transformers 5.x returns a BatchEncoding (dict) when tokenize=True; older
     # versions return a plain list. return_dict=False normalizes to a list, and we

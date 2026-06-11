@@ -49,9 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=None,
                    help="JSONL path (default advantages_opd_<teacher>_revkl_<rolloutstem>.jsonl)")
     p.add_argument("--tensor-parallel-size", type=int, default=2)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.80,
-                   help="Kept below ~0.85 to leave room for the FlashInfer MoE "
-                        "workspace + CUDA-graph capture (0.9 OOMs the 30B-A3B teacher).")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     p.add_argument("--max-model-len", type=int, default=None)
     return p.parse_args()
 
