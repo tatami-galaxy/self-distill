@@ -1,281 +1,324 @@
-"""Token-level first-error labels for credit rollouts (one judge config per run).
+"""Judge-label the first uncorrected error in each (incorrect) rollout, by step.
 
-For each (incorrect) rollout we ask a judge model to locate the FIRST mathematical
-/ reasoning error that is NOT corrected later, as a *verbatim quote*. The quote is
-matched against the canonical token reconstruction of the completion
-(``common.reconstruct_trace``) and mapped to a contiguous token span — giving a
-per-token error mask aligned with the per-token credit signals (A_t / reweight_t).
+The rollout is segmented deterministically (:mod:`credit_assignment.segment`) into
+numbered steps, the steps are shown to a strong judge, and the judge returns the
+*index* of the first step containing a mathematical/logical error that is not
+corrected later. Because the judge emits an index into our pre-computed steps —
+not a quote — its tokenizer is irrelevant and the label maps back to an exact
+token range with zero string matching. This is what lets us use a different-family
+judge (Qwen3.6-27B, vocab 248044) that could never serve as a same-tokenizer
+teacher.
 
-This produces ONE label set per invocation; the credit study uses four (see
-design.md / the comparison script):
-  - matched regime (judge = the model whose credit we compare, same info):
-      opd_blind   : judge = 30B teacher,  --pi none
-      opsd_final  : judge = student,      --pi answer
-      opsd_gold   : judge = student,      --pi solution
-  - external anchor (fixed strong judge, best-informed; separate analysis):
-      anchor      : judge = Qwen/Qwen3.6-27B,  --pi solution|answer|both
+The judge is privileged: it sees the gold final answer and DeepMath's
+``r1_solution_1`` reference solution (rejoined by problem_id), so its error
+localization is as reliable as possible — the "ground-truth" anchor we later
+compare OPD/OPSD per-token credit against.
 
-The judge's tokenizer is irrelevant — it only emits text; the span mapping uses the
-student's stored ``token_str``. Privileged-info ``solution`` is DeepMath's
-r1_solution_1, rejoined by problem_id (= deepmath_<idx>).
+The judge runs as a separate vLLM server (``vllm serve``); this script is a thin
+client that segments the rollouts, builds the judge prompts, and fires them all at
+the server's OpenAI-compatible endpoint, letting vLLM batch them. Decoupling the
+27B judge from this process makes iterating on the prompt / parsing far quicker.
 
-Run from the repo root, e.g. (OPSD-final matched judge, student self):
-    PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES=7 \
+Run from the repo root, e.g.:
+    # 1. start the judge server (separate terminal; keep it up)
+    PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES=0,1 \
+    vllm serve Qwen/Qwen3.6-27B --tensor-parallel-size 2 --port 8000 \
+        --max-model-len 40000
+
+    # 2. send the rollouts to it
     python -m credit_assignment.label_errors \
         --rollouts data/credit_assignment/rollouts_Qwen_Qwen3-1.7B_deepmath.jsonl \
-        --judge-model Qwen/Qwen3-1.7B --pi answer --label opsd_final \
-        --max-traces 200 --max-model-len 40000
+        --judge-model Qwen/Qwen3.6-27B --port 8000 --max-model-len 40000
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
-from vllm import LLM, SamplingParams
+from openai import AsyncOpenAI, OpenAI
+from transformers import AutoTokenizer
 
-import re
+from credit_assignment.score_opsd import build_solution_map
+from credit_assignment.segment import segment_rollout
 
-from credit_assignment.common import (
-    faithful_trace_and_offsets,
-    quote_to_token_span,
+JUDGE_SYSTEM = (
+    "You are an expert mathematician grading a student's step-by-step solution "
+    "attempt. You are given the problem, the correct final answer, a correct "
+    "reference solution, and the student's attempt split into numbered steps. Your "
+    "job is to find the FIRST step that contains a mathematical or logical error "
+    "that the student does NOT correct in a later step. A step where the student "
+    "explores a wrong idea but later fixes it is NOT the first uncorrected error. "
+    "If the whole attempt is mathematically sound (even if messy), report -1."
 )
 
+JUDGE_USER_TEMPLATE = """Problem:
+{problem}
 
-SYSTEM_PROMPT = (
-    "You are a careful math grader. You are given a problem and a step-by-step "
-    "solution attempt. The attempt may or may not contain an error. Find the FIRST "
-    "place that is mathematically or logically wrong and is NOT corrected by a later "
-    "step. If every step is correct, report no error."
-)
+Correct final answer: {gold_answer}
 
-USER_TEMPLATE = """Problem:
-{question}
-{pi_block}
-Solution attempt to grade (verbatim):
-<<<
-{trace}
->>>
+Correct reference solution:
+{solution}
 
-The "quote" and "pivotal" fields MUST be copied EXACTLY, character-for-character,
-from the text between <<< and >>> (same words, same LaTeX, same symbols). Do NOT
-paraphrase, translate, summarize, shorten, or fix them — if a string does not appear
-verbatim in the attempt it is wrong. After any reasoning, end your reply with ONLY a
-JSON object of this exact form and nothing after it:
-{{"has_error": true or false, "quote": "the verbatim sentence or equation from the attempt containing the first uncorrected error, or null", "pivotal": "the shortest verbatim substring of that quote that is the actual mistake, or null", "reason": "one short sentence"}}"""
+Student attempt, split into numbered steps:
+{steps_block}
+
+Find the FIRST step whose reasoning is mathematically or logically wrong and is
+not corrected by any later step. Then respond with ONLY a JSON object on the last
+line, no extra text:
+{{"first_error_step": <int, or -1 if no uncorrected error>, "error_type": "<calculation|algebra|logic|misread|other>", "severity": "<low|medium|high>", "reason": "<one short sentence>"}}"""
+
+
+def stream_incorrect(path: Path, limit: int | None):
+    """Yield up to ``limit`` incorrect rollouts without loading the whole file."""
+    n = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("correct"):
+                continue
+            yield rec
+            n += 1
+            if limit is not None and n >= limit:
+                return
+
+
+def faithful_step_texts(
+    student_tok, comp_ids: list[int], steps: list[dict]
+) -> list[str]:
+    """Decode each step's token span with the *student* tokenizer (intact unicode)."""
+    return [student_tok.decode(comp_ids[s["tok_start"] : s["tok_end"]]) for s in steps]
+
+
+def build_steps_block(step_texts: list[str]) -> str:
+    return "\n\n".join(
+        f"### Step {i}\n{txt.strip()}" for i, txt in enumerate(step_texts)
+    )
+
+
+def extract_label(text: str) -> dict | None:
+    """Parse the trailing JSON object from the judge output (after any thinking)."""
+    start, end = text.rfind("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Token-level first-error labels for credit rollouts.")
-    p.add_argument("--rollouts", required=True, help="JSONL with per-token token_str (rollouts or advantages).")
-    p.add_argument("--judge-model", required=True)
-    p.add_argument("--pi", choices=["none", "answer", "solution", "both"], default="none",
-                   help="Privileged info the judge sees about the correct result.")
-    p.add_argument("--label", required=True, help="Label key for outputs (e.g. opd_blind, opsd_final, anchor).")
-    p.add_argument("--only-incorrect", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--skip-truncated", action=argparse.BooleanOptionalAction, default=True,
-                   help="Skip completions with no closing </think> (uncorrected-error is ill-defined).")
-    p.add_argument("--max-traces", type=int, default=None)
+    p = argparse.ArgumentParser(description="Judge first-uncorrected-error per rollout (by step).")
+    p.add_argument("--rollouts", required=True, help="JSONL from generate_rollouts.py")
+    p.add_argument("--judge-model", default="Qwen/Qwen3.6-27B",
+                   help="Model id expected on the server (verified before sending).")
+    p.add_argument("--host", default="127.0.0.1", help="vLLM server host")
+    p.add_argument("--port", type=int, required=True, help="vLLM server port (from vllm serve)")
+    p.add_argument("--api-key", default="EMPTY", help="API key sent to the server")
+    p.add_argument("--max-concurrency", type=int, default=256,
+                   help="max in-flight requests; the server batches them")
+    p.add_argument("--request-timeout", type=float, default=3600.0,
+                   help="per-request timeout in seconds (judge thinking can be long)")
+    p.add_argument("--max-traces", type=int, default=None, help="cap on incorrect rollouts")
+    p.add_argument("--min-tokens", type=int, default=20, help="segmentation min step size")
+    p.add_argument("--max-tokens", type=int, default=200, help="segmentation max step size")
+    p.add_argument("--max-gen-tokens", type=int, default=32000, help="judge thinking+JSON budget")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-new-tokens", type=int, default=16000)
-    p.add_argument("--fuzzy-cutoff", type=float, default=60.0,
-                   help="rapidfuzz partial_ratio (0-100) floor for a fuzzy quote match.")
-    p.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True,
-                   help="Judge's own thinking mode (Qwen3); the critique JSON is parsed from the tail.")
+    p.add_argument("--max-model-len", type=int, default=None,
+                   help="skip prompts whose token_count + max-gen-tokens exceeds this "
+                        "(match the server's --max-model-len)")
     p.add_argument("--output", default=None,
-                   help="JSONL path (default data/credit_assignment/errors_<label>_<rolloutstem>.jsonl)")
-    p.add_argument("--tensor-parallel-size", type=int, default=1)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    p.add_argument("--max-model-len", type=int, default=None)
+                   help="JSONL (default errors_<judge>_<rolloutstem>.jsonl beside rollouts)")
     return p.parse_args()
 
 
-def load_rollouts(path: Path) -> list[dict]:
-    records = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+def default_output(args: argparse.Namespace, rollouts_path: Path) -> Path:
+    judge_slug = args.judge_model.replace("/", "_")
+    stem = rollouts_path.stem.replace("rollouts_", "")
+    return rollouts_path.parent / f"errors_{judge_slug}_{stem}.jsonl"
 
 
-def select_records(records: list[dict], args: argparse.Namespace) -> list[dict]:
-    kept = []
-    for r in records:
-        if args.only_incorrect and r.get("correct"):
-            continue
-        if args.skip_truncated and "</think>" not in r.get("completion_text", ""):
-            continue
-        kept.append(r)
-    if args.max_traces is not None and args.max_traces < len(kept):
-        import random
-        random.seed(args.seed)
-        kept = random.sample(kept, args.max_traces)
-    return kept
+def build_judge_prompt_ids(judge_tok, problem, gold_answer, solution, steps_block):
+    user = JUDGE_USER_TEMPLATE.format(
+        problem=problem, gold_answer=gold_answer, solution=solution,
+        steps_block=steps_block,
+    )
+    messages = [
+        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    # transformers 5.x returns a BatchEncoding (dict) when tokenize=True;
+    # return_dict=False normalizes to a list, and we still guard for the dict form.
+    kwargs = {"tokenize": True, "add_generation_prompt": True, "return_dict": False}
+    try:
+        ids = judge_tok.apply_chat_template(messages, enable_thinking=True, **kwargs)
+    except TypeError:
+        ids = judge_tok.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+        )
+    if isinstance(ids, dict):  # BatchEncoding
+        ids = ids["input_ids"]
+    return [int(t) for t in ids]
 
 
-def build_solution_map(records: list[dict]) -> dict[str, str]:
-    """Rejoin DeepMath r1_solution_1 by problem_id (= deepmath_<idx>)."""
-    from datasets import load_dataset
-
-    ds = load_dataset("zwhe99/DeepMath-103K", split="train")
-    sol: dict[str, str] = {}
-    for r in records:
-        pid = str(r["problem_id"])
-        if pid.startswith("deepmath_"):
-            sol[pid] = ds[int(pid.split("_", 1)[1])]["r1_solution_1"] or ""
-    return sol
-
-
-def pi_block(pi: str, rec: dict, solution_map: dict[str, str]) -> str:
-    parts = []
-    if pi in ("answer", "both"):
-        parts.append(f"The correct final answer is: {rec['gold_answer']}")
-    if pi in ("solution", "both"):
-        sol = solution_map.get(str(rec["problem_id"]), "")
-        if sol.strip():
-            parts.append(f"A correct reference solution:\n{sol}")
-    return ("\n" + "\n\n".join(parts) + "\n") if parts else "\n"
+def verify_server_model(base_url: str, api_key: str, judge_model: str) -> None:
+    """Fail fast unless the vLLM server at ``base_url`` is serving ``judge_model``."""
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    try:
+        served = [m.id for m in client.models.list().data]
+    except Exception as e:  # refused connection, wrong port, server still loading
+        raise SystemExit(f"Could not reach a vLLM server at {base_url}: {e}")
+    if judge_model not in served:
+        raise SystemExit(
+            f"Server at {base_url} is serving {served}, not --judge-model "
+            f"{judge_model!r}. Start `vllm serve {judge_model}` or fix --port/--judge-model."
+        )
+    print(f"Verified judge {judge_model} is served at {base_url}", file=sys.stderr)
 
 
-def _extract_str_field(text: str, field: str) -> str | None:
-    """Raw value of a string field, taking backslashes LITERALLY (not JSON escapes).
+async def _judge_all(
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompts: list[list[int]],
+    max_tokens: int,
+    seed: int,
+    concurrency: int,
+    timeout: float,
+) -> list[tuple[str | None, str | None]]:
+    """Send every prompt (as token ids) to the server at once; vLLM batches them.
 
-    The quote/pivotal must match the trace, which contains literal LaTeX backslashes
-    (``\\frac``, ``\\infty``). JSON unescaping would turn ``\\frac`` into a form-feed
-    (``\\f``) and never match, so we capture the verbatim substring between the field's
-    quotes instead — ending at a ``"`` that is followed by ``,`` or ``}`` (so interior
-    quotes don't terminate early). Returns the last match (the final answer object).
+    Returns ``(text, error)`` per prompt in input order. Concurrency is capped by a
+    semaphore so we don't open thousands of sockets, and a single failed request
+    (e.g. a prompt that slips past the length filter) does not abort the rest.
     """
-    pat = re.compile(r'"' + re.escape(field) + r'"\s*:\s*"(.*?)"\s*(?=[,}])', re.DOTALL)
-    matches = pat.findall(text)
-    return matches[-1] if matches else None
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=2)
+    sem = asyncio.Semaphore(concurrency)
 
+    async def one(ids: list[int]) -> tuple[str | None, str | None]:
+        async with sem:
+            try:
+                resp = await client.completions.create(
+                    model=model, prompt=ids, max_tokens=max_tokens, seed=seed,
+                )
+                return resp.choices[0].text, None
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
 
-def parse_quote_critique(text: str) -> dict:
-    """Tolerant critique parser (regex, not json.loads — LaTeX-safe).
-
-    Reads the LAST ``has_error`` and the raw quote/pivotal/reason field values. We
-    avoid ``json.loads`` entirely because math quotes carry ``{}`` and lone
-    backslashes that break both brace-matching and JSON-escape rules.
-    """
-    flags = re.findall(r'"has_error"\s*:\s*(true|false)', text)
-    if not flags:
-        return {"has_error": None, "quote": None, "pivotal": None, "reason": None, "parse_ok": False}
-    reason = _extract_str_field(text, "reason")
-    if flags[-1] == "false":
-        return {"has_error": False, "quote": None, "pivotal": None, "reason": reason, "parse_ok": True}
-    return {
-        "has_error": True,
-        "quote": _extract_str_field(text, "quote"),
-        "pivotal": _extract_str_field(text, "pivotal"),
-        "reason": reason,
-        "parse_ok": True,
-    }
+    try:
+        return await asyncio.gather(*(one(ids) for ids in prompts))
+    finally:
+        await client.close()
 
 
 def main() -> None:
     args = parse_args()
     rollouts_path = Path(args.rollouts)
-    stem = rollouts_path.stem.replace("rollouts_", "").replace("advantages_", "")
-    output_path = (
-        Path(args.output) if args.output
-        else rollouts_path.parent / f"errors_{args.label}_{stem}.jsonl"
-    )
+    output_path = Path(args.output) if args.output else default_output(args, rollouts_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    records = select_records(load_rollouts(rollouts_path), args)
-    print(f"Labeling {len(records)} rollouts (label={args.label}, pi={args.pi})", file=sys.stderr)
+    records = list(stream_incorrect(rollouts_path, args.max_traces))
+    print(f"Loaded {len(records)} incorrect rollouts from {rollouts_path}", file=sys.stderr)
     if not records:
-        raise SystemExit("No rollouts selected.")
+        print("No incorrect rollouts to label.", file=sys.stderr)
+        return
 
-    solution_map = build_solution_map(records) if args.pi in ("solution", "both") else {}
+    base_url = f"http://{args.host}:{args.port}/v1"
+    verify_server_model(base_url, args.api_key, args.judge_model)
 
-    llm_kwargs = dict(
-        model=args.judge_model,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=True,
-    )
-    if args.max_model_len is not None:
-        llm_kwargs["max_model_len"] = args.max_model_len
-    llm = LLM(**llm_kwargs)
-    tokenizer = llm.get_tokenizer()
+    student_model = records[0]["student_model"]
+    student_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=True)
+    # The judge tokenizer is loaded locally only to template + length-count the
+    # prompts (the weights live on the server); we send the resulting token ids.
+    judge_tok = AutoTokenizer.from_pretrained(args.judge_model, trust_remote_code=True)
+    solution_map = build_solution_map(records)
 
-    # Canonical faithful traces + per-token offsets via the *student* tokenizer
-    # (judge-agnostic; keeps math unicode intact so quotes map exactly).
-    from transformers import AutoTokenizer
-    student_tok = AutoTokenizer.from_pretrained(
-        records[0]["student_model"], trust_remote_code=True)
-    traces, offsets = [], []
-    for r in records:
-        full, offs = faithful_trace_and_offsets(
-            student_tok, [t["token_id"] for t in r["tokens"]])
-        traces.append(full)
-        offsets.append(offs)
+    # Segment every rollout, build judge prompts; skip those without a reference
+    # solution or whose prompt is too long.
+    prompts: list = []
+    meta: list[dict] = []  # parallel to prompts: {rec, steps}
+    n_skip_sol = n_skip_len = 0
+    for rec in records:
+        sol = solution_map.get(str(rec["problem_id"]), "")
+        if not sol.strip():
+            n_skip_sol += 1
+            continue
+        comp_ids = [t["token_id"] for t in rec["tokens"]]
+        steps = segment_rollout(rec["tokens"], args.min_tokens, args.max_tokens)
+        if not steps:
+            continue
+        step_texts = faithful_step_texts(student_tok, comp_ids, steps)
+        steps_block = build_steps_block(step_texts)
+        ids = build_judge_prompt_ids(
+            judge_tok, rec["problem"], rec["gold_answer"], sol, steps_block
+        )
+        if args.max_model_len and len(ids) + args.max_gen_tokens > args.max_model_len:
+            n_skip_len += 1
+            continue
+        prompts.append(ids)
+        meta.append({"rec": rec, "steps": steps})
 
-    prompts = []
-    for r, trace in zip(records, traces):
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_TEMPLATE.format(
-                question=r["problem"], pi_block=pi_block(args.pi, r, solution_map), trace=trace)},
-        ]
-        try:
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=args.enable_thinking)
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
-        prompts.append(prompt)
+    print(f"Judging {len(prompts)} rollouts "
+          f"({n_skip_sol} no-solution, {n_skip_len} too-long, skipped)", file=sys.stderr)
 
-    sampling = SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0, seed=args.seed)
-    outputs = llm.generate(prompts, sampling)
+    results = asyncio.run(_judge_all(
+        base_url, args.api_key, args.judge_model, prompts,
+        max_tokens=args.max_gen_tokens, seed=args.seed,
+        concurrency=args.max_concurrency, timeout=args.request_timeout,
+    ))
 
-    status_counts: dict[str, int] = {}
-    n_error = 0
+    n_written = n_unparsed = n_error = 0
     with output_path.open("w", encoding="utf-8") as handle:
-        for r, trace, offs, output in zip(records, traces, offsets, outputs, strict=True):
-            crit = parse_quote_critique(output.outputs[0].text)
-            span = {"status": "no_error", "score": None, "char_span": None, "token_span": None}
-            pivotal_span = None
-            if crit["parse_ok"] and crit["has_error"] and crit["quote"]:
-                span = quote_to_token_span(trace, offs, crit["quote"], fuzzy_cutoff=args.fuzzy_cutoff)
-                n_error += int(span["status"] != "not_found")
-                if crit["pivotal"] and span["char_span"]:
-                    pivotal_span = quote_to_token_span(trace, offs, crit["pivotal"], fuzzy_cutoff=args.fuzzy_cutoff)
-            elif not crit["parse_ok"]:
-                span = {"status": "parse_failed", "score": None, "char_span": None, "token_span": None}
-            status_counts[span["status"]] = status_counts.get(span["status"], 0) + 1
-
+        for m, (raw, err) in zip(meta, results, strict=True):
+            rec, steps = m["rec"], m["steps"]
+            label = extract_label(raw) if raw else None
+            if err:
+                n_error += 1
+            elif label is None:
+                n_unparsed += 1
+            fe = label.get("first_error_step") if label else None
+            try:
+                fe = int(fe)
+            except (TypeError, ValueError):
+                fe = None
+            in_range = fe is not None and 0 <= fe < len(steps)
+            span = (
+                [steps[fe]["tok_start"], steps[fe]["tok_end"]] if in_range else None
+            )
             handle.write(json.dumps({
-                "problem_id": r.get("problem_id"),
-                "row_index": r.get("row_index"),
-                "label": args.label,
+                "problem_id": rec["problem_id"],
+                "row_index": rec.get("row_index"),
+                "correct": rec.get("correct"),
+                "student_model": student_model,
                 "judge_model": args.judge_model,
-                "pi": args.pi,
-                "correct": r.get("correct"),
-                "num_completion_tokens": len(r["tokens"]),
-                "has_error": crit["has_error"],
-                "quote": crit["quote"],
-                "pivotal": crit["pivotal"],
-                "reason": crit["reason"],
-                "parse_ok": crit["parse_ok"],
-                "match_status": span["status"],
-                "match_score": span["score"],
-                "char_span": span["char_span"],
-                "token_span": span["token_span"],
-                "pivotal_token_span": pivotal_span["token_span"] if pivotal_span else None,
-                "pivotal_match_score": pivotal_span["score"] if pivotal_span else None,
+                "gold_answer": rec.get("gold_answer"),
+                "pred_answer": rec.get("pred_answer"),
+                "num_completion_tokens": rec.get("num_completion_tokens"),
+                "segmentation": {
+                    "min_tokens": args.min_tokens, "max_tokens": args.max_tokens,
+                    "n_steps": len(steps),
+                },
+                "steps": [
+                    {"idx": s["idx"], "tok_start": s["tok_start"],
+                     "tok_end": s["tok_end"], "n_tokens": s["n_tokens"],
+                     "region": s["region"]}
+                    for s in steps
+                ],
+                "first_error_step": fe if in_range else (-1 if fe == -1 else None),
+                "first_error_tok_span": span,
+                "label": label,
+                "judge_error": err,
+                "judge_raw": raw,
             }, ensure_ascii=False) + "\n")
+            n_written += 1
 
-    print(f"Wrote {len(records)} labels -> {output_path}", file=sys.stderr)
-    print(f"  located errors: {n_error} | match-status: {json.dumps(status_counts)}", file=sys.stderr)
+    print(f"Wrote {n_written} labels ({n_unparsed} unparsed, {n_error} request errors) "
+          f"-> {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

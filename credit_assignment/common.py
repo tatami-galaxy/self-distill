@@ -24,6 +24,15 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
+# Appended to the user turn on the privileged (OPSD) pass only, right before the
+# assistant generation prompt. Reiterates the "solve it yourself, using the
+# reference as a hint" frame under which we score the rollout. We don't actually
+# generate here (the pre-generated rollout is teacher-forced), but this line
+# conditions pi_theta(. | x, f, .) toward producing its own answer rather than
+# merely echoing the reference. Omitted when privileged_info is None so the
+# unprivileged baseline stays byte-identical to the generation prompt.
+PRIVILEGED_INSTRUCTION = "Now answer with a response of your own, including the thinking process:"
+
 
 def build_prompt_ids(
     tokenizer: Any,
@@ -36,14 +45,20 @@ def build_prompt_ids(
     ``enable_thinking`` is forwarded to the chat template when supported (Qwen3);
     templates that don't accept it are called without it.
 
-    ``privileged_info`` (OPSD only) is appended to the user turn so the model
-    scores the *same* completion under privileged context f. The unprivileged
-    prompt (``privileged_info=None``) reproduces exactly what generate_rollouts
-    used, so the OPSD baseline log-probs (``student_lp``) carry over unchanged and
-    only the privileged pass is recomputed. The generation prompt is identical in
-    both cases, so the teacher-forced completion attaches at the same boundary.
+    ``privileged_info`` (OPSD only) is appended to the user turn, followed by
+    :data:`PRIVILEGED_INSTRUCTION`, so the model scores the *same* completion under
+    privileged context f with a "now answer it yourself" frame. The unprivileged
+    prompt (``privileged_info=None``) omits both and reproduces exactly what
+    generate_rollouts used, so the OPSD baseline log-probs (``student_lp``) carry
+    over unchanged and only the privileged pass is recomputed. The generation
+    prompt is identical in both cases, so the teacher-forced completion attaches at
+    the same boundary.
     """
-    user_content = problem if privileged_info is None else f"{problem}\n\n{privileged_info}"
+    user_content = (
+        problem
+        if privileged_info is None
+        else f"{problem}\n\n{privileged_info}\n\n{PRIVILEGED_INSTRUCTION}"
+    )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
@@ -73,119 +88,6 @@ def token_strings(tokenizer: Any, token_ids: list[int]) -> list[str]:
     visualization only.
     """
     return tokenizer.batch_decode([[t] for t in token_ids])
-
-
-def reconstruct_trace(tokens: list[dict]) -> str:
-    """Canonical completion text = concatenation of per-token surfaces.
-
-    Built from the stored ``token_str`` (single-token decode) so it is exactly the
-    string whose char offsets line up with the per-token credit signal. We show
-    *this* string to the error judge, so any verbatim quote it copies maps back to
-    a contiguous token range by construction — no dependence on the judge's
-    tokenizer, and no expensive O(n^2) re-decode. (Equals ``completion_text`` except
-    at the rare multi-byte char split across tokens; immaterial for ASCII/LaTeX math.)
-    """
-    return "".join(t["token_str"] for t in tokens)
-
-
-def token_char_offsets(tokens: list[dict]) -> list[tuple[int, int]]:
-    """Per-token ``[char_start, char_end)`` into :func:`reconstruct_trace` output."""
-    offsets: list[tuple[int, int]] = []
-    pos = 0
-    for t in tokens:
-        n = len(t["token_str"])
-        offsets.append((pos, pos + n))
-        pos += n
-    return offsets
-
-
-def faithful_trace_and_offsets(
-    tokenizer: Any, token_ids: list[int], window: int = 8
-) -> tuple[str, list[tuple[int, int]]]:
-    """Faithful completion text + per-token ``[char_start, char_end)`` offsets.
-
-    Unlike :func:`reconstruct_trace` (single-token decode, which renders a multi-byte
-    char split across tokens as ``�``), this decodes with the *student* tokenizer so
-    math unicode (``√``, ``∞``, ...) is intact — important for both the judge's
-    comprehension and verbatim quote matching. Per-token surface lengths come from a
-    windowed incremental decode (``len(decode(ids[lo:i+1])) - len(decode(ids[lo:i]))``,
-    ``lo = i-window+1``), which is O(n·window) instead of O(n²). Offsets index the
-    returned faithful text; at the rare codepoint that straddles a token boundary the
-    boundary may be off by ~1 char (immaterial for token-span overlap), and the final
-    offset is clamped so the spans cover the full text exactly.
-    """
-    full = tokenizer.decode(token_ids)
-    offsets: list[tuple[int, int]] = []
-    pos = 0
-    for i in range(len(token_ids)):
-        lo = max(0, i - window + 1)
-        a = len(tokenizer.decode(token_ids[lo : i + 1]))
-        b = len(tokenizer.decode(token_ids[lo:i])) if i > lo else 0
-        delta = max(0, a - b)
-        offsets.append((pos, pos + delta))
-        pos += delta
-    if offsets and pos != len(full):  # absorb accumulated drift into the last token
-        last_start = offsets[-1][0]
-        offsets[-1] = (min(last_start, len(full)), len(full))
-    return full, offsets
-
-
-def _span_to_token_range(
-    offsets: list[tuple[int, int]], c0: int, c1: int
-) -> tuple[int, int]:
-    """Half-open token range [lo, hi) whose char spans overlap ``[c0, c1)``."""
-    lo = next((i for i, (_s, e) in enumerate(offsets) if e > c0), len(offsets))
-    hi = next((i for i in range(len(offsets) - 1, -1, -1) if offsets[i][0] < c1), -1)
-    return lo, (hi + 1 if hi >= lo else lo)
-
-
-def quote_to_token_span(
-    trace: str,
-    offsets: list[tuple[int, int]],
-    quote: str,
-    fuzzy_cutoff: float = 60.0,
-) -> dict:
-    """Locate a judge's ``quote`` in ``trace`` -> token span, via a matching ladder.
-
-    Returns ``{status, score, char_span, token_span}``. ``status`` (the tier that
-    matched) is one of:
-      - ``exact``      : the quote occurs exactly once (score 100).
-      - ``ambiguous``  : occurs verbatim more than once; first occurrence (score 100).
-      - ``normalized`` : found after collapsing runs of whitespace (score 100).
-      - ``fuzzy``      : best edit-distance-aligned substring of ~quote length, when
-                         the judge paraphrased; ``score`` is rapidfuzz partial_ratio
-                         (0-100) and the match is kept only if ``>= fuzzy_cutoff``.
-      - ``not_found``  : nothing at/above cutoff; spans are None.
-    rapidfuzz's ``partial_ratio_alignment`` is the "slide a quote-sized window, take
-    the most similar" step — it returns the aligned substring's char offsets directly.
-    Heavy paraphrase (low score) is left for a later semantic-embedding tier.
-    """
-    import re
-
-    if not quote:
-        return {"status": "not_found", "score": None, "char_span": None, "token_span": None}
-
-    first = trace.find(quote)
-    if first >= 0:
-        second = trace.find(quote, first + 1)
-        status = "exact" if second < 0 else "ambiguous"
-        c0, c1, score = first, first + len(quote), 100.0
-    else:
-        # Whitespace-flexible retry: the judge may re-flow spaces/newlines.
-        pattern = r"\s+".join(re.escape(tok) for tok in quote.split())
-        m = re.search(pattern, trace) if pattern else None
-        if m is not None:
-            status, c0, c1, score = "normalized", m.start(), m.end(), 100.0
-        else:
-            from rapidfuzz import fuzz
-
-            ali = fuzz.partial_ratio_alignment(quote, trace, score_cutoff=fuzzy_cutoff)
-            if ali is None:  # below cutoff
-                return {"status": "not_found", "score": None, "char_span": None, "token_span": None}
-            status, c0, c1, score = "fuzzy", ali.dest_start, ali.dest_end, float(ali.score)
-
-    lo, hi = _span_to_token_range(offsets, c0, c1)
-    return {"status": status, "score": score, "char_span": [c0, c1], "token_span": [lo, hi]}
 
 
 def read_generation_logprobs(output: Any, topk: int) -> list[dict]:

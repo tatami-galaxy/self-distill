@@ -1,19 +1,7 @@
 """Score student rollouts under a *privileged self-teacher* — per-token OPSD credit.
 
 On-policy self-distillation (OPSD): the teacher is the *same* model that produced
-the rollout, re-run with privileged information ``f`` prepended to the prompt. The
-per-token credit is
-
-    A_t = log pi_theta(y_t | x, f, y_<t) - log pi_theta(y_t | x, y_<t)
-
-i.e. the pointwise information gain from f (a pointwise mutual information, in
-expectation -KL(pi_unpriv || pi_priv)_t under on-policy sampling). Semantically
-distinct from OPD's capability gap, but the same syntactic log-ratio — see design.md.
-
-The unprivileged baseline ``log pi_theta(y_t | x, y_<t)`` is exactly the
-``student_lp`` already stored in the rollouts (read off the T=1 generation), so
-OPSD needs only ONE new forward pass: the privileged (f-augmented) teacher-forcing.
-The completion token ids are reused verbatim; only the prompt prefix gains f.
+the rollout, re-run with privileged information ``f`` prepended to the prompt.
 
 Two ``f`` choices are supported, scored in a single model-loaded session:
   - ``final_answer``  : the gold boxed answer (mild hint, verifier-like).
@@ -59,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--max-model-len", type=int, default=None,
-                   help="Sequences whose f-augmented prompt+completion exceed this are skipped.")
+                   help="Override the model context window. Either way, sequences whose "
+                        "f-augmented prompt+completion exceed the effective limit are skipped.")
     return p.parse_args()
 
 
@@ -71,6 +60,29 @@ def load_rollouts(path: Path) -> list[dict]:
             if line:
                 records.append(json.loads(line))
     return records
+
+
+def effective_context_limit(llm: LLM, override: int | None) -> int:
+    """Token budget vLLM will actually enforce (the model's ``max_model_len``).
+
+    When ``--max-model-len`` is set the engine is built with it, so that *is* the
+    limit. Otherwise read it back off the loaded engine (the model's native
+    context window, 40960 for Qwen3-1.7B), falling back conservatively. Used to
+    pre-filter ``gold_solution``-augmented sequences that would overflow it.
+    """
+    if override is not None:
+        return override
+    for getter in (
+        lambda: llm.llm_engine.model_config.max_model_len,
+        lambda: llm.llm_engine.get_model_config().max_model_len,
+    ):
+        try:
+            val = getter()
+            if val:
+                return int(val)
+        except Exception:
+            pass
+    return 32768
 
 
 def build_solution_map(records: list[dict]) -> dict[str, str]:
@@ -106,7 +118,7 @@ def f_text(variant: str, rec: dict, solution_map: dict[str, str]) -> str | None:
         sol = solution_map.get(str(rec["problem_id"]), "")
         if not sol.strip():
             return None
-        return f"Here is a worked reference solution you may rely on:\n\n{sol}"
+        return f"Here is an example response to the question:\n\n{sol}"
     raise ValueError(variant)
 
 
@@ -118,7 +130,7 @@ def score_variant(
     solution_map: dict[str, str],
     topk: int,
     batch_size: int,
-    max_model_len: int | None,
+    context_limit: int,
     output_path: Path,
 ) -> None:
     """Score one f variant and write an advantages JSONL (OPD-compatible schema)."""
@@ -143,7 +155,10 @@ def score_variant(
                     privileged_info=f,
                 )
                 full_ids = prompt_ids + comp_ids
-                if max_model_len is not None and len(full_ids) > max_model_len:
+                # +1 for the single decode token vLLM appends during the
+                # prompt_logprobs prefill; sequences at/over the context window
+                # would otherwise error mid-batch instead of being scored.
+                if len(full_ids) + 1 > context_limit:
                     n_skipped += 1
                     continue
                 seqs.append((full_ids, len(prompt_ids)))
@@ -215,13 +230,17 @@ def main() -> None:
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
 
+    context_limit = effective_context_limit(llm, args.max_model_len)
+    print(f"Context limit {context_limit} tokens; f-augmented prompt+completion "
+          f"sequences over this are skipped", file=sys.stderr)
+
     stem = rollouts_path.stem.replace("rollouts_", "")
     for variant in args.f:
         output_path = out_dir / f"advantages_opsd_{variant}_revkl_{stem}.jsonl"
         score_variant(
             llm, tokenizer, records, variant, solution_map,
             topk=args.topk, batch_size=args.score_batch_size,
-            max_model_len=args.max_model_len, output_path=output_path,
+            context_limit=context_limit, output_path=output_path,
         )
 
 
