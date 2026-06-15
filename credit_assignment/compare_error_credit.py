@@ -182,18 +182,25 @@ def _bootstrap_paired(diffs: np.ndarray, n_boot: int, seed: int) -> tuple[float,
     return float(diffs.mean()), float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
 
 
-def aggregate(rows: list[dict], methods: list[str], n_boot: int, seed: int) -> None:
+def aggregate(rows: list[dict], methods: list[str], n_boot: int, seed: int,
+              summary_out: Path | None = None) -> None:
     by_method = {m: [r for r in rows if r["method"] == m] for m in methods}
 
-    print("\n" + "=" * 98)
-    print("Per-method localization (mean +/- SE over rollouts). gap<0 => error step "
-          "more blamed than baseline.")
-    print("=" * 98)
+    lines: list[str] = []
+
+    def w(s: str = "") -> None:  # tee: print and capture for the summary file
+        print(s)
+        lines.append(s)
+
+    w("\n" + "=" * 98)
+    w("Per-method localization (mean +/- SE over rollouts). gap<0 => error step "
+      "more blamed than baseline.")
+    w("=" * 98)
     for m in methods:
         mr = by_method[m]
-        print(f"\n### {m}   (n={len(mr)} rollouts)")
-        print(f"  {'signal':<11}{'gap':>16}{'gap_min':>16}{'err_rank':>10}"
-              f"{'%most':>8}{'placebo':>12}{'prev_gap':>12}")
+        w(f"\n### {m}   (n={len(mr)} rollouts)")
+        w(f"  {'signal':<11}{'gap':>16}{'gap_min':>16}{'err_rank':>10}"
+          f"{'%most':>8}{'placebo':>12}{'prev_gap':>12}")
         for sig in SIGNALS:
             g_m, g_se, _ = _mean_se([r[sig]["gap"] for r in mr])
             gm_m, gm_se, _ = _mean_se([r[sig]["gap_min"] for r in mr])
@@ -203,21 +210,21 @@ def aggregate(rows: list[dict], methods: list[str], n_boot: int, seed: int) -> N
             most = float(np.mean(most_vals)) if most_vals else float("nan")
             pl, _, _ = _mean_se([r[sig]["placebo_gap"] for r in mr])
             pv, _, _ = _mean_se([r[sig]["prev_gap"] for r in mr])
-            print(f"  {sig:<11}{g_m:>8.3f}±{g_se:<6.3f}{gm_m:>8.3f}±{gm_se:<6.3f}"
-                  f"{rk:>10.3f}{most:>8.2f}{pl:>12.3f}{pv:>12.3f}")
+            w(f"  {sig:<11}{g_m:>8.3f}±{g_se:<6.3f}{gm_m:>8.3f}±{gm_se:<6.3f}"
+              f"{rk:>10.3f}{most:>8.2f}{pl:>12.3f}{pv:>12.3f}")
 
     if len(methods) > 1:
-        print("\n" + "=" * 98)
-        print("Paired difference in error-step gap vs OPD (negative => that method "
-              "blames the error MORE).")
-        print("95% bootstrap CI; Wilcoxon signed-rank p (paired, same rollouts).")
-        print("=" * 98)
+        w("\n" + "=" * 98)
+        w("Paired difference in error-step gap vs OPD (negative => that method "
+          "blames the error MORE).")
+        w("95% bootstrap CI; Wilcoxon signed-rank p (paired, same rollouts).")
+        w("=" * 98)
         base = "opd" if "opd" in methods else methods[0]
         base_idx = {r["problem_id"]: r for r in by_method[base]}
         for m in methods:
             if m == base:
                 continue
-            print(f"\n### {m} - {base}")
+            w(f"\n### {m} - {base}")
             for sig in SIGNALS:
                 pairs = [(r[sig]["gap"], base_idx[r["problem_id"]][sig]["gap"])
                          for r in by_method[m]
@@ -231,8 +238,13 @@ def aggregate(rows: list[dict], methods: list[str], n_boot: int, seed: int) -> N
                 except ValueError:  # all-zero differences
                     p = float("nan")
                 flag = "*" if (p < 0.05) else " "
-                print(f"  {sig:<11} Δgap={d:>8.3f}  95%CI[{lo:>7.3f},{hi:>7.3f}]  "
-                      f"p={p:>8.4g} {flag}  (n={diffs.size})")
+                w(f"  {sig:<11} Δgap={d:>8.3f}  95%CI[{lo:>7.3f},{hi:>7.3f}]  "
+                  f"p={p:>8.4g} {flag}  (n={diffs.size})")
+
+    if summary_out is not None:
+        summary_out.parent.mkdir(parents=True, exist_ok=True)
+        summary_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"\nWrote summary -> {summary_out}", file=sys.stderr)
 
 
 # -------------------------------------------------------------------------- cli
@@ -240,16 +252,30 @@ def aggregate(rows: list[dict], methods: list[str], n_boot: int, seed: int) -> N
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare OPD/OPSD credit vs judge first-error step.")
-    p.add_argument("--errors", required=True, help="judge errors JSONL from label_errors.py")
+    p.add_argument("--errors", default=None,
+                   help="judge errors JSONL from label_errors.py (required unless --rows-in)")
     p.add_argument("--opd", default=None)
     p.add_argument("--opsd-gold", default=None)
     p.add_argument("--opsd-final", default=None)
     p.add_argument("--rows-out", default=None, help="per-(rollout,method) rows JSONL")
     p.add_argument("--rows-in", default=None, help="skip streaming; aggregate these rows instead")
+    p.add_argument("--summary-out", default=None,
+                   help="write the printed summary tables to this .txt "
+                        "(default: <rows>_summary.txt next to --rows-out/--rows-in)")
     p.add_argument("--max-rollouts", type=int, default=None, help="cap per method (quick test)")
     p.add_argument("--n-boot", type=int, default=10000)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
+
+
+def _summary_path(explicit: str | None, rows_path: str | None) -> Path | None:
+    """--summary-out wins; else derive <rows>_summary.txt; else don't write one."""
+    if explicit:
+        return Path(explicit)
+    if rows_path:
+        rp = Path(rows_path)
+        return rp.with_name(rp.stem + "_summary.txt")
+    return None
 
 
 def main() -> None:
@@ -258,9 +284,12 @@ def main() -> None:
     if args.rows_in:
         rows = [json.loads(l) for l in Path(args.rows_in).open() if l.strip()]
         methods = list(dict.fromkeys(r["method"] for r in rows))
-        aggregate(rows, methods, args.n_boot, args.seed)
+        aggregate(rows, methods, args.n_boot, args.seed,
+                  summary_out=_summary_path(args.summary_out, args.rows_in))
         return
 
+    if not args.errors:
+        raise SystemExit("--errors is required unless --rows-in is given.")
     labels = load_judge_labels(Path(args.errors))
     pids = set(labels)
     method_paths = [(m, p) for m, p in
@@ -274,6 +303,7 @@ def main() -> None:
         n_in = n_skip = 0
         for rec in stream_matched(Path(path), pids, args.max_rollouts):
             # deterministic per-rollout placebo, independent of method/order
+            # NumPy's default_rng wants a seed in the 32-bit range
             r_rng = np.random.default_rng(abs(hash(str(rec["problem_id"]))) % (2**32) + args.seed)
             row = compute_row(rec, labels[str(rec["problem_id"])], r_rng)
             if row is None:
@@ -290,7 +320,8 @@ def main() -> None:
                 fh.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"Wrote {len(rows)} rows -> {args.rows_out}", file=sys.stderr)
 
-    aggregate(rows, [m for m, _ in method_paths], args.n_boot, args.seed)
+    aggregate(rows, [m for m, _ in method_paths], args.n_boot, args.seed,
+              summary_out=_summary_path(args.summary_out, args.rows_out))
 
 
 if __name__ == "__main__":
