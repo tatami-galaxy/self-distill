@@ -42,8 +42,8 @@ from pathlib import Path
 from openai import AsyncOpenAI, OpenAI
 from transformers import AutoTokenizer
 
-from credit_assignment.score_opsd import build_solution_map
-from credit_assignment.segment import segment_rollout
+from error_detect.score_opsd import build_solution_map
+from error_detect.segment import segment_rollout
 
 JUDGE_SYSTEM = (
     "You are an expert mathematician grading a student's step-by-step solution "

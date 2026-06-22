@@ -25,7 +25,7 @@ from pathlib import Path
 
 from vllm import LLM
 
-from credit_assignment.common import (
+from error_detect.common import (
     build_prompt_ids,
     expected_advantage,
     score_prompt_logprobs,

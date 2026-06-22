@@ -25,7 +25,7 @@ from pathlib import Path
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
-from credit_assignment.common import (
+from error_detect.common import (
     build_prompt_ids,
     read_generation_logprobs,
     token_strings,

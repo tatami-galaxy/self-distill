@@ -37,7 +37,7 @@ from pathlib import Path
 
 from vllm import LLM
 
-from credit_assignment.common import expected_advantage, score_prompt_logprobs
+from error_detect.common import expected_advantage, score_prompt_logprobs
 
 
 def parse_args() -> argparse.Namespace:
