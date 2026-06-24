@@ -50,7 +50,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
-from eval.run_eval import SYSTEM_PROMPT 
+from eval.run_eval import SYSTEM_PROMPT
+from eval.utils import extract_boxed_answer, grade_answer
 
 
 def build_prompt(question: str) -> list[dict]:
@@ -64,11 +65,14 @@ def build_prompt(question: str) -> list[dict]:
 
 def to_sdft_columns(ds):
     """Map the PI dataset (question, answer, privileged_context) to the columns
-    SDFTTrainer consumes (prompt, privileged_context). `answer` is dropped: SDFT
-    has no reward, it only distills the teacher distribution."""
+    the trainer uses: `prompt` and `privileged_context` drive SDFT; `answer` is
+    the gold final answer, carried through (SDFTConfig keeps unused columns) so
+    RewardLoggingSDFTTrainer can grade the student's rollouts. It does not affect
+    the gradient -- SDFT only distills the teacher."""
     return ds.map(
         lambda row: {
             "prompt": build_prompt(row["question"]),
+            "answer": row["answer"],
             "privileged_context": row["privileged_context"],
         },
         remove_columns=ds.column_names,
@@ -105,6 +109,41 @@ def filter_overlong(ds, tokenizer, max_prompt_length, template, chat_template_kw
     ds = ds.filter(keep)
     print(f"  teacher prompt > {max_prompt_length} tok: dropped {n0 - len(ds)}, kept {len(ds)}/{n0}")
     return ds
+
+
+class RewardLoggingSDFTTrainer(SDFTTrainer):
+    """SDFT trainer that also logs the student's answer accuracy as `reward/answer_accuracy`.
+
+    SDFT has no reward -- the gradient comes only from distilling the teacher.
+    But grading the student's on-policy rollouts against the gold `answer` each
+    step is a key diagnostic: it tracks whether the student is actually getting
+    better at the task, and whether PI-induced exploration collapse trades search
+    (and accuracy) for shorter, teacher-imitating traces. This is logging only;
+    it never enters the loss.
+    """
+
+    def _prepare_training_batch(self, inputs):
+        batch = super()._prepare_training_batch(inputs)
+        self._log_answer_accuracy(inputs, batch)
+        return batch
+
+    def _log_answer_accuracy(self, inputs, batch):
+        if not inputs or inputs[0].get("answer") is None:
+            return
+        mode = "train" if self.model.training else "eval"
+        # _get_completion_ids_list trims each rollout to its real length; decoded
+        # text keeps <think>...</think> and the \boxed{} answer (only specials are
+        # stripped). inputs is already expanded by num_generations, so it aligns
+        # 1:1 with the completions.
+        completions = self.processing_class.batch_decode(
+            self._get_completion_ids_list(batch), skip_special_tokens=True
+        )
+        correct = []
+        for ex, text in zip(inputs, completions, strict=True):
+            question = ex["prompt"][-1]["content"] if isinstance(ex["prompt"], list) else ""
+            correct.append(float(grade_answer(extract_boxed_answer(text), ex["answer"], question)))
+        acc = self.accelerator.gather(torch.tensor(correct, device=self.accelerator.device))
+        self._metrics[mode]["reward/answer_accuracy"].append(acc.float().mean().item())
 
 
 def main():
@@ -245,7 +284,7 @@ def main():
     )
     model.config.use_cache = False  # gradient checkpointing below
 
-    trainer = SDFTTrainer(
+    trainer = RewardLoggingSDFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
