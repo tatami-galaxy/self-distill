@@ -325,11 +325,6 @@ def generate_hints(ds: Dataset, spec: DatasetSpec, args) -> list[str]:
     sp = SamplingParams(max_tokens=args.max_tokens)
     outputs = llm.generate(prompts, sp)
     hints = [extract_hint(o.outputs[0].text, args.think_close) for o in outputs]
-
-    for h in hints:
-        print(h)
-        print('\n')
-    quit()
     
     n_empty = sum(1 for h in hints if not h)
     if n_empty:
