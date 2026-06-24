@@ -20,14 +20,28 @@ The student / teacher are one network (same tokenizer) differing only in the PI.
 The system prompt and chat format are shared with eval (`eval.run_eval`) so the
 trained student is prompted at eval time exactly as it was trained.
 
+Generation uses a vLLM *server* by default: launch it on its own GPU first, then
+point training at it. This frees the training GPU of vLLM's weights+KV cache, so
+the teacher forward and a larger batch fit. The teacher (frozen `base`) is scored
+locally; only the student's on-policy generation goes to the server.
+
 Examples
 --------
-python -m train.train_sdft --pi-data data/pi/full
-python -m train.train_sdft --pi-data data/pi/hint_Qwen3-4B_nothink --max-samples 256
-python -m train.train_sdft --pi-data data/pi/alpha_0.5 --no-use-vllm   # transformers gen (debug)
+# 1. start the vLLM server on a dedicated GPU (e.g. GPU 7)
+CUDA_VISIBLE_DEVICES=7 trl vllm-serve --model Qwen/Qwen3-4B --port 8000 \
+    --gpu_memory_utilization 0.9 --max_model_len 16384
+
+# 2. train an arm on another GPU, pointing at that server
+CUDA_VISIBLE_DEVICES=4 python -m train.train_sdft --pi-data data/pi/full \
+    --keep-indices data/pi/keep_8192.json --vllm-server-port 8000
+
+# colocate (no server) or transformers (debug) still available:
+python -m train.train_sdft --pi-data data/pi/alpha_0.5 --vllm-mode colocate
+python -m train.train_sdft --pi-data data/pi/alpha_0.5 --no-use-vllm
 """
 
 import argparse
+import json
 import os
 
 import torch
@@ -61,6 +75,38 @@ def to_sdft_columns(ds):
     )
 
 
+def teacher_messages(prompt: list[dict], privileged_context: str, template: str) -> list[dict]:
+    """Reconstruct the teacher prompt exactly as SDFTTrainer does: the PI is
+    folded into the last user turn via `template`, system turns are kept as-is.
+    Mirrors `SDFTTrainer._compose_teacher_prompt` so length filtering matches
+    what the trainer will actually tokenize."""
+    system_messages = prompt[:-1]
+    user_text = prompt[-1]["content"]
+    teacher_text = template.format(prompt=user_text, privileged_context=privileged_context)
+    return system_messages + [{"role": "user", "content": teacher_text}]
+
+
+def filter_overlong(ds, tokenizer, max_prompt_length, template, chat_template_kwargs):
+    """Drop rows whose teacher prompt exceeds `max_prompt_length` tokens.
+
+    The trainer left-truncates over-length prompts, which for a long PI (e.g.
+    `full`) would silently chop the system prompt / question and keep only the
+    PI tail. Filtering instead keeps every retained example intact. The teacher
+    prompt is the longer of the two (it carries the PI), so it bounds both."""
+    def keep(row):
+        msgs = teacher_messages(row["prompt"], row["privileged_context"], template)
+        enc = tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=True,
+            return_dict=True, **chat_template_kwargs,
+        )
+        return len(enc["input_ids"]) <= max_prompt_length
+
+    n0 = len(ds)
+    ds = ds.filter(keep)
+    print(f"  teacher prompt > {max_prompt_length} tok: dropped {n0 - len(ds)}, kept {len(ds)}/{n0}")
+    return ds
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -72,34 +118,47 @@ def main():
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<basename of --pi-data>")
     p.add_argument("--max-samples", type=int, default=None,
-                   help="Subset the training set (quick smoke tests)")
-    # lengths -- the tiny SDFT defaults (512/256) truncate math reasoning + PI
-    p.add_argument("--max-prompt-length", type=int, default=4096,
+                   help="Subset the training set")
+    p.add_argument("--keep-indices", default=None,
+                   help="JSON from train.build_keep_set: a shared keep-set of row indices so "
+                        "every PI arm trains on identical questions. When set, rows are selected "
+                        "from it and per-arm length filtering is skipped.")
+    p.add_argument("--max-prompt-length", type=int, default=8192,
                    help="Teacher prompt holds the PI and is left-truncated; must fit "
                         "system + question + privileged_context for the longest PI.")
-    p.add_argument("--max-completion-length", type=int, default=4096)
+    p.add_argument("--max-completion-length", type=int, default=8192)
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
-    p.add_argument("--num-train-epochs", type=float, default=1.0)
-    p.add_argument("--per-device-train-batch-size", type=int, default=8)
-    p.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    p.add_argument("--num-generations", type=int, default=8,
+    p.add_argument("--optim", default="adamw_bnb_8bit",
+                   help="Optimizer. Default 8-bit Adam ; use adamw_torch for fp32.")
+    p.add_argument("--max-steps", type=int, default=500,
+                   help="Total optimizer steps to train (overrides epochs).")
+    p.add_argument("--per-device-train-batch-size", type=int, default=1)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    p.add_argument("--num-generations", type=int, default=1,
                    help="Rollouts per prompt; effective batch must be divisible by this.")
-    p.add_argument("--temperature", type=float, default=1.0)
-    # distillation objective (locked-in defaults)
+    # distillation objective
     p.add_argument("--distillation-alpha", type=float, default=1.0,
-                   help="1.0 = reverse KL (locked in). 0.0 = forward KL, in-between = JSD.")
+                   help="1.0 = reverse KL, 0.0 = forward KL, in-between = JSD.")
     p.add_argument("--distillation-topk", type=int, default=100)
     p.add_argument("--teacher-model-kind", default="base", choices=["base", "ema", "live"])
-    # generation backend
+    # generation backend (vLLM server by default; launch it separately --
+    #   CUDA_VISIBLE_DEVICES=<gpu> trl vllm-serve --model <model> --port <port>)
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True,
-                   help="vLLM colocate generation (locked in). --no-use-vllm falls back "
-                        "to transformers generation for debugging.")
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3)
+                   help="Use vLLM for generation. --no-use-vllm falls back to "
+                        "transformers generation for debugging.")
+    p.add_argument("--vllm-mode", default="colocate", choices=["server", "colocate"],
+                   help="server: connect to a separate `trl vllm-serve` process on its own GPU "
+                        "(frees training-GPU memory, allows higher batch). colocate: run vLLM "
+                        "in-process, sharing the training GPU.")
+    p.add_argument("--vllm-server-host", default="0.0.0.0")
+    p.add_argument("--vllm-server-port", type=int, default=8000)
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.2,
+                   help="Colocate only; in server mode set --gpu_memory_utilization on `trl vllm-serve`.")
     # bookkeeping
-    p.add_argument("--logging-steps", type=int, default=1)
-    p.add_argument("--save-steps", type=int, default=200)
-    p.add_argument("--report-to", default="none")
+    p.add_argument("--logging-steps", type=int, default=10)
+    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -108,6 +167,21 @@ def main():
     print(f"PI variant: {variant}  ->  output: {output_dir}")
 
     ds = load_from_disk(args.pi_data)
+    if args.keep_indices:
+        with open(args.keep_indices) as f:
+            keep = json.load(f)
+        if len(ds) != keep["n_total"]:
+            raise ValueError(
+                f"keep-set was built on {keep['n_total']} rows but this arm has {len(ds)}; "
+                "the arms are misaligned -- rebuild them / the keep-set with the same seed."
+            )
+        if keep["max_prompt_length"] != args.max_prompt_length:
+            raise ValueError(
+                f"keep-set built at max_prompt_length={keep['max_prompt_length']} "
+                f"but tried to train at {args.max_prompt_length}"
+            )
+        ds = ds.select(keep["indices"])
+        print(f"  shared keep-set: {len(ds)}/{keep['n_total']} rows from {args.keep_indices}")
     if args.max_samples:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     train_dataset = to_sdft_columns(ds)
@@ -119,11 +193,6 @@ def main():
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, dtype=torch.bfloat16
-    )
-    model.config.use_cache = False  # gradient checkpointing below
 
     training_args = SDFTConfig(
         output_dir=output_dir,
@@ -139,14 +208,16 @@ def main():
         max_prompt_length=args.max_prompt_length,
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
-        temperature=args.temperature,
         # generation backend
         use_vllm=args.use_vllm,
-        vllm_mode="colocate",
+        vllm_mode=args.vllm_mode,
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         # optimization
         learning_rate=args.learning_rate,
-        num_train_epochs=args.num_train_epochs,
+        optim=args.optim,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
@@ -157,6 +228,22 @@ def main():
         report_to=args.report_to,
         seed=args.seed,
     )
+
+    # Without a shared keep-set, fall back to per-arm length filtering (debug /
+    # single-arm runs). Drops rows whose teacher prompt would be left-truncated.
+    # Done before the model load so it fails fast / is cheap to iterate.
+    if not args.keep_indices:
+        train_dataset = filter_overlong(
+            train_dataset, tokenizer,
+            training_args.max_prompt_length,
+            training_args.teacher_prompt_template,
+            training_args.chat_template_kwargs,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, trust_remote_code=True, dtype=torch.bfloat16
+    )
+    model.config.use_cache = False  # gradient checkpointing below
 
     trainer = SDFTTrainer(
         model=model,
