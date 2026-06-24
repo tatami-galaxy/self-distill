@@ -9,7 +9,7 @@ reverse KL over the student's top-k support.
 
 Run once per PI variant (one of the dirs produced by
 `hint_gen.build_pi_datasets`): full, answer, tail, hint_<model>_<think>,
-alpha_<a>. The output dir defaults to `outputs/sdft/<variant>`.
+alpha_<a>. The output dir defaults to `outputs/sdft/<model>/<dataset>/<variant>`.
 
 Locked-in design (see memory):
   - reverse KL                 -> distillation_alpha = 1.0
@@ -32,12 +32,12 @@ CUDA_VISIBLE_DEVICES=7 trl vllm-serve --model Qwen/Qwen3-4B --port 8000 \
     --gpu_memory_utilization 0.9 --max_model_len 16384
 
 # 2. train an arm on another GPU, pointing at that server
-CUDA_VISIBLE_DEVICES=4 python -m train.train_sdft --pi-data data/pi/full \
-    --keep-indices data/pi/keep_8192.json --vllm-server-port 8000
+CUDA_VISIBLE_DEVICES=4 python -m train.train_sdft --pi-data data/pi_deepmath/full \
+    --keep-indices data/pi_deepmath/keep_8192.json --vllm-server-port 8000
 
 # colocate (no server) or transformers (debug) still available:
-python -m train.train_sdft --pi-data data/pi/alpha_0.5 --vllm-mode colocate
-python -m train.train_sdft --pi-data data/pi/alpha_0.5 --no-use-vllm
+python -m train.train_sdft --pi-data data/pi_numina/answer --vllm-mode colocate
+python -m train.train_sdft --pi-data data/pi_deepmath/alpha_0.5 --no-use-vllm
 """
 
 import argparse
@@ -151,11 +151,11 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--pi-data", required=True,
-                   help="Path to a built PI dataset dir, e.g. data/pi/full")
+                   help="Path to a built PI dataset dir, e.g. data/pi_deepmath/full or data/pi_numina/answer")
     p.add_argument("--model", default="Qwen/Qwen3-4B")
     p.add_argument("--output-root", default="outputs/sdft")
     p.add_argument("--output-dir", default=None,
-                   help="Override; defaults to <output-root>/<basename of --pi-data>")
+                   help="Override; defaults to <output-root>/<model>/<dataset>/<variant>")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Subset the training set")
     p.add_argument("--keep-indices", default=None,
@@ -201,9 +201,14 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
+    # Default output dir disambiguates by model and dataset, since we sweep PIs
+    # across multiple students and datasets: <output_root>/<model>/<dataset>/<variant>
+    # e.g. outputs/sdft/Qwen3-4B/pi_numina/answer
     variant = os.path.basename(args.pi_data.rstrip("/"))
-    output_dir = args.output_dir or os.path.join(args.output_root, variant)
-    print(f"PI variant: {variant}  ->  output: {output_dir}")
+    dataset_tag = os.path.basename(os.path.dirname(args.pi_data.rstrip("/")))  # e.g. pi_numina
+    model_slug = args.model.rstrip("/").split("/")[-1]
+    output_dir = args.output_dir or os.path.join(args.output_root, model_slug, dataset_tag, variant)
+    print(f"model: {model_slug}  dataset: {dataset_tag}  PI: {variant}  ->  output: {output_dir}")
 
     ds = load_from_disk(args.pi_data)
     if args.keep_indices:

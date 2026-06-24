@@ -14,7 +14,8 @@ the same model tokenizer and `enable_thinking`, so the budget matches training.
 
 Example
 -------
-python -m train.build_keep_set --pi-root data/pi --max-prompt-length 8192
+python -m train.build_keep_set --pi-root data/pi_deepmath --max-prompt-length 8192
+python -m train.build_keep_set --pi-root data/pi_numina --max-prompt-length 8192
 """
 
 import argparse
@@ -59,7 +60,8 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--pi-root", default="data/pi")
+    p.add_argument("--pi-root", default="data/pi_deepmath",
+                   help="Dir holding the PI arm datasets to intersect (data/pi_<dataset>)")
     p.add_argument("--arms", nargs="*", default=None,
                    help="Arm dir names to intersect (default: all dataset dirs under --pi-root)")
     p.add_argument("--model", default="Qwen/Qwen3-4B")
