@@ -3,7 +3,7 @@ Evaluate language models on MATH and other math benchmarks.
 
 Usage:
 
-    CUDA_VISIBLE_DEVICES=0 uv run python -m src.eval.run_eval \
+    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.run_eval \
     --model Qwen/Qwen2.5-Math-7B \
     --dataset math500 \
     --num_samples 10 \
