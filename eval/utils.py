@@ -763,6 +763,28 @@ def load_aime26(levels: list[int] | None = None) -> list[dict]:
     return out
 
 
+@register_dataset_eval("beyond_aime")
+def load_beyond_aime(levels: list[int] | None = None) -> list[dict]:
+    """Load ByteDance-Seed/BeyondAIME (100 test problems, AIME #11-15+ difficulty).
+
+    Test-only with just ``problem`` (str) and ``answer`` (int64); the answer is
+    cast to ``str`` and the level/subject/solution fields are left blank like the
+    other competition loaders.
+    """
+    ds = load_dataset("ByteDance-Seed/BeyondAIME", split="test")
+    out = []
+    for idx, row in enumerate(ds):
+        out.append({
+            "problem": row["problem"],
+            "answer": str(row["answer"]),
+            "solution": "",
+            "level": 0,
+            "subject": "",
+            "unique_id": f"beyondaime_{idx}",
+        })
+    return out
+
+
 @register_dataset_eval("math500")
 def load_math500(levels: list[int] | None = None) -> list[dict]:
     ds = load_dataset("HuggingFaceH4/MATH-500", split="test")

@@ -288,11 +288,6 @@ def main():
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="Load chat template from this model (e.g. the instruct variant) "
                              "for base models that lack one")
-    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
-                        default=None,
-                        help="For models with a toggleable thinking mode (e.g. Qwen3): "
-                            "pass --enable-thinking or --no-enable-thinking to override "
-                            "the template default. Leave unset to use the model default.") 
     
 
     args = parser.parse_args()
