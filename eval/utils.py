@@ -1,9 +1,48 @@
 import re
+import signal
+from contextlib import contextmanager
 
 import sympy
 from pylatexenc import latex2text
 from sympy.parsing import sympy_parser
 from datasets import load_dataset
+
+# ---------------------------------------------------------------------------
+# Sympy timeout guard
+# ---------------------------------------------------------------------------
+
+# Wall-clock budget for any single sympy simplify/equiv check. Untrusted model
+# outputs can contain expressions (e.g. a factorial of a 10^15-sized number)
+# that sympy evaluates *eagerly* and exactly, which never finishes in practice.
+_SYMPY_TIMEOUT_S = 5.0
+
+
+class _SympyTimeout(Exception):
+    pass
+
+
+@contextmanager
+def _time_limit(seconds: float):
+    """Best-effort wall-clock timeout via SIGALRM.
+
+    Only works on the main thread on Unix; if signals aren't available here
+    (e.g. called from a worker thread), it falls back to running unguarded so
+    grading never crashes on that account.
+    """
+    def _handler(signum, frame):
+        raise _SympyTimeout()
+
+    try:
+        old = signal.signal(signal.SIGALRM, _handler)
+    except (ValueError, AttributeError):
+        yield
+        return
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 # ---------------------------------------------------------------------------
 # Answer extraction
@@ -415,10 +454,11 @@ def _are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
     try:
         expr = f"({ground_truth_normalized})-({given_normalized})"
         if _should_allow_eval(expr):
-            sympy_diff = _sympy_parse(expr)
-            simplified = sympy.simplify(sympy_diff)
-            if simplified == 0:
-                are_equal = True
+            with _time_limit(_SYMPY_TIMEOUT_S):
+                sympy_diff = _sympy_parse(expr)
+                simplified = sympy.simplify(sympy_diff)
+                if simplified == 0:
+                    are_equal = True
     except Exception:
         pass
     return are_equal
@@ -507,8 +547,9 @@ def _latex_sympy_equiv(pred: str, gold: str) -> bool:
     except Exception:
         return False
     try:
-        diff = sympy.simplify(parse_latex(gold) - parse_latex(pred))
-        return diff == 0
+        with _time_limit(_SYMPY_TIMEOUT_S):
+            diff = sympy.simplify(parse_latex(gold) - parse_latex(pred))
+            return diff == 0
     except Exception:
         return False
 

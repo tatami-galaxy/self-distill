@@ -100,25 +100,24 @@ def main():
                    help="Default 8-bit Adam keeps optimizer states small; use adamw_torch for fp32.")
     p.add_argument("--max-steps", type=int, default=500,
                    help="Total optimizer steps to train (overrides epochs).")
-    p.add_argument("--per-device-train-batch-size", type=int, default=2)
+    p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
     p.add_argument("--num-generations", type=int, default=8,
                    help="Group size for group-relative advantage; effective batch must be divisible by this.")
-    p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=0.0,
                    help="KL coefficient to the reference model. 0 (default) = no ref model "
                         "loaded (lighter); >0 adds a frozen ref copy + KL penalty.")
     # generation backend (mirrors train_sdft)
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True,
                    help="Use vLLM for generation. --no-use-vllm falls back to transformers.")
-    p.add_argument("--vllm-mode", default="server", choices=["server", "colocate"])
+    p.add_argument("--vllm-mode", default="colocate", choices=["server", "colocate"])
     p.add_argument("--vllm-server-host", default="0.0.0.0")
     p.add_argument("--vllm-server-port", type=int, default=8000)
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.2,
                    help="Colocate only; in server mode set it on `trl vllm-serve`.")
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=50)
+    p.add_argument("--save-steps", type=int, default=100)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
@@ -157,7 +156,6 @@ def main():
         # sampling / objective
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
-        temperature=args.temperature,
         beta=args.beta,
         chat_template_kwargs={"enable_thinking": True},
         # generation backend
