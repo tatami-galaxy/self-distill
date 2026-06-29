@@ -1,3 +1,4 @@
+import logging
 import re
 import signal
 from contextlib import contextmanager
@@ -6,6 +7,12 @@ import sympy
 from pylatexenc import latex2text
 from sympy.parsing import sympy_parser
 from datasets import load_dataset
+
+# pylatexenc logs a WARNING ("macro '\\frac' failed its substitution!") whenever
+# a malformed macro -- e.g. a `\frac` missing its arguments in a model output --
+# can't be substituted during grading. The grader handles these gracefully
+# (the answer just won't match), so silence the noise.
+logging.getLogger("pylatexenc.latex2text").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Sympy timeout guard
