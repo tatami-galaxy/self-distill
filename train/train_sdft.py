@@ -51,7 +51,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from eval.run_eval import SYSTEM_PROMPT
-from eval.utils import extract_boxed_answer, grade_answer
+from eval.utils import grade_answer
 
 
 def build_prompt(question: str) -> list[dict]:
@@ -140,8 +140,7 @@ class RewardLoggingSDFTTrainer(SDFTTrainer):
         )
         correct = []
         for ex, text in zip(inputs, completions, strict=True):
-            question = ex["prompt"][-1]["content"] if isinstance(ex["prompt"], list) else ""
-            correct.append(float(grade_answer(extract_boxed_answer(text), ex["answer"], question)))
+            correct.append(float(grade_answer(text, ex["answer"])))
         acc = self.accelerator.gather(torch.tensor(correct, device=self.accelerator.device))
         self._metrics[mode]["reward/answer_accuracy"].append(acc.float().mean().item())
 

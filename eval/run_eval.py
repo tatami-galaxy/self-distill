@@ -14,11 +14,9 @@ import argparse
 import json
 import os
 import time
-from collections import defaultdict
 from vllm import LLM, SamplingParams
 from .utils import (
-    extract_boxed_answer,
-    grade_answer,
+    grade,
     DATASET_REGISTRY_EVAL,
 )
 
@@ -31,26 +29,17 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
-RAW_PROMPT = "Can you solve the following math problem? "
-RAW_COT = " Please reason step by step, and put your final answer within \\boxed{}."
 
-
-def format_prompt_chat(problem: str) -> list[dict]:
+def format_prompt(problem: str) -> list[dict]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
 
 
-def format_prompt_raw(problem: str) -> str:
-    return RAW_PROMPT + problem + RAW_COT
-
-
-def build_prompt(problem: str, prompt_mode: str, tokenizer, template_tok=None) -> str:
-    """Build a prompt string from a problem, respecting prompt_mode."""
-    if prompt_mode == "raw":
-        return format_prompt_raw(problem)
-    messages = format_prompt_chat(problem)
+def build_prompt(problem: str, tokenizer, template_tok=None) -> str:
+    """Build a prompt string from a problem"""
+    messages = format_prompt(problem)
     tok = template_tok or tokenizer
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     return tok.apply_chat_template(messages, **kwargs)
@@ -104,8 +93,7 @@ def evaluate_model(
     for prob, output in zip(problems, outputs):
         completion = output.outputs[0]
         response = completion.text
-        pred_answer = extract_boxed_answer(response)
-        correct = grade_answer(pred_answer, prob["answer"], prob.get("problem", ""))
+        pred_answer, correct = grade(response, prob["answer"])
         results.append({
             **prob,
             "response": response,
@@ -137,49 +125,6 @@ def print_report(eval_output: dict):
     print(f"Results: {model}")
     print(f"Overall: {correct}/{total} = {correct/total*100:.1f}%")
 
-    lens = [r["num_tokens_generated"] for r in results if "num_tokens_generated" in r]
-    if lens:
-        correct_lens = [
-            r["num_tokens_generated"] for r in results
-            if "num_tokens_generated" in r and r["correct"]
-        ]
-        incorrect_lens = [
-            r["num_tokens_generated"] for r in results
-            if "num_tokens_generated" in r and not r["correct"]
-        ]
-        print(f"Avg tokens generated: {sum(lens)/len(lens):.1f} (n={len(lens)})")
-        if correct_lens:
-            print(f"  correct:   {sum(correct_lens)/len(correct_lens):.1f} (n={len(correct_lens)})")
-        if incorrect_lens:
-            print(f"  incorrect: {sum(incorrect_lens)/len(incorrect_lens):.1f} (n={len(incorrect_lens)})")
-    print(f"{'='*60}")
-
-    # By level
-    by_level = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        by_level[r["level"]]["total"] += 1
-        by_level[r["level"]]["correct"] += int(r["correct"])
-
-    print(f"\n{'Level':<10} {'Correct':>8} {'Total':>6} {'Acc':>8}")
-    print("-" * 35)
-    for level in sorted(by_level):
-        d = by_level[level]
-        acc = d["correct"] / d["total"] * 100 if d["total"] else 0
-        print(f"Level {level:<4} {d['correct']:>8} {d['total']:>6} {acc:>7.1f}%")
-
-    # By subject
-    by_subject = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        by_subject[r["subject"]]["total"] += 1
-        by_subject[r["subject"]]["correct"] += int(r["correct"])
-
-    print(f"\n{'Subject':<25} {'Correct':>8} {'Total':>6} {'Acc':>8}")
-    print("-" * 50)
-    for subj in sorted(by_subject):
-        d = by_subject[subj]
-        acc = d["correct"] / d["total"] * 100 if d["total"] else 0
-        print(f"{subj:<25} {d['correct']:>8} {d['total']:>6} {acc:>7.1f}%")
-
     # Extraction failures
     no_answer = sum(1 for r in results if r["pred_answer"] is None)
     if no_answer:
@@ -201,26 +146,6 @@ def save_results(eval_output: dict, output_dir: str):
     total = len(results)
     correct = sum(r["correct"] for r in results)
 
-    by_level = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        by_level[r["level"]]["total"] += 1
-        by_level[r["level"]]["correct"] += int(r["correct"])
-
-    by_subject = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        by_subject[r["subject"]]["total"] += 1
-        by_subject[r["subject"]]["correct"] += int(r["correct"])
-
-    lens = [r["num_tokens_generated"] for r in results if "num_tokens_generated" in r]
-    correct_lens = [
-        r["num_tokens_generated"] for r in results
-        if "num_tokens_generated" in r and r["correct"]
-    ]
-    incorrect_lens = [
-        r["num_tokens_generated"] for r in results
-        if "num_tokens_generated" in r and not r["correct"]
-    ]
-
     summary = {
         "model": eval_output["model"],
         "method": eval_output.get("method", "greedy"),
@@ -228,21 +153,6 @@ def save_results(eval_output: dict, output_dir: str):
         "overall_accuracy": correct / total if total else 0,
         "elapsed_s": eval_output["elapsed_s"],
         "max_tokens": eval_output.get("max_tokens"),
-        "avg_tokens_generated": sum(lens) / len(lens) if lens else None,
-        "avg_tokens_correct": (
-            sum(correct_lens) / len(correct_lens) if correct_lens else None
-        ),
-        "avg_tokens_incorrect": (
-            sum(incorrect_lens) / len(incorrect_lens) if incorrect_lens else None
-        ),
-        "by_level": {
-            str(k): {**v, "accuracy": v["correct"] / v["total"] if v["total"] else 0}
-            for k, v in sorted(by_level.items())
-        },
-        "by_subject": {
-            k: {**v, "accuracy": v["correct"] / v["total"] if v["total"] else 0}
-            for k, v in sorted(by_subject.items())
-        },
         "extraction_failures": sum(
             1 for r in results if r["pred_answer"] is None
         ),
@@ -267,18 +177,10 @@ def main():
         help="HuggingFace model name or local checkpoint path",
     )
     parser.add_argument(
-        "--dataset", default="math500", choices=list(DATASET_REGISTRY_EVAL.keys()),
+        "--dataset", default="aime24", choices=list(DATASET_REGISTRY_EVAL.keys()),
         help="Benchmark dataset to evaluate on",
     )
-    parser.add_argument(
-        "--levels", nargs="*", type=int, default=None,
-        help="Filter to specific MATH difficulty levels (1-5)",
-    )
     parser.add_argument("--output_dir", default="results")
-    parser.add_argument("--prompt_mode", type=str, default="chat",
-                        choices=["chat", "raw"],
-                        help="Prompt format: 'chat' uses system+user chat template, "
-                             "'raw' uses plain CoT string (matches Power-SMC reference for base models)")
     parser.add_argument("--max_tokens", type=int, default=32000)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=None,

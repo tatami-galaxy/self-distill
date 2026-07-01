@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from datasets import Dataset, load_dataset
-from eval.utils import extract_boxed_answer  # noqa: E402
+from eval.utils import extract_answer  # noqa: E402
 
 
 HINT_INSTRUCTION = (
@@ -83,7 +83,7 @@ def _deepmath_answer(row: dict) -> str:
     ans = row.get("final_answer")
     if ans is not None and str(ans).strip():
         return str(ans).strip()
-    return (extract_boxed_answer(row["r1_solution_1"]) or "").strip()
+    return (extract_answer(row["r1_solution_1"]) or "").strip()
 
 
 def _deepmath_keep(row: dict) -> bool:

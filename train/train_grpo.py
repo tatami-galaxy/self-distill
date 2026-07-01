@@ -43,8 +43,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl import GRPOConfig, GRPOTrainer
 
+from trl.rewards import accuracy_reward
+
 from eval.run_eval import SYSTEM_PROMPT
-from eval.utils import extract_boxed_answer, grade_answer
 
 
 def build_prompt(question: str) -> list[dict]:
@@ -69,13 +70,12 @@ def to_grpo_columns(ds):
 def correctness_reward(completions, answer, **kwargs):
     """+1 if the rollout's boxed answer matches the gold answer, else 0.
 
-    `completions` is a list of conversational completions ([{role, content}, ...]);
-    `answer` is the gold column, expanded by num_generations to align 1:1."""
-    rewards = []
-    for completion, gold in zip(completions, answer):
-        text = completion[-1]["content"] if isinstance(completion, list) else completion
-        rewards.append(1.0 if grade_answer(extract_boxed_answer(text), gold) else 0.0)
-    return rewards
+    Thin wrapper over TRL's `accuracy_reward` (math_verify parse + verify):
+    `completions` is a list of conversational completions ([{role, content}, ...]),
+    `answer` is the gold column (expanded by num_generations to align 1:1) passed
+    as accuracy_reward's `solution`. A None reward (unparseable gold) maps to 0.0."""
+    rewards = accuracy_reward(completions=completions, solution=answer, **kwargs)
+    return [0.0 if r is None else r for r in rewards]
 
 
 def main():
