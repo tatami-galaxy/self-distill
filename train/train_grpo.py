@@ -71,8 +71,15 @@ def main():
                    help="Token-loss aggregation")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
+    p.add_argument("--lr-scheduler-type", default="constant",
+                   choices=["linear", "cosine", "cosine_with_restarts",
+                            "polynomial", "constant", "constant_with_warmup",
+                            "inverse_sqrt"],
+                   help="LR schedule over --max-steps")
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="Linear LR warmup steps before the schedule kicks in.")
     p.add_argument("--optim", default="adamw_bnb_8bit",
-                   help="Optimizer. Default 8-bit Adam; use adamw_torch for fp32.")
+                   help="Optimizer. Default 8-bit Adam; use adamw_torch_fused otherwise.")
     p.add_argument("--max-steps", type=int, default=500,
                    help="Total optimizer steps")
     p.add_argument("--per-device-train-batch-size", type=int, default=1,
@@ -118,6 +125,8 @@ def main():
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         # optimization
         learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         optim=args.optim,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
