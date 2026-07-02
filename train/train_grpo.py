@@ -66,6 +66,9 @@ def main():
     p.add_argument("--max-completion-length", type=int, default=8192)
     p.add_argument("--num-generations", type=int, default=8,
                    help="Rollouts per prompt (the GRPO group size).")
+    p.add_argument("--loss-type", default="dapo",
+                   choices=["dapo", "grpo", "dr_grpo"],
+                   help="Token-loss aggregation")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--optim", default="adamw_bnb_8bit",
@@ -85,6 +88,10 @@ def main():
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--log-completions", action=argparse.BooleanOptionalAction, default=False,
+                   help="Log sample completions to the run's report backend.")
+    p.add_argument("--num-completions-to-print", type=int, default=1,
+                   help="How many completions to print/log when --log-completions is set.")
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
@@ -103,6 +110,7 @@ def main():
         # GRPO objective
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
+        loss_type=args.loss_type,
         # generation backend
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
@@ -122,7 +130,8 @@ def main():
         # bookkeeping
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        log_completions=True,
+        log_completions=args.log_completions,
+        num_completions_to_print=args.num_completions_to_print,
         report_to=args.report_to,
         seed=args.seed,
     )
