@@ -1,12 +1,11 @@
 """
-Evaluate language models on MATH and other math benchmarks.
+Evaluate language models on math benchmarks.
 
 Usage:
 
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.run_eval \
-    --model Qwen/Qwen2.5-Math-7B \
-    --dataset math500 \
-    --num_samples 10 \
+    --model Qwen/Qwen3-4B \
+    --dataset aime24 \
 
 """
 
@@ -15,35 +14,22 @@ import json
 import os
 import time
 from vllm import LLM, SamplingParams
-from .utils import (
+from utils import (
     grade,
     DATASET_REGISTRY_EVAL,
+    format_prompt_math,
 )
 
 # ---------------------------------------------------------------------------
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the following problem step by step. "
-    "Put your final answer in \\boxed{}."
-)
-
-
-def format_prompt(problem: str) -> list[dict]:
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
-    ]
-
-
 def build_prompt(problem: str, tokenizer, template_tok=None) -> str:
     """Build a prompt string from a problem"""
-    messages = format_prompt(problem)
+    messages = format_prompt_math(problem)
     tok = template_tok or tokenizer
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     return tok.apply_chat_template(messages, **kwargs)
-
 
 # ---------------------------------------------------------------------------
 # Evaluation
@@ -54,9 +40,7 @@ def evaluate_model(
     problems: list[dict],
     max_tokens: int = 2048,
     tensor_parallel_size: int = 1,
-    chat_template_tokenizer=None,
-    prompt_mode: str = "chat",
-) -> dict:
+    chat_template_tokenizer=None,) -> dict:
     """Run evaluation and return results dict."""
     print(f"\n{'='*60}")
     print(f"Evaluating: {model_name}")
@@ -79,7 +63,7 @@ def evaluate_model(
     prompts = []
     for p in problems:
         prompts.append(build_prompt(
-            p["problem"], prompt_mode, tokenizer, template_tok)
+            p["problem"], tokenizer, template_tok)
         )
 
     # Generate
@@ -115,7 +99,6 @@ def evaluate_model(
 # ---------------------------------------------------------------------------
 
 def print_report(eval_output: dict):
-    """Print accuracy breakdown by level and subject."""
     model = eval_output["model"]
     results = eval_output["results"]
     total = len(results)
@@ -196,10 +179,8 @@ def main():
 
     # Load dataset
     loader = DATASET_REGISTRY_EVAL[args.dataset]
-    problems = loader(levels=args.levels)
+    problems = loader()
     print(f"Loaded {len(problems)} problems from {args.dataset}")
-    if args.levels:
-        print(f"  Filtered to levels: {args.levels}")
 
     # Subset selection
     if args.num_samples is not None and args.num_samples < len(problems):
@@ -226,7 +207,6 @@ def main():
         max_tokens=args.max_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
         chat_template_tokenizer=chat_template_tokenizer,
-        prompt_mode=args.prompt_mode,
     )
     print_report(eval_output)
     save_results(eval_output, output_dir)

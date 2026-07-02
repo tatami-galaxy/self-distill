@@ -5,6 +5,22 @@ from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
+# ---------------------------------------------------------------------------
+# Prompts and config
+# ---------------------------------------------------------------------------
+
+
+MATH_SYSTEM_PROMPT = (
+    "You are a helpful math assistant. Solve the following problem step by step. "
+    "Put your final answer in \\boxed{}."
+)
+
+def format_prompt_math(problem: str) -> list[dict]:
+    return [
+        {"role": "system", "content": MATH_SYSTEM_PROMPT},
+        {"role": "user", "content": problem},
+    ]
+
 
 # math_verify normalizes units, prioritizes a \boxed{} match, and (with
 # try_extract_without_anchor=False) only extracts a properly formatted answer.
@@ -79,6 +95,7 @@ def grade(response: str, gold: str) -> tuple[str | None, bool]:
     return pred_str, correct
 
 
+# used in train_sdft.py
 def grade_answer(response: str, gold: str) -> bool:
     """Boolean equivalence check between a completion and the gold answer."""
     return grade(response, gold)[1]
@@ -189,43 +206,23 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
 @register_dataset_train("deepmath")
 def load_deepmath(
     max_samples: int | None = None,
-    seed: int = 42,
 ) -> "Dataset":
-    """Load zwhe99/DeepMath-103K, exploding 3 solution columns into separate rows.
-
-    Each example is tripled: one row per r1_solution_{1,2,3}. The columns are
-    mapped to 'problem', 'solution', and 'answer' to match the existing format.
-    """
-    from datasets import concatenate_datasets
 
     ds = load_dataset("zwhe99/DeepMath-103K", split="train")
 
-    # Explode: create 3 copies of each row, one per solution column
-    def _make_split(sol_col):
-        return ds.map(
-            lambda x: {"problem": x["question"], "solution": x[sol_col], "answer": x["final_answer"]},
-            remove_columns=ds.column_names,
-            num_proc=4,
-        )
-
-    ds_exploded = concatenate_datasets([
-        _make_split("r1_solution_1"),
-        _make_split("r1_solution_2"),
-        _make_split("r1_solution_3"),
-    ])
-
-    # Drop rows with empty solutions
-    ds_exploded = ds_exploded.filter(
-        lambda x: x["solution"] is not None and len(x["solution"].strip()) > 0,
+    # Drop rows where any of the three solutions is empty
+    ds = ds.filter(
+        lambda x: all(
+            x[f"r1_solution_{i}"] is not None and len(x[f"r1_solution_{i}"].strip()) > 0
+            for i in (1, 2, 3)
+        ),
         num_proc=4,
     )
 
-    ds_exploded = ds_exploded.shuffle(seed=seed)
-
     if max_samples:
-        ds_exploded = ds_exploded.select(range(min(max_samples, len(ds_exploded))))
+        ds = ds.select(range(min(max_samples, len(ds))))
 
-    return ds_exploded
+    return ds
 
 
 @register_dataset_train("openthoughts")
