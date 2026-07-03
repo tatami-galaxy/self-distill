@@ -20,6 +20,29 @@ from utils import (
     format_prompt_math,
 )
 
+
+# ---------------------------------------------------------------------------
+# pass@k estimator
+# ---------------------------------------------------------------------------
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al., 2021).
+
+    Given ``n`` samples of which ``c`` are correct, returns the probability that
+    at least one of ``k`` samples drawn without replacement is correct:
+    ``1 - C(n-c, k) / C(n, k)``. Averaged over problems this is a lower-variance
+    estimate than sampling exactly ``k`` and checking for any hit, and lets a
+    single run of ``n`` samples yield pass@k for every ``k <= n``.
+    """
+    if k > n:
+        raise ValueError(f"pass@{k} needs n>={k} samples, got n={n}")
+    if n - c < k:
+        return 1.0
+    prod = 1.0
+    for i in range(n - c + 1, n + 1):
+        prod *= 1.0 - k / i
+    return 1.0 - prod
+
 # ---------------------------------------------------------------------------
 # Prompt formatting
 # ---------------------------------------------------------------------------
@@ -40,11 +63,20 @@ def evaluate_model(
     problems: list[dict],
     max_tokens: int = 2048,
     tensor_parallel_size: int = 1,
-    chat_template_tokenizer=None,) -> dict:
-    """Run evaluation and return results dict."""
+    chat_template_tokenizer=None,
+    n_samples: int = 1,
+) -> dict:
+    """Run evaluation and return results dict.
+
+    Samples ``n_samples`` completions per problem (one vLLM request with
+    ``n=n_samples``, which shares the prompt prefix across rollouts) and grades
+    each, so the caller can compute pass@k for any ``k <= n_samples``. Sampling
+    (temperature, top_p, ...) is left to vLLM's model defaults.
+    """
     print(f"\n{'='*60}")
     print(f"Evaluating: {model_name}")
     print(f"Problems:   {len(problems)}")
+    print(f"Samples/problem: {n_samples}")
     print(f"{'='*60}")
 
     llm_kwargs = dict(
@@ -55,6 +87,7 @@ def evaluate_model(
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
+        n=n_samples,
         max_tokens=max_tokens,
     )
 
@@ -70,20 +103,27 @@ def evaluate_model(
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
     elapsed = time.time() - t0
-    print(f"Generation took {elapsed:.1f}s ({len(problems)/elapsed:.1f} problems/s)")
+    n_gen = len(problems) * n_samples
+    print(f"Generation took {elapsed:.1f}s ({n_gen/elapsed:.1f} samples/s)")
 
-    # Score
+    # Score: grade each of the n_samples completions per problem.
     results = []
     for prob, output in zip(problems, outputs):
-        completion = output.outputs[0]
-        response = completion.text
-        pred_answer, correct = grade(response, prob["answer"])
+        samples = []
+        for completion in output.outputs:
+            response = completion.text
+            pred_answer, correct = grade(response, prob["answer"])
+            samples.append({
+                "response": response,
+                "pred_answer": pred_answer,
+                "correct": correct,
+                "num_tokens_generated": len(completion.token_ids),
+            })
         results.append({
             **prob,
-            "response": response,
-            "pred_answer": pred_answer,
-            "correct": correct,
-            "num_tokens_generated": len(completion.token_ids),
+            "samples": samples,
+            "n_samples": len(samples),
+            "n_correct": sum(s["correct"] for s in samples),
         })
 
     return {
@@ -91,6 +131,7 @@ def evaluate_model(
         "results": results,
         "elapsed_s": elapsed,
         "max_tokens": max_tokens,
+        "n_samples": n_samples,
     }
 
 
@@ -98,23 +139,37 @@ def evaluate_model(
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_report(eval_output: dict):
+def compute_pass_at_k(results: list[dict], ks: list[int]) -> dict[int, float]:
+    """Average the unbiased pass@k over all problems, for each k in ``ks``."""
+    total = len(results)
+    return {
+        k: sum(pass_at_k(r["n_samples"], r["n_correct"], k) for r in results) / total
+        for k in ks
+    }
+
+
+def print_report(eval_output: dict, ks: list[int]):
     model = eval_output["model"]
     results = eval_output["results"]
     total = len(results)
-    correct = sum(r["correct"] for r in results)
+    n_samples = eval_output["n_samples"]
 
     print(f"\n{'='*60}")
     print(f"Results: {model}")
-    print(f"Overall: {correct}/{total} = {correct/total*100:.1f}%")
+    print(f"Problems: {total}  |  Samples/problem: {n_samples}")
+    for k, acc in compute_pass_at_k(results, ks).items():
+        print(f"pass@{k}: {acc*100:.1f}%")
 
-    # Extraction failures
-    no_answer = sum(1 for r in results if r["pred_answer"] is None)
+    # Extraction failures (across all samples)
+    total_samples = sum(r["n_samples"] for r in results)
+    no_answer = sum(
+        1 for r in results for s in r["samples"] if s["pred_answer"] is None
+    )
     if no_answer:
-        print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total}")
+        print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total_samples} samples")
 
 
-def save_results(eval_output: dict, output_dir: str):
+def save_results(eval_output: dict, output_dir: str, ks: list[int]):
     """Save full results and summary to disk."""
     os.makedirs(output_dir, exist_ok=True)
     model_slug = eval_output["model"].replace("/", "_")
@@ -127,18 +182,20 @@ def save_results(eval_output: dict, output_dir: str):
     # Summary
     results = eval_output["results"]
     total = len(results)
-    correct = sum(r["correct"] for r in results)
+    pass_at_ks = compute_pass_at_k(results, ks)
+    total_samples = sum(r["n_samples"] for r in results)
 
     summary = {
         "model": eval_output["model"],
-        "method": eval_output.get("method", "greedy"),
         "dataset_size": total,
-        "overall_accuracy": correct / total if total else 0,
+        "n_samples": eval_output["n_samples"],
+        "pass_at_k": {f"pass@{k}": acc for k, acc in pass_at_ks.items()},
         "elapsed_s": eval_output["elapsed_s"],
         "max_tokens": eval_output.get("max_tokens"),
         "extraction_failures": sum(
-            1 for r in results if r["pred_answer"] is None
+            1 for r in results for s in r["samples"] if s["pred_answer"] is None
         ),
+        "total_samples": total_samples,
     }
 
     summary_path = os.path.join(output_dir, f"{model_slug}_summary.json")
@@ -164,6 +221,10 @@ def main():
         help="Benchmark dataset to evaluate on",
     )
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument("--n", type=int, default=1,
+                        help="Number of samples to draw per problem (n>=max(k) for pass@k)")
+    parser.add_argument("--k", type=int, nargs="+", default=[1],
+                        help="pass@k value(s) to report, e.g. --k 1 8 16")
     parser.add_argument("--max_tokens", type=int, default=32000)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=None,
@@ -176,6 +237,12 @@ def main():
     
 
     args = parser.parse_args()
+
+    if max(args.k) > args.n:
+        parser.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
+    if args.n > 1:
+        print("Note: pass@k needs stochastic sampling; relying on vLLM's model "
+              "default sampling (ensure temperature > 0 in the model's generation config)")
 
     # Load dataset
     loader = DATASET_REGISTRY_EVAL[args.dataset]
@@ -207,9 +274,10 @@ def main():
         max_tokens=args.max_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
         chat_template_tokenizer=chat_template_tokenizer,
+        n_samples=args.n,
     )
-    print_report(eval_output)
-    save_results(eval_output, output_dir)
+    print_report(eval_output, args.k)
+    save_results(eval_output, output_dir, args.k)
 
 
 if __name__ == "__main__":
