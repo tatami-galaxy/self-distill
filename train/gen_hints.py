@@ -1,0 +1,186 @@
+"""
+Generate self-hints for SDFT's `--pi-mode hint` (the "hint-self" PI arm).
+
+The model reads each DeepMath problem together with its reference solution and
+compresses it into a SMALL set of useful concepts and intermediate results --
+NOT the final answer. This is summarization of a solution the model can see, so
+even a small student produces good hints; the point is that the hint is phrased
+in the student's own terms and carries no answer, sitting between the `full`
+(whole solution) and `answer` (boxed value) privileged contexts.
+
+Run ONCE per model, before training. The model here MUST be the model you train
+with (`train_sdft.py --model`): the hint is only "self" if the same weights wrote
+it. That is enforced structurally -- the cache is keyed by model slug and stamped
+with a `gen_model` column that train_sdft asserts against its `--model`.
+
+Anti-leak: DeepMath solutions end in \\boxed{answer}; a hint that restates the
+answer would collapse this PI into the `answer` PI and confound the experiment.
+Rows whose hint contains \\boxed or the gold final answer are dropped.
+
+Output: an on-disk HF dataset at data/pi/hint/<model-slug>/ with columns
+question, final_answer, hint, gen_model.
+
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.gen_hints \
+    --model Qwen/Qwen3-1.7B --max-samples 20000
+"""
+
+import argparse
+import os
+import re
+
+from datasets import Dataset, load_from_disk
+from vllm import LLM, SamplingParams
+
+from utils import hint_path, load_deepmath
+
+
+HINT_SYSTEM = (
+    "You are helping a student prepare to solve a competition math problem. You "
+    "are given the problem and a full worked solution. Distill the solution into a "
+    "SHORT list of the key concepts, theorems, formulas, and intermediate results "
+    "that are most useful for solving the problem."
+)
+
+HINT_USER = (
+    "Problem:\n{problem}\n\n"
+    "Worked solution (for your reference only):\n{solution}\n\n"
+    "Write 3-6 concise bullet points naming the key ideas: relevant concepts, "
+    "theorems or lemmas, formulas, and important intermediate results or setup "
+    "steps. Explain *how* to approach the problem, not the arithmetic. Do NOT "
+    "state or compute the final answer, and do NOT use \\boxed{{}}. Output only the "
+    "bullet points."
+)
+
+
+def build_messages(problem: str, solution: str) -> list[dict]:
+    return [
+        {"role": "system", "content": HINT_SYSTEM},
+        {"role": "user", "content": HINT_USER.format(problem=problem, solution=solution)},
+    ]
+
+
+def leaks_answer(hint: str, gold: str) -> bool:
+    """True if the hint reveals the final answer.
+
+    `\\boxed` is always a leak. For the gold value we require a word-boundary
+    match and skip golds shorter than 2 chars: single-digit answers (0-9) appear
+    incidentally in almost every hint, so substring-matching them would drop
+    nearly everything -- there we rely on the no-answer instruction instead.
+    Dropping is the safe error (lost data, no confound); missing a leak is not,
+    so the check errs toward dropping for distinctive answers.
+    """
+    if "\\boxed" in hint:
+        return True
+    g = str(gold).strip()
+    if len(g) >= 2 and re.search(rf"(?<![\w.]){re.escape(g)}(?![\w.])", hint):
+        return True
+    return False
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--model", default="Qwen/Qwen3-1.7B",
+                   help="MUST match the model you train with (self-hint purity).")
+    p.add_argument("--max-samples", type=int, default=20000,
+                   help="How many DeepMath rows to generate hints for. Generate "
+                        "for the largest N you will train on; training takes a prefix.")
+    p.add_argument("--output-root", default="data/pi/hint")
+    p.add_argument("--force", action="store_true",
+                   help="Regenerate even if a large-enough cache already exists.")
+    # generation
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--max-tokens", type=int, default=512,
+                   help="Max hint length. Hints are short lists; 512 is ample.")
+    p.add_argument("--seed", type=int, default=42)
+    # vLLM
+    p.add_argument("--max-model-len", type=int, default=32768,
+                   help="vLLM context. Rows whose (problem+solution) prompt plus "
+                        "--max-tokens exceeds this are skipped.")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--tensor-parallel-size", type=int, default=1)
+    args = p.parse_args()
+
+    out_dir = hint_path(args.model, args.output_root)
+
+    # Reuse guard: skip if a compatible cache (same model, >= requested rows) exists.
+    if not args.force and os.path.isdir(out_dir):
+        cached = load_from_disk(out_dir)
+        same_model = set(cached.unique("gen_model")) == {args.model}
+        if same_model and len(cached) >= args.max_samples:
+            print(f"Reusing {len(cached)} cached hints at {out_dir} "
+                  f"(>= {args.max_samples}, model matches). Use --force to regenerate.")
+            return
+
+    ds = load_deepmath(max_samples=args.max_samples)
+    print(f"Loaded {len(ds)} DeepMath rows for hint generation with {args.model}")
+
+    llm = LLM(
+        model=args.model,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
+        seed=args.seed,
+        trust_remote_code=True,
+    )
+    tokenizer = llm.get_tokenizer()
+
+    # Build prompts and drop any whose input won't leave room for the hint.
+    budget = args.max_model_len - args.max_tokens
+    rows, conversations = [], []
+    n_too_long = 0
+    for row in ds:
+        messages = build_messages(row["question"], row["r1_solution_1"])
+        # return_dict + input_ids gives the real token count (a bare tokenize=True
+        # returns a BatchEncoding whose len() is the field count). enable_thinking
+        # is passed straight through to the Qwen chat template, matching llm.chat below.
+        enc = tokenizer.apply_chat_template(
+            [messages], add_generation_prompt=True, tokenize=True,
+            return_dict=True, enable_thinking=False,
+        )
+        n_prompt = len(enc["input_ids"][0])
+        if n_prompt > budget:
+            n_too_long += 1
+            continue
+        rows.append(row)
+        conversations.append(messages)
+    if n_too_long:
+        print(f"  skipped {n_too_long} rows whose prompt exceeded the context budget")
+
+    sampling = SamplingParams(
+        temperature=args.temperature, top_p=args.top_p,
+        max_tokens=args.max_tokens, seed=args.seed,
+    )
+    outputs = llm.chat(
+        conversations, sampling,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    kept, n_leaked, n_empty = [], 0, 0
+    for row, out in zip(rows, outputs, strict=True):
+        hint = out.outputs[0].text.strip()
+        if not hint:
+            n_empty += 1
+            continue
+        if leaks_answer(hint, row["final_answer"]):
+            n_leaked += 1
+            continue
+        kept.append({
+            "question": row["question"],
+            "final_answer": row["final_answer"],
+            "hint": hint,
+            "gen_model": args.model,
+        })
+
+    print(f"Generated {len(outputs)} hints -> kept {len(kept)} "
+          f"(dropped {n_leaked} answer leaks, {n_empty} empty)")
+
+    Dataset.from_list(kept).save_to_disk(out_dir)
+    print(f"Saved hint dataset -> {out_dir}")
+    print(f"  sample hint: {kept[0]['hint'][:200]!r}" if kept else "  (no rows kept!)")
+
+
+if __name__ == "__main__":
+    main()
