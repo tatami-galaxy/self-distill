@@ -56,7 +56,7 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--model", default="Qwen/Qwen3-4B")
+    p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--output-root", default="outputs/grpo")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/deepmath")
