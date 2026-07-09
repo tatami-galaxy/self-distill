@@ -35,20 +35,17 @@ from utils import hint_path, load_deepmath
 
 
 HINT_SYSTEM = (
-    "You are helping a student prepare to solve a competition math problem. You "
-    "are given the problem and a full worked solution. Distill the solution into a "
-    "SHORT list of the key concepts, theorems, formulas, and intermediate results "
-    "that are most useful for solving the problem."
+    "You are helping a student prepare to solve a competition math problem. "
+    "You are given the problem and a full worked solution. Extract a "
+    "SHORT list of the key concepts that are most useful for solving the problem."
 )
 
 HINT_USER = (
     "Problem:\n{problem}\n\n"
     "Worked solution (for your reference only):\n{solution}\n\n"
-    "Write 3-6 concise bullet points naming the key ideas: relevant concepts, "
-    "theorems or lemmas, formulas, and important intermediate results or setup "
-    "steps. Explain *how* to approach the problem, not the arithmetic. Do NOT "
-    "state or compute the final answer, and do NOT use \\boxed{{}}. Output only the "
-    "bullet points."
+    "Write a few concise bullet points naming the key ideas and concepts, "
+    "that are relevant for solving the problem. Do NOT state or compute the final answer. "
+    "Output only the bullet points."
 )
 
 
@@ -90,8 +87,6 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="Regenerate even if a large-enough cache already exists.")
     # generation
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--max-tokens", type=int, default=512,
                    help="Max hint length. Hints are short lists; 512 is ample.")
     p.add_argument("--seed", type=int, default=42)
@@ -150,7 +145,6 @@ def main():
         print(f"  skipped {n_too_long} rows whose prompt exceeded the context budget")
 
     sampling = SamplingParams(
-        temperature=args.temperature, top_p=args.top_p,
         max_tokens=args.max_tokens, seed=args.seed,
     )
     outputs = llm.chat(
@@ -161,6 +155,8 @@ def main():
     kept, n_leaked, n_empty = [], 0, 0
     for row, out in zip(rows, outputs, strict=True):
         hint = out.outputs[0].text.strip()
+        print(hint)
+        quit()
         if not hint:
             n_empty += 1
             continue
