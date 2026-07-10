@@ -189,8 +189,7 @@ def main():
     elapsed = time.time() - t0
 
     # Report table
-    print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n}, "
-          f"T={args.temperature})\n{'='*60}")
+    print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n}, ")
     header = "PI mode  " + "  ".join(f"pass@{k:<3}" for k in args.k)
     print(header)
     for mode in args.pi_modes:
@@ -203,8 +202,6 @@ def main():
         "n_problems": len(problems),
         "n_samples": args.n,
         "ks": args.k,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "elapsed_s": elapsed,

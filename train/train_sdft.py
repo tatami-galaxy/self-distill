@@ -10,7 +10,7 @@ Privileged context (`--pi-mode`):
             full solution; precompute with `python -m train.gen_hints` first
             (same --model). Sits between `full` and `answer`.
 
-# single GPU, colocate vLLM
+# single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sdft \
     --model Qwen/Qwen3-4B --pi-mode full
 
