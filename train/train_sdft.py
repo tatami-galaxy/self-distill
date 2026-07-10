@@ -23,12 +23,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
 """
 
 import argparse
+import json
 import os
 
 from datasets import load_from_disk
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
-from utils import format_prompt_math, load_deepmath
+from utils import format_prompt_math, hint_path, load_deepmath
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +133,6 @@ def build_sdft_dataset(
               f"fits max_prompt_length={max_prompt_length}")
 
     return ds
-
-
-def hint_path(model: str, root: str = "data/pi/hint") -> str:
-    """On-disk cache for `--pi-mode hint`, keyed by model slug so hints generated
-    by one model are never loaded for another (self-hint purity). Written by
-    train/gen_hints.py, read by train/train_sdft.py."""
-    return os.path.join(root, model.rstrip("/").split("/")[-1])
 
 
 def build_hint_dataset(model: str | None, max_samples: int | None):
@@ -327,6 +321,28 @@ def main():
         report_to=args.report_to,
         seed=args.seed,
     )
+
+    # Provenance: pi_mode (and, for hint, the generating model) are CLI args, not
+    # SDFTConfig fields, so they never reach the pickled training_args.bin. Drop a
+    # small run_meta.json at the run root -- shared by every checkpoint under
+    # output_dir -- so each run is self-describing when sweeping PIs.
+    if training_args.process_index == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        meta = {
+            "model": args.model,
+            "pi_mode": args.pi_mode,
+            "gen_model": args.model if args.pi_mode == "hint" else None,
+            "dataset": "deepmath",
+            "max_samples": args.max_samples,
+            "num_train_examples": len(train_dataset),
+            "distillation_mode": args.distillation_mode,
+            "distillation_alpha": args.distillation_alpha,
+            "teacher_model_kind": args.teacher_model_kind,
+        }
+        meta_path = os.path.join(output_dir, "run_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"Wrote run metadata -> {meta_path}")
 
     trainer = SDFTTrainer(
         model=args.model,

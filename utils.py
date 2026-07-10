@@ -22,6 +22,13 @@ def format_prompt_math(problem: str) -> list[dict]:
         {"role": "user", "content": problem},
     ]
 
+
+def hint_path(model: str, root: str = "data/pi/hint") -> str:
+    """On-disk cache for `--pi-mode hint`, keyed by model slug so hints generated
+    by one model are never loaded for another (self-hint purity). Written by
+    train/gen_hints.py; read by train/train_sdft.py and eval/passk_pi.py."""
+    return os.path.join(root, model.rstrip("/").split("/")[-1])
+
 # math_verify normalizes units, prioritizes a \boxed{} match, and (with
 # try_extract_without_anchor=False) only extracts a properly formatted answer.
 _PRED_EXTRACTION_CONFIG = [
