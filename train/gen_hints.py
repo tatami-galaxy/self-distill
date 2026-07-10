@@ -35,17 +35,18 @@ from utils import hint_path, load_deepmath
 
 
 HINT_SYSTEM = (
-    "You are helping a student prepare to solve a competition math problem. "
-    "You are given the problem and a full worked solution. Extract a "
+    "You are given a math problem and a full worked solution. Extract a "
     "SHORT list of the key concepts that are most useful for solving the problem."
 )
 
 HINT_USER = (
     "Problem:\n{problem}\n\n"
     "Worked solution (for your reference only):\n{solution}\n\n"
-    "Write a few concise bullet points naming the key ideas and concepts, "
-    "that are relevant for solving the problem. Do NOT state or compute the final answer. "
-    "Output only the bullet points."
+    "In a few lines mention key ideas and concepts "
+    "that might be relevant for solving the problem. "
+    "Output only the key ideas. "
+    "Be as brief as possible."
+    "Do NOT state or compute the final answer under any circumstances. "
 )
 
 
@@ -155,8 +156,6 @@ def main():
     kept, n_leaked, n_empty = [], 0, 0
     for row, out in zip(rows, outputs, strict=True):
         hint = out.outputs[0].text.strip()
-        print(hint)
-        quit()
         if not hint:
             n_empty += 1
             continue
@@ -169,7 +168,6 @@ def main():
             "hint": hint,
             "gen_model": args.model,
         })
-
     print(f"Generated {len(outputs)} hints -> kept {len(kept)} "
           f"(dropped {n_leaked} answer leaks, {n_empty} empty)")
 

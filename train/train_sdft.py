@@ -28,7 +28,7 @@ import os
 from datasets import load_from_disk
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
-from utils import format_prompt_math, hint_path, load_deepmath
+from utils import format_prompt_math, load_deepmath
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ PI_ANSWER = (
     "Reach it with your own complete reasoning."
 )
 PI_HINT = (
-    "Here are some useful concepts and intermediate results for the question above:\n\n"
+    "Here are some useful concepts for the question above:\n\n"
     "{hint}\n\n"
     "Use them for your own complete solution if needed."
 )
@@ -132,6 +132,13 @@ def build_sdft_dataset(
               f"fits max_prompt_length={max_prompt_length}")
 
     return ds
+
+
+def hint_path(model: str, root: str = "data/pi/hint") -> str:
+    """On-disk cache for `--pi-mode hint`, keyed by model slug so hints generated
+    by one model are never loaded for another (self-hint purity). Written by
+    train/gen_hints.py, read by train/train_sdft.py."""
+    return os.path.join(root, model.rstrip("/").split("/")[-1])
 
 
 def build_hint_dataset(model: str | None, max_samples: int | None):
