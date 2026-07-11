@@ -75,6 +75,24 @@ def leaks_answer(hint: str, gold: str) -> bool:
     return False
 
 
+def strip_thinking(text: str) -> str | None:
+    """Drop a model's ``<think>...</think>`` reasoning trace, keeping what follows.
+
+    Some models (e.g. OLMo) think by default and ignore ``enable_thinking=False``,
+    emitting the trace inline; the actual hint is the text after ``</think>``. We
+    strip it so the trace (which we don't want, and which leaks answers) never
+    reaches the cache or the leak check. Returns ``None`` when ``<think>`` was
+    opened but never closed -- the trace was truncated by ``--max-tokens`` and
+    there is no usable hint, which also signals the budget is too small for a
+    thinking model.
+    """
+    if "</think>" in text:
+        return text.rsplit("</think>", 1)[1].strip()
+    if "<think>" in text:
+        return None
+    return text.strip()
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -88,7 +106,7 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="Regenerate even if a large-enough cache already exists.")
     # generation
-    p.add_argument("--max-tokens", type=int, default=512,
+    p.add_argument("--max-tokens", type=int, default=8192,
                    help="Max hint length. Hints are short lists; 512 is ample.")
     p.add_argument("--seed", type=int, default=42)
     # vLLM
@@ -153,9 +171,14 @@ def main():
         chat_template_kwargs={"enable_thinking": False},
     )
 
-    kept, n_leaked, n_empty = [], 0, 0
+    kept, n_leaked, n_empty, n_unclosed = [], 0, 0, 0
     for row, out in zip(rows, outputs, strict=True):
-        hint = out.outputs[0].text.strip()
+        # Strip any inline reasoning trace first, so only the concise hint is
+        # cached and leak-checked (thinking models ignore enable_thinking=False).
+        hint = strip_thinking(out.outputs[0].text)
+        if hint is None:
+            n_unclosed += 1
+            continue
         if not hint:
             n_empty += 1
             continue
@@ -169,7 +192,10 @@ def main():
             "gen_model": args.model,
         })
     print(f"Generated {len(outputs)} hints -> kept {len(kept)} "
-          f"(dropped {n_leaked} answer leaks, {n_empty} empty)")
+          f"(dropped {n_leaked} answer leaks, {n_empty} empty, {n_unclosed} unclosed-thinking)")
+    if n_unclosed:
+        print(f"  note: {n_unclosed} outputs were an unclosed <think> trace -- "
+              f"raise --max-tokens (currently {args.max_tokens}) for this thinking model")
 
     Dataset.from_list(kept).save_to_disk(out_dir)
     print(f"Saved hint dataset -> {out_dir}")
