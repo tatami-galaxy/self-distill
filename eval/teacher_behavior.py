@@ -32,7 +32,7 @@ problem-for-problem and every mean shares a denominator.
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
     --teacher-model Qwen/Qwen3-1.7B --pi-modes none answer hint full
 
-# strong teacher (OPD), query-only, same problems (needs network for first download)
+# strong teacher (OPD), query-only, same problems 
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
     --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
     --problem-model Qwen/Qwen3-1.7B --pi-modes none
@@ -98,9 +98,15 @@ def measure_completion(text: str, n_tokens: int, finish_reason: str | None,
         "text": text,
         "n_tokens": n_tokens,
         "correct": correct,
-        # truncated: hit the token cap, or the <think> block never closed. Either
-        # way the length is right-censored and would bias the mean downward.
-        "truncated": finish_reason == "length" or not closed,
+        # Two distinct flags, kept separate:
+        #  * truncated -- hit the token cap (finish_reason "length"); its length is
+        #    right-censored and biases mean_tokens downward.
+        #  * unclosed  -- no </think> in the completion. A truncated completion is
+        #    always unclosed, but a completion can also finish (reason "stop") while
+        #    still inside the think block -- e.g. under full PI it reaches \boxed
+        #    before emitting </think>. That length is genuine, not censored.
+        "truncated": finish_reason == "length",
+        "unclosed": not closed,
         "e_think": sum(e_think.values()),
         "e_post": sum(e_post.values()),
         "e_total": sum(e_total.values()),
@@ -129,6 +135,7 @@ def summarize(records: list[dict]) -> dict:
         "mean_tokens": tot_tokens / n,
         "pass@1": sum(r["correct"] for r in records) / n,
         "trunc_rate": sum(r["truncated"] for r in records) / n,
+        "unclosed_rate": sum(r["unclosed"] for r in records) / n,
         "mean_e_total": e_total / n,
         "mean_e_think": e_think / n,
         "mean_e_post": sum(r["e_post"] for r in records) / n,
@@ -190,9 +197,6 @@ def main():
                    help="Completion budget. Thinking teachers can overrun this; "
                         "truncated completions are flagged (trunc_rate) since their "
                         "censored length biases mean_tokens downward.")
-    p.add_argument("--temperature", type=float, default=0.8,
-                   help="Matches passk_pi / training-time teacher sampling.")
-    p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--output-dir", default="results/teacher_behavior")
     p.add_argument("--save-completions", action=argparse.BooleanOptionalAction, default=True,
                    help="Dump raw completion text + per-completion metrics to JSONL "
@@ -231,7 +235,7 @@ def main():
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
         n=args.n, max_tokens=args.max_tokens,
-        temperature=args.temperature, top_p=args.top_p, seed=args.seed,
+        seed=args.seed,
     )
 
     out_dir = os.path.join(args.output_dir, args.teacher_model.replace("/", "_"))
@@ -245,7 +249,8 @@ def main():
         s = summary[mode]
         print(f"  {mode:7s}  tokens={s['mean_tokens']:7.1f}  "
               f"E(y)={s['mean_e_total']:5.2f}  E/1k={s['e_per_1k_tokens']:5.2f}  "
-              f"pass@1={s['pass@1']*100:5.1f}%  trunc={s['trunc_rate']*100:4.1f}%")
+              f"pass@1={s['pass@1']*100:5.1f}%  trunc={s['trunc_rate']*100:4.1f}%  "
+              f"unclosed={s['unclosed_rate']*100:4.1f}%")
         if args.save_completions:
             jl = os.path.join(out_dir, f"completions_{mode}.jsonl")
             with open(jl, "w") as f:
@@ -259,8 +264,6 @@ def main():
         "n_problems": len(problems),
         "n_samples": args.n,
         "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
         "seed": args.seed,
         "epistemic_markers": EPISTEMIC_MARKERS,
         "elapsed_s": elapsed,

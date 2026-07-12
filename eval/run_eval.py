@@ -221,9 +221,9 @@ def main():
         help="Benchmark dataset to evaluate on",
     )
     parser.add_argument("--output_dir", default="results")
-    parser.add_argument("--n", type=int, default=1,
+    parser.add_argument("--n", type=int, default=16,
                         help="Number of samples to draw per problem (n>=max(k) for pass@k)")
-    parser.add_argument("--k", type=int, nargs="+", default=[1],
+    parser.add_argument("--k", type=int, nargs="+", default=[1, 8, 16],
                         help="pass@k value(s) to report, e.g. --k 1 8 16")
     parser.add_argument("--max_tokens", type=int, default=32000)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
