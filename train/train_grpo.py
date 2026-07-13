@@ -80,7 +80,7 @@ def main():
                    help="Linear LR warmup steps before the schedule kicks in.")
     p.add_argument("--optim", default="adamw_bnb_8bit",
                    help="Optimizer. Default 8-bit Adam; use adamw_torch_fused otherwise.")
-    p.add_argument("--max-steps", type=int, default=500,
+    p.add_argument("--max-steps", type=int, default=200,
                    help="Total optimizer steps")
     p.add_argument("--per-device-train-batch-size", type=int, default=1,
                    help="should be a multiple of --num-generations.")
@@ -94,7 +94,7 @@ def main():
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--log-completions", action=argparse.BooleanOptionalAction, default=False,
                    help="Log sample completions to the run's report backend.")
     p.add_argument("--num-completions-to-print", type=int, default=1,

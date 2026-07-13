@@ -197,7 +197,7 @@ def main():
                         "default), 'answer' boxed value, or 'hint' precomputed "
                         "self-hints (run train.gen_hints first). See PI_* templates.")
     # SDFT objective
-    p.add_argument("--distillation-mode", default="topk_logits",
+    p.add_argument("--distillation-mode", default="sampled_token",
                    choices=["topk_logits", "full_logits", "sampled_token"],
                    help="Support the reverse-KL is computed over. 'topk_logits' "
                         "(paper) is the student's top-k; 'sampled_token' is the "
@@ -213,7 +213,7 @@ def main():
                    help="Mask the first N completion tokens from the loss (paper's "
                         "heuristic to suppress copied 'Based on the example...' openings).")
     # teacher
-    p.add_argument("--teacher-model-kind", default="ema",
+    p.add_argument("--teacher-model-kind", default="base",
                    choices=["base", "live", "ema"],
                    help="'base' = frozen initial student (default); 'ema' = the "
                         "paper's Alg.1 EMA teacher; 'live' = current student.")
@@ -245,7 +245,7 @@ def main():
                    help="Linear LR warmup steps before the schedule kicks in.")
     p.add_argument("--optim", default="adamw_bnb_8bit",
                    help="Optimizer. Default 8-bit Adam; use adamw_torch_fused otherwise.")
-    p.add_argument("--max-steps", type=int, default=500,
+    p.add_argument("--max-steps", type=int, default=200,
                    help="Total optimizer steps")
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
@@ -258,7 +258,7 @@ def main():
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
