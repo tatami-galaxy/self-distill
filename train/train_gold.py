@@ -30,7 +30,7 @@ GPU topology (bf16 30B teacher + colocate vLLM don't share one GPU comfortably):
 
 CUDA_VISIBLE_DEVICES=6,7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     uv run python -m train.train_gold \
-    --model Qwen/Qwen3-1.7B --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
+    --model Qwen/Qwen3-1.7B --dataset deepmath --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
     --teacher-device cuda:1 --max-samples 8192
 
 Validated at 8192 completions: GPU6 (student+vLLM) peak ~60GB, GPU7 (teacher) ~64GB,
@@ -166,8 +166,6 @@ def main():
                         "0.0 = forward KL, 0.5 = JSD.")
     p.add_argument("--seq-kd", action=argparse.BooleanOptionalAction, default=False,
                    help="Sequence-level KD (SFT on teacher samples) instead of on-policy.")
-    p.add_argument("--temperature", type=float, default=0.9)
-    p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--max-completion-length", type=int, default=8192,
                    help="On-policy completion budget (GOLD's max_completion_length). "
                         "Matches the SDFT runs.")
@@ -244,8 +242,6 @@ def main():
         lmbda=args.lmbda,
         beta=args.beta,
         seq_kd=args.seq_kd,
-        temperature=args.temperature,
-        top_p=args.top_p,
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         # teacher

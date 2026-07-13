@@ -12,7 +12,7 @@ Privileged context (`--pi-mode`):
 
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sdft \
-    --model Qwen/Qwen3-4B --pi-mode full
+    --model Qwen/Qwen3-4B --pi-mode full --dataset deepmath
 
 # multiple GPUs: data-parallel via accelerate, one process per GPU. In colocate
 # mode each process trains the policy and runs its own vLLM engine on its GPU.

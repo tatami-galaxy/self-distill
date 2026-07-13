@@ -1,7 +1,7 @@
 """
 # single GPU, colocate vLLM
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_grpo \
-    --model Qwen/Qwen3-4B --max-samples 8192
+    --model Qwen/Qwen3-4B --max-samples 8192 --dataset deepmath
 
 # multiple GPUs: data-parallel via accelerate, one process per GPU. In colocate
 # mode each process trains the policy and runs its own vLLM engine on its GPU.
