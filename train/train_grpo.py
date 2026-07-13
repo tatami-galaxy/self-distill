@@ -17,7 +17,7 @@ import os
 from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import accuracy_reward
 
-from utils import format_prompt_math, load_deepmath
+from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, load_train_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ from utils import format_prompt_math, load_deepmath
 # ---------------------------------------------------------------------------
 
 
-def build_grpo_dataset(max_samples: int | None = None):
+def build_grpo_dataset(dataset: str = "deepmath", max_samples: int | None = None):
     """
     `prompt`   -- conversational [system, user] messages (same format as eval);
                   GRPOTrainer applies the chat template and generates from it.
@@ -33,10 +33,10 @@ def build_grpo_dataset(max_samples: int | None = None):
                   this column directly with math_verify, and bare values (e.g.
                   "204", "\\frac{1}{2}") don't reliably parse without the anchor.
 
-    `load_deepmath` yields (question, final_answer, r1_solution_*); the reference
-    solutions are unused here and dropped.
+    Loaders yield (question, final_answer, solution); the worked solution is unused
+    here and dropped.
     """
-    ds = load_deepmath(max_samples=max_samples)
+    ds = load_train_dataset(dataset, max_samples=max_samples)
 
     def _map(row):
         return {
@@ -57,9 +57,11 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
+                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN).")
     p.add_argument("--output-root", default="outputs/grpo")
     p.add_argument("--output-dir", default=None,
-                   help="Override; defaults to <output-root>/<model>/deepmath")
+                   help="Override; defaults to <output-root>/<model>/<dataset>")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Subset the training set")
     # GRPO
@@ -104,10 +106,10 @@ def main():
     args = p.parse_args()
 
     model_slug = args.model.rstrip("/").split("/")[-1]
-    output_dir = args.output_dir or os.path.join(args.output_root, model_slug, "deepmath")
-    print(f"model: {model_slug}  dataset: deepmath  ->  output: {output_dir}")
+    output_dir = args.output_dir or os.path.join(args.output_root, model_slug, args.dataset)
+    print(f"model: {model_slug}  dataset: {args.dataset}  ->  output: {output_dir}")
 
-    train_dataset = build_grpo_dataset(max_samples=args.max_samples)
+    train_dataset = build_grpo_dataset(args.dataset, max_samples=args.max_samples)
     print(f"Loaded {len(train_dataset)} examples")
     print(f"  sample prompt: {train_dataset[0]['prompt'][-1]['content'][:120]!r}")
     print(f"  sample solution: {train_dataset[0]['solution']!r}")

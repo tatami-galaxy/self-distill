@@ -17,11 +17,11 @@ Anti-leak: DeepMath solutions end in \\boxed{answer}; a hint that restates the
 answer would collapse this PI into the `answer` PI and confound the experiment.
 Rows whose hint contains \\boxed or the gold final answer are dropped.
 
-Output: an on-disk HF dataset at data/pi/hint/<model-slug>/ with columns
-question, final_answer, hint, gen_model.
+Output: an on-disk HF dataset at data/pi/hint/<dataset>/<model-slug>/ with columns
+question, final_answer, hint, gen_model, dataset.
 
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.gen_hints \
-    --model Qwen/Qwen3-1.7B --max-samples 20000
+    --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 20000
 """
 
 import argparse
@@ -31,7 +31,7 @@ import re
 from datasets import Dataset, load_from_disk
 from vllm import LLM, SamplingParams
 
-from utils import hint_path, load_deepmath
+from utils import DATASET_REGISTRY_TRAIN, hint_path, load_train_dataset
 
 
 HINT_SYSTEM = (
@@ -99,8 +99,11 @@ def main():
     )
     p.add_argument("--model", default="Qwen/Qwen3-1.7B",
                    help="MUST match the model you train with (self-hint purity).")
+    p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
+                   help="Source dataset (see utils.DATASET_REGISTRY_TRAIN); only its "
+                        "solution-bearing rows are used. MUST match the training --dataset.")
     p.add_argument("--max-samples", type=int, default=20000,
-                   help="How many DeepMath rows to generate hints for. Generate "
+                   help="How many solution-bearing rows to generate hints for. Generate "
                         "for the largest N you will train on; training takes a prefix.")
     p.add_argument("--output-root", default="data/pi/hint")
     p.add_argument("--force", action="store_true",
@@ -117,7 +120,7 @@ def main():
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     args = p.parse_args()
 
-    out_dir = hint_path(args.model, args.output_root)
+    out_dir = hint_path(args.model, args.dataset, args.output_root)
 
     # Reuse guard: skip if a compatible cache (same model, >= requested rows) exists.
     if not args.force and os.path.isdir(out_dir):
@@ -128,8 +131,9 @@ def main():
                   f"(>= {args.max_samples}, model matches). Use --force to regenerate.")
             return
 
-    ds = load_deepmath(max_samples=args.max_samples)
-    print(f"Loaded {len(ds)} DeepMath rows for hint generation with {args.model}")
+    ds = load_train_dataset(args.dataset, max_samples=args.max_samples, require_solution=True)
+    print(f"Loaded {len(ds)} {args.dataset} rows (with solutions) for hint generation "
+          f"with {args.model}")
 
     llm = LLM(
         model=args.model,
@@ -146,7 +150,7 @@ def main():
     rows, conversations = [], []
     n_too_long = 0
     for row in ds:
-        messages = build_messages(row["question"], row["r1_solution_1"])
+        messages = build_messages(row["question"], row["solution"])
         # return_dict + input_ids gives the real token count (a bare tokenize=True
         # returns a BatchEncoding whose len() is the field count). enable_thinking
         # is passed straight through to the Qwen chat template, matching llm.chat below.
@@ -190,6 +194,7 @@ def main():
             "final_answer": row["final_answer"],
             "hint": hint,
             "gen_model": args.model,
+            "dataset": args.dataset,
         })
     print(f"Generated {len(outputs)} hints -> kept {len(kept)} "
           f"(dropped {n_leaked} answer leaks, {n_empty} empty, {n_unclosed} unclosed-thinking)")

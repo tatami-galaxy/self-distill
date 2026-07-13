@@ -23,11 +23,11 @@ def format_prompt_math(problem: str) -> list[dict]:
     ]
 
 
-def hint_path(model: str, root: str = "data/pi/hint") -> str:
-    """On-disk cache for `--pi-mode hint`, keyed by model slug so hints generated
-    by one model are never loaded for another (self-hint purity). Written by
-    train/gen_hints.py; read by train/train_sdft.py and eval/passk_pi.py."""
-    return os.path.join(root, model.rstrip("/").split("/")[-1])
+def hint_path(model: str, dataset: str, root: str = "data/pi/hint") -> str:
+    """On-disk cache for `--pi-mode hint`, keyed by dataset then model slug so hints
+    are never crossed between datasets or between models (self-hint purity). Written
+    by train/gen_hints.py; read by train/train_sdft.py and eval/passk_pi.py."""
+    return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
 
 # math_verify normalizes units, prioritizes a \boxed{} match, and (with
 # try_extract_without_anchor=False) only extracts a properly formatted answer.
@@ -129,6 +129,54 @@ def register_dataset_train(name):
         return fn
     return wrapper
 
+
+# ---------------------------------------------------------------------------
+# Common training schema
+#
+# Every DATASET_REGISTRY_TRAIN loader returns exactly three columns:
+#   question      -- the problem statement (str)
+#   final_answer  -- the gold final answer (str; always present -- rows without
+#                    one are dropped by the loader)
+#   solution      -- a worked-solution demo (str; "" when the dataset has none
+#                    for that row, e.g. ~82% of DeepScaleR)
+# so the train/eval scripts are dataset-agnostic and adding a dataset is one loader.
+# ---------------------------------------------------------------------------
+
+
+def _nonempty(x) -> bool:
+    return x is not None and len(str(x).strip()) > 0
+
+
+def has_solution(row: dict) -> bool:
+    """True if the row carries a non-empty worked-solution demo.
+
+    The paths that consume `solution` -- SDFT `--pi-mode full`, train/gen_hints.py,
+    and passk_pi's full arm -- filter on this. A no-op for DeepMath (its loader
+    already requires a solution) but essential for DeepScaleR, where most rows have
+    an answer but no solution."""
+    return _nonempty(row.get("solution"))
+
+
+def load_train_dataset(
+    dataset: str,
+    max_samples: int | None = None,
+    require_solution: bool = False,
+) -> "Dataset":
+    """Load a registered training dataset in the common schema.
+
+    `require_solution=True` (SDFT full / hint gen) drops rows without a `solution`
+    *before* taking the `max_samples` prefix, so the caller gets `max_samples` rows
+    that actually have a demo -- otherwise on DeepScaleR the prefix would be ~82%
+    solution-less. For DeepMath the drop is a no-op, so the prefix is unchanged."""
+    loader = DATASET_REGISTRY_TRAIN[dataset]
+    if not require_solution:
+        return loader(max_samples=max_samples)
+    ds = loader()
+    ds = ds.filter(has_solution, num_proc=4)
+    if max_samples is not None:
+        ds = ds.select(range(min(max_samples, len(ds))))
+    return ds
+
 # ---------------------------------------------------------------------------
 # Eval loaders
 # ---------------------------------------------------------------------------
@@ -214,14 +262,12 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
 def load_deepmath(
     max_samples: int | None = None,
 ) -> "Dataset":
-
     ds = load_dataset("zwhe99/DeepMath-103K", split="train")
 
-    # Drop rows where any of the three solutions is empty
+    # Drop rows without a final answer or where any of the three solutions is empty.
     ds = ds.filter(
-        lambda x: all(
-            x[f"r1_solution_{i}"] is not None and len(x[f"r1_solution_{i}"].strip()) > 0
-            for i in (1, 2, 3)
+        lambda x: _nonempty(x["final_answer"]) and all(
+            _nonempty(x[f"r1_solution_{i}"]) for i in (1, 2, 3)
         ),
         num_proc=4,
     )
@@ -229,7 +275,40 @@ def load_deepmath(
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
-    return ds
+    # Normalize to the common schema (solution = the first R1 trace).
+    return ds.map(
+        lambda row: {
+            "question": row["question"],
+            "final_answer": str(row["final_answer"]),
+            "solution": row["r1_solution_1"],
+        },
+        remove_columns=ds.column_names,
+    )
+
+
+@register_dataset_train("deepscaler")
+def load_deepscaler(
+    max_samples: int | None = None,
+) -> "Dataset":
+    """agentica-org/DeepScaleR-Preview-Dataset: (problem, answer, solution), 40,315
+    rows. Every row has an answer, but ~82% have an empty `solution` (official
+    solution unavailable); those are usable for GRPO/GOLD/`--pi-mode answer` and
+    dropped by `require_solution` for the solution-consuming paths (~7.4k remain)."""
+    ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
+
+    ds = ds.filter(lambda x: _nonempty(x["answer"]), num_proc=4)
+
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    return ds.map(
+        lambda row: {
+            "question": row["problem"],
+            "final_answer": str(row["answer"]),
+            "solution": row["solution"] or "",
+        },
+        remove_columns=ds.column_names,
+    )
 
 
 @register_dataset_train("openthoughts")
@@ -247,28 +326,23 @@ def load_openthoughts(
     # Filter to math domain
     ds = ds.filter(lambda x: x["domain"] == "math", num_proc=4)
 
-    # Map to standard columns
+    # Map to the common schema (question, final_answer, solution)
     def _map_columns(example):
         # Try extracting boxed answer from deepseek_solution first
         answer = extract_answer(example["deepseek_solution"] or "")
         if not answer and example.get("ground_truth_solution"):
             answer = extract_answer(example["ground_truth_solution"])
         return {
-            "problem": example["problem"],
+            "question": example["problem"],
             "solution": example["deepseek_reasoning"],
-            "answer": answer or "",
+            "final_answer": answer or "",
         }
 
     ds = ds.map(_map_columns, remove_columns=ds.column_names, num_proc=4)
 
     # Drop rows with empty solution or answer
     ds = ds.filter(
-        lambda x: (
-            x["solution"] is not None
-            and len(x["solution"].strip()) > 0
-            and x["answer"] is not None
-            and len(x["answer"].strip()) > 0
-        ),
+        lambda x: _nonempty(x["solution"]) and _nonempty(x["final_answer"]),
         num_proc=4,
     )
 

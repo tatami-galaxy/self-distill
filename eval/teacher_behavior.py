@@ -51,7 +51,7 @@ from eval.passk_pi import (
     load_eval_problems,
     restrict_to_full_feasible,
 )
-from utils import grade
+from utils import DATASET_REGISTRY_TRAIN, grade
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +187,9 @@ def main():
                         "--teacher-model (the self-teacher case). Set to the student "
                         "when the teacher is a strong external model, so both runs "
                         "score the SAME problems.")
+    p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
+                   help="Dataset whose hint cache (under --problem-model) defines the "
+                        "fixed eval set. Must match the hint cache's dataset.")
     p.add_argument("--pi-modes", nargs="+", default=["none", "answer", "hint", "full"],
                    choices=["none", "answer", "hint", "full"],
                    help="PI arms to generate. Strong-teacher OPD uses just 'none'.")
@@ -215,7 +218,9 @@ def main():
     # Fixed eval set: problem-model's hint cache, restricted to full-PI-feasible
     # under that model's tokenizer -- computed regardless of which arms we run, so
     # self- and strong-teacher invocations line up problem-for-problem.
-    problems = load_eval_problems(problem_model, args.num_problems, args.seed, need_full=True)
+    problems = load_eval_problems(
+        problem_model, args.num_problems, args.seed, need_full=True, dataset=args.dataset
+    )
     from transformers import AutoTokenizer
     problem_tok = AutoTokenizer.from_pretrained(problem_model, trust_remote_code=True)
     problems = restrict_to_full_feasible(

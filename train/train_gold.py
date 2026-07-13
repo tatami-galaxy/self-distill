@@ -45,7 +45,7 @@ import torch
 from torch import nn
 from trl.experimental.gold import GOLDConfig, GOLDTrainer
 
-from utils import format_prompt_math, load_deepmath
+from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, load_train_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +122,13 @@ class SplitDeviceGOLDTrainer(GOLDTrainer):
 # ---------------------------------------------------------------------------
 
 
-def build_gold_dataset(max_samples: int | None = None):
+def build_gold_dataset(dataset: str = "deepmath", max_samples: int | None = None):
     """`messages` = [system, user, assistant] with the system+user turns IDENTICAL
     to the SDFT / eval prompt (format_prompt_math). GOLD's ChatML collator reads
     messages[:-1] as the prompt; at lmbda=1.0 the assistant turn is regenerated
     on-policy, but the collator still needs it for the prompt/completion boundary,
     so we use the gold boxed answer (valid too for any lmbda < 1.0)."""
-    ds = load_deepmath(max_samples=max_samples)
+    ds = load_train_dataset(dataset, max_samples=max_samples)
 
     def _map(row):
         messages = format_prompt_math(row["question"]) + [
@@ -152,9 +152,11 @@ def main():
                    help="Student to train. Must share a tokenizer with --teacher-model.")
     p.add_argument("--teacher-model", default="Qwen/Qwen3-30B-A3B-Thinking-2507",
                    help="Strong external OPD teacher. Same tokenizer as --model.")
+    p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
+                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN).")
     p.add_argument("--output-root", default="outputs/gold")
     p.add_argument("--output-dir", default=None,
-                   help="Override; defaults to <output-root>/<model>/deepmath_<teacher>")
+                   help="Override; defaults to <output-root>/<model>/<dataset>_<teacher>")
     p.add_argument("--max-samples", type=int, default=None)
     # GOLD / distillation objective
     p.add_argument("--lmbda", type=float, default=1.0,
@@ -215,12 +217,12 @@ def main():
     model_slug = args.model.rstrip("/").split("/")[-1]
     teacher_slug = args.teacher_model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(
-        args.output_root, model_slug, f"deepmath_{teacher_slug}"
+        args.output_root, model_slug, f"{args.dataset}_{teacher_slug}"
     )
-    print(f"model: {model_slug}  teacher: {teacher_slug}  dataset: deepmath  "
+    print(f"model: {model_slug}  teacher: {teacher_slug}  dataset: {args.dataset}  "
           f"->  output: {output_dir}")
 
-    train_dataset = build_gold_dataset(max_samples=args.max_samples)
+    train_dataset = build_gold_dataset(args.dataset, max_samples=args.max_samples)
     print(f"Loaded {len(train_dataset)} examples")
 
     # GOLD builds its ChatML collator in __init__ before SFTTrainer loads a tokenizer
@@ -280,7 +282,7 @@ def main():
             "method": "gold_opd_vllm",
             "model": args.model,
             "teacher_model": args.teacher_model,
-            "dataset": "deepmath",
+            "dataset": args.dataset,
             "max_samples": args.max_samples,
             "num_train_examples": len(train_dataset),
             "use_uld_loss": False,
