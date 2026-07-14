@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import threading
@@ -21,6 +22,51 @@ def format_prompt_math(problem: str) -> list[dict]:
         {"role": "system", "content": MATH_SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
+
+
+def validate_resume(resume_path: str, this_meta: dict, force: bool = False) -> None:
+    """Guard a `--resume-from-checkpoint`: check the checkpoint against the original
+    run's run_meta.json (written at the run root = the checkpoint's parent dir).
+
+    Restoring weights/optimizer/scheduler/RNG works from any checkpoint, but resuming
+    on the right *examples* also needs the dataset and batch config to be identical
+    (shuffle_dataset uses a seeded permutation; the per-step batch boundary depends on
+    the batch config). Every key in `this_meta` present in the prior meta is compared;
+    a mismatch is a hard error (data would silently misalign) unless `force` downgrades
+    it to a warning. A missing run_meta.json warns and skips the check.
+
+    Shared by train_sdft / train_grpo / train_gold; each passes its own build_run_meta.
+    """
+    if not os.path.isdir(resume_path):
+        raise FileNotFoundError(f"--resume-from-checkpoint {resume_path} is not a directory")
+    if not os.path.basename(resume_path.rstrip("/")).startswith("checkpoint-"):
+        print(f"  warning: {resume_path} does not look like a 'checkpoint-<step>' dir")
+
+    meta_path = os.path.join(os.path.dirname(resume_path.rstrip("/")), "run_meta.json")
+    if not os.path.isfile(meta_path):
+        print(f"  warning: no run_meta.json next to the checkpoint ({meta_path}); "
+              f"cannot verify hyperparameters match -- data-skip alignment is on you.")
+        return
+
+    with open(meta_path) as f:
+        prior = json.load(f)
+    mismatches = [
+        f"    {k}: checkpoint={prior[k]!r} vs now={this_meta[k]!r}"
+        for k in this_meta
+        if k in prior and prior[k] != this_meta[k]
+    ]
+    if mismatches:
+        msg = ("Resume config differs from the checkpoint's run_meta.json "
+               f"({meta_path}):\n" + "\n".join(mismatches))
+        if force:
+            print(f"  warning (--force-resume): {msg}")
+        else:
+            raise ValueError(
+                msg + "\n  These affect which examples the data-skip lands on. "
+                "Pass the original run's args, or --force-resume to override."
+            )
+    else:
+        print(f"  resume config matches {meta_path}")
 
 
 def hint_path(model: str, dataset: str, root: str = "data/pi/hint") -> str:

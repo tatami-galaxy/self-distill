@@ -10,6 +10,13 @@ Privileged context (`--pi-mode`):
             full solution; precompute with `python -m train.gen_hints` first
             (same --model). Sits between `full` and `answer`.
 
+Resume (`--resume-from-checkpoint`) restores weights/optimizer/scheduler/RNG and
+skips already-seen data; pass the same hyperparameters (verified against run_meta.json).
+CAVEAT: only sound for `--teacher-model-kind base` (the frozen base teacher is re-loaded
+from the base model id, so resume can't corrupt it). For `ema` the EMA teacher state is
+held in a callback and is NOT in the checkpoint, so resuming resets it to the base weights
+and silently loses the accumulated EMA -- don't resume `ema` runs without accounting for this.
+
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sdft \
     --model Qwen/Qwen3-4B --pi-mode full --dataset deepmath
@@ -34,6 +41,7 @@ from utils import (
     format_prompt_math,
     hint_path,
     load_train_dataset,
+    validate_resume,
 )
 
 
@@ -193,6 +201,35 @@ def build_hint_dataset(model: str | None, dataset: str, max_samples: int | None)
 
 
 # ---------------------------------------------------------------------------
+# Resume
+# ---------------------------------------------------------------------------
+
+
+def build_run_meta(args, num_train_examples: int) -> dict:
+    """Provenance + resume-critical config for run_meta.json. The second block must
+    match on resume for the seeded data-skip to land on the same examples."""
+    return {
+        "model": args.model,
+        "pi_mode": args.pi_mode,
+        "gen_model": args.model if args.pi_mode == "hint" else None,
+        "dataset": args.dataset,
+        "max_samples": args.max_samples,
+        "num_train_examples": num_train_examples,
+        "distillation_mode": args.distillation_mode,
+        "distillation_alpha": args.distillation_alpha,
+        "teacher_model_kind": args.teacher_model_kind,
+        # resume-critical: dataset order (seed, length) + batch chunking. If any of
+        # these differ from the original run, the shuffle_dataset permutation or the
+        # per-step batch boundary shifts and the skip resumes on the wrong data.
+        "seed": args.seed,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_generations": args.num_generations,
+        "max_prompt_length": args.max_prompt_length,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -280,6 +317,17 @@ def main():
     p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
+    # resume
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="Resume from a checkpoint dir (path ending in "
+                        "'checkpoint-<step>'). Restores weights/optimizer/scheduler/RNG "
+                        "and skips already-seen examples. Pass the SAME --model, --dataset, "
+                        "--max-samples, --seed and batch config as the original run (verified "
+                        "against its run_meta.json). --max-steps is the TOTAL budget: training "
+                        "continues from the checkpoint's step up to --max-steps.")
+    p.add_argument("--force-resume", action="store_true",
+                   help="Downgrade a run_meta.json hyperparameter mismatch from an error to "
+                        "a warning (use only if you understand the data-skip consequences).")
     args = p.parse_args()
 
     model_slug = args.model.rstrip("/").split("/")[-1]
@@ -342,23 +390,20 @@ def main():
         seed=args.seed,
     )
 
+    meta = build_run_meta(args, len(train_dataset))
+
+    # Before resuming, verify the run this checkpoint came from used the same config
+    # (its run_meta.json sits beside the checkpoint), so the seeded data-skip lands
+    # on the examples that were actually left untrained.
+    if args.resume_from_checkpoint:
+        validate_resume(args.resume_from_checkpoint, meta, args.force_resume)
+
     # Provenance: pi_mode (and, for hint, the generating model) are CLI args, not
     # SDFTConfig fields, so they never reach the pickled training_args.bin. Drop a
     # small run_meta.json at the run root -- shared by every checkpoint under
     # output_dir -- so each run is self-describing when sweeping PIs.
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
-        meta = {
-            "model": args.model,
-            "pi_mode": args.pi_mode,
-            "gen_model": args.model if args.pi_mode == "hint" else None,
-            "dataset": args.dataset,
-            "max_samples": args.max_samples,
-            "num_train_examples": len(train_dataset),
-            "distillation_mode": args.distillation_mode,
-            "distillation_alpha": args.distillation_alpha,
-            "teacher_model_kind": args.teacher_model_kind,
-        }
         meta_path = os.path.join(output_dir, "run_meta.json")
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -369,7 +414,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     final_dir = os.path.join(output_dir, "final")
     trainer.save_model(final_dir)
     print(f"Saved model -> {final_dir}")
