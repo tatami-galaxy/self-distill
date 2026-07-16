@@ -1,281 +1,318 @@
 """
-Train the PPO baseline -- the actor-critic RL contrast to GRPO. Where GRPO scores
-a rollout against a *group-relative* mean baseline (no critic), PPO learns a value
-function and estimates per-token advantages with GAE. On our sparse terminal
-binary reward that learned critic is the whole point: it is the dense per-token
-credit-assignment signal, the RL analogue of the OPD/OPSD credit this project
-studies.
+Train the PPO baseline -- the actor-critic RL contrast to GRPO, in our RLVR setting
+(verifiable binary outcome reward, NO reward model, NO reference model, vLLM rollouts).
 
-Uses TRL's classic RLHF `trl.experimental.ppo.PPOTrainer`, adapted to our RLVR
-setup (verifiable binary reward, no reward model, no reference model). Three
-adaptations, none of which the stock trainer supports directly:
+Where GRPO scores a rollout against a *group-relative* mean baseline (no critic), PPO
+learns a **value function** and estimates per-token advantages with GAE. On our sparse
+terminal binary reward that learned critic is the whole point: it is the dense per-token
+credit-assignment signal, the RL analogue of the OPD/OPSD credit this project studies.
 
-  * Binary verifiable reward instead of a reward MODEL. TRL's PPOTrainer scores
-    with an nn.Module (`get_reward` runs a forward + `.score` head over the token
-    ids and reads the last-token logit) and never sees the gold answer. We instead
-    pass a tiny sentinel `reward_model`, carry the per-example gold answer through a
-    custom collator + a dataloader wrapper, and monkeypatch the module-level
-    `get_reward` to dispatch on model identity: our sentinel -> `utils.grade()`
-    (+1 correct / 0 incorrect); the value model -> the original `get_reward`.
-    (GRPOTrainer takes a `reward_funcs` callable; PPOTrainer has no such hook.)
+Design -- built ON TOP of GRPOTrainer rather than TRL's classic PPOTrainer, so we inherit
+the fast machinery for free and only add the critic:
 
-  * Reference-free (`kl_coef=0.0`), matching our GRPO baseline (GRPOConfig.beta
-    defaults to 0.0). Justified for verifiable rewards: a ground-truth verifier
-    cannot be reward-hacked, and reasoning RL wants the policy to drift from init.
-    The constructor still builds a reference copy (it raises if you pass None
-    without PEFT), so we free it post-init to reclaim the memory.
-    KNOWN RESIDUAL: at kl_coef=0 the rollout loop still runs one policy-as-ref
-    forward per micro-batch whose result is multiplied by 0. Harmless but wasted;
-    removing it needs a train()-loop override, deferred to the vLLM port.
+  * vLLM colocate generation + policy->vLLM weight sync, prompt tokenization, reward-func
+    invocation, per-token logprobs, and the clipped-surrogate policy loss are ALL reused
+    from GRPOTrainer unchanged. GRPO's `_compute_loss` already accepts per-token (B,T)
+    advantages (for subclasses like MiniLLM), so our GAE advantages plug straight in.
+  * NO reference model: GRPO builds one only when beta>0; we force beta=0 (matches our
+    GRPO baseline). NO reward model: the outcome reward is `trl.rewards.accuracy_reward`
+    over the gold `solution` column -- identical to the GRPO baseline, so PPO-vs-GRPO
+    isolates exactly the critic.
+  * The critic is a SEPARATE value model (policy arch + scalar `.score` head, via
+    AutoModelForSequenceClassification num_labels=1), kept out of `self.model` so the
+    vLLM weight-sync (which iterates `self.model.named_parameters()`) is untouched.
 
-  * Value model = the policy arch with a scalar head
-    (`AutoModelForSequenceClassification`, num_labels=1), initialised from --model.
+What we override on GRPOTrainer:
+  * `_calculate_rewards`  -- stash the raw (gathered) rewards so we can rebuild the
+                            terminal scalar reward for GAE (GRPO discards it after
+                            group-normalizing).
+  * `_generate_and_score_completions` -- call super() for all the generation/reward/
+                            logprob work, then REPLACE the group-normalized advantages
+                            with a value-model forward (old values) + GAE (advantages,
+                            returns). Stored as extra (B,T) tensors in the batch dict;
+                            GRPO's split/shuffle buffering handles them like any other.
+  * `_compute_loss`       -- reuse GRPO's policy loss (super) and ADD a clipped value
+                            (MSE) loss over the critic's fresh predictions vs returns.
+  * `create_optimizer`    -- add the value model's parameters so the critic trains.
 
-NO vLLM: PPOTrainer generates with HF `model.generate` (the slow path we dropped
-GKD for). So this baseline is deliberately scoped to the 1.7B student at a reduced
-completion budget; porting the GOLD-style colocate-vLLM rollout into PPO is a
-separate follow-up. NO resume: PPOTrainer.train() takes no resume argument.
+GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=0.95. lam is the
+PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline
+(the interpretable ablation); lam<1 leans on the critic's bootstrap for denser credit.
 
-GAE: gamma=1.0 (no discounting over a single reasoning episode) and lam=0.95.
-lam is the PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus
-the critic baseline (the interpretable ablation); lam<1 leans on the critic's
-bootstrap for denser per-token credit.
+Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
+separate value model + cross-process grad sync is a follow-up. No resume (the value-model
+state is not in the standard HF checkpoint).
 
-# single GPU, 1.7B, reduced budget (HF generate is slow at long lengths)
+# single GPU, colocate vLLM
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo \
-    --model Qwen/Qwen3-1.7B --dataset deepmath --max-steps 200
+    --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 8192
+
+aside :  GRPOTrainer also supports custom rollout logic, in case we want to use this later
 """
 
 import argparse
-import gc
 import json
 import os
+from dataclasses import dataclass, field
 
 import torch
-from torch import nn
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    DataCollatorWithPadding,
-)
-from trl.experimental.ppo import PPOConfig, PPOTrainer
-import trl.experimental.ppo.ppo_trainer as _ppo_mod
+from transformers import AutoModelForSequenceClassification
+from trl import GRPOConfig, GRPOTrainer
+from trl.rewards import accuracy_reward
 
-from utils import (
-    DATASET_REGISTRY_TRAIN,
-    format_prompt_math,
-    grade,
-    load_train_dataset,
-)
+from train.train_grpo import build_grpo_dataset
+from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 
 # ---------------------------------------------------------------------------
-# Binary verifiable reward, wired in where TRL expects a reward MODEL
+# Small masked reducers (defined here rather than imported from trl's experimental
+# PPO internals, to avoid depending on that module's private surface).
 # ---------------------------------------------------------------------------
-#
-# TRL's rollout loop calls `get_reward(model, query_responses, pad_token_id,
-# context_length)` twice per micro-batch -- once for the value model, once for the
-# reward model -- and only ever passes token ids (never the gold answer). We make
-# the reward a rule-based verifier by:
-#   1. a sentinel `reward_model` (below) whose identity we detect,
-#   2. a monkeypatch of module-level `get_reward` that routes the sentinel to
-#      binary grading and everything else (the value model) to the original, and
-#   3. per-batch gold answers stashed on the sentinel by _GoldStashingLoader.
 
 
-class BinaryRewardModel(nn.Module):
-    """Stand-in for TRL's reward model that returns a verifiable binary reward.
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (x * mask).sum() / mask.sum().clamp(min=1.0)
 
-    Never actually forwarded: the monkeypatched `get_reward` intercepts it before
-    the `.score`/backbone path runs. It still has to be a real nn.Module because
-    the trainer calls `disable_dropout_in_model` on it and moves it to the device;
-    the lone dummy parameter makes `.parameters()`/`.to()` well-defined.
 
-    Gold answers for the current rollout batch are stashed on `current_golds` (with
-    a `cursor` advanced across the micro-batch slices) by _GoldStashingLoader, so
-    `compute` can look up the gold aligned to each decoded completion.
+def masked_whiten(x: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
+    """Whiten `x` over the masked (real) tokens; matches trl PPO's masked_whiten."""
+    mean = masked_mean(x, mask)
+    var = masked_mean((x - mean) ** 2, mask)
+    out = (x - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        out = out + mean
+    return out
+
+
+def compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    gamma: float,
+    lam: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token-level GAE over right-padded completions.
+
+    `rewards`, `values`, `mask` are all (B, T) aligned to completion tokens; the terminal
+    reward sits at each row's last real token and `values`/`rewards` are zero on padding.
+    Because padding tails carry zero reward and zero value, GAE decays to 0 there and the
+    bootstrap at the terminal token uses next-value = 0 (episode end). Returns
+    (advantages, returns) with returns = advantages + values (the value-fn targets),
+    both computed from the RAW (un-whitened) advantages.
     """
-
-    def __init__(self, tokenizer, reward_correct: float, reward_incorrect: float):
-        super().__init__()
-        self._dummy = nn.Parameter(torch.zeros(1))
-        self.tokenizer = tokenizer
-        self.reward_correct = reward_correct
-        self.reward_incorrect = reward_incorrect
-        self.current_golds: list[str] = []
-        self.cursor = 0
-
-    def compute(self, query_responses: torch.Tensor, context_length: int):
-        """Grade the completion (tokens past `context_length`) of each row against
-        its gold answer. Returns (reward_logits, scores, sequence_lengths) to match
-        `get_reward`; only the middle element (the terminal score) is consumed."""
-        responses = query_responses[:, context_length:]
-        texts = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
-        n = len(texts)
-        golds = self.current_golds[self.cursor : self.cursor + n]
-        self.cursor += n
-        if len(golds) != n:
-            raise RuntimeError(
-                f"reward gold misalignment: needed {n} golds at cursor "
-                f"{self.cursor - n}, batch holds {len(self.current_golds)}"
-            )
-        vals = [
-            self.reward_correct if grade(t, g)[1] else self.reward_incorrect
-            for t, g in zip(texts, golds)
-        ]
-        scores = torch.tensor(vals, dtype=torch.float32, device=query_responses.device)
-        return None, scores, None
-
-
-def _install_reward_patch():
-    """Monkeypatch module-level `get_reward` once, dispatching on model identity:
-    a BinaryRewardModel -> binary grading; anything else (the value model) -> the
-    original. Idempotent, and preserves the original for the value-model path."""
-    if getattr(_ppo_mod, "_binary_reward_patched", False):
-        return
-    _orig_get_reward = _ppo_mod.get_reward
-
-    def get_reward(model, query_responses, pad_token_id, context_length):
-        if isinstance(model, BinaryRewardModel):
-            return model.compute(query_responses, context_length)
-        return _orig_get_reward(model, query_responses, pad_token_id, context_length)
-
-    _ppo_mod.get_reward = get_reward
-    _ppo_mod._binary_reward_patched = True
-
-
-_install_reward_patch()
+    values = values * mask
+    T = rewards.size(1)
+    lastgaelam = 0.0
+    advantages_reversed = []
+    for t in reversed(range(T)):
+        nextvalues = values[:, t + 1] if t < T - 1 else 0.0
+        delta = rewards[:, t] + gamma * nextvalues - values[:, t]
+        lastgaelam = delta + gamma * lam * lastgaelam
+        advantages_reversed.append(lastgaelam)
+    advantages = torch.stack(advantages_reversed[::-1], dim=1)
+    returns = advantages + values
+    return advantages, returns
 
 
 # ---------------------------------------------------------------------------
-# Carrying the gold answer to reward time
+# Config
 # ---------------------------------------------------------------------------
 
 
-class GoldPadCollator:
-    """Collate PPO batches while carrying the per-example gold answer through.
+@dataclass
+class PPOConfig(GRPOConfig):
+    """GRPOConfig + the PPO critic/GAE knobs. beta is forced to 0 (no reference model)
+    and scale_rewards to 'none' (advantages come from GAE, not group normalization)."""
 
-    The default `DataCollatorWithPadding` runs `tokenizer.pad`, which rejects a
-    string column -- so we pop `gold` (a list of strings, passed through untouched)
-    and pad only `input_ids`/`attention_mask`. The trainer's rollout loop reads
-    `input_ids`; `gold` rides along for the reward (see _GoldStashingLoader)."""
+    gamma: float = field(default=1.0, metadata={"help": "GAE discount (1.0 = no discounting)."})
+    lam: float = field(default=0.95, metadata={"help": "GAE lambda."})
+    vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
+    cliprange_value: float = field(default=0.2, metadata={"help": "Value-clipping range."})
+    whiten_advantages: bool = field(default=True, metadata={"help": "Whiten GAE advantages over the mask."})
+    missing_eos_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Subtract from a completion's terminal reward if it did not end in EOS "
+                          "(reasoning truncated at the budget). 0.0 disables."},
+    )
 
-    def __init__(self, tokenizer):
-        self._pad = DataCollatorWithPadding(tokenizer)
-
-    def __call__(self, features):
-        golds = [f.pop("gold") for f in features]
-        batch = self._pad(features)
-        batch["gold"] = golds
-        return batch
-
-
-class _GoldStashingLoader:
-    """Wrap the (accelerate-prepared) train dataloader so that drawing a batch
-    stashes that batch's gold answers onto the reward sentinel and resets its
-    per-batch cursor. The rollout loop consumes micro-batch slices of the batch in
-    order, so a cursor advanced by BinaryRewardModel.compute stays aligned with the
-    queries -- even though the dataloader shuffles (gold is collated in lockstep
-    with input_ids, so the stashed order already matches)."""
-
-    def __init__(self, loader, reward_model: BinaryRewardModel):
-        self._loader = loader
-        self._reward_model = reward_model
-
-    def __iter__(self):
-        for batch in self._loader:
-            self._reward_model.current_golds = batch["gold"]
-            self._reward_model.cursor = 0
-            yield batch
-
-    def __len__(self):
-        return len(self._loader)
-
-    def __getattr__(self, name):
-        return getattr(self._loader, name)
+    def __post_init__(self):
+        # Reference-free objective; advantages are GAE, so no group-normalization.
+        self.beta = 0.0
+        self.scale_rewards = "none"
+        super().__post_init__()
 
 
 # ---------------------------------------------------------------------------
-# Trainer subclass: free the ref at kl_coef=0, install the gold-stashing loader
+# Trainer
 # ---------------------------------------------------------------------------
 
 
-class BinaryRewardPPOTrainer(PPOTrainer):
-    def __init__(self, *args, **kwargs):
+class PPOTrainer(GRPOTrainer):
+    """GRPOTrainer + a learned critic (separate value model) and GAE advantages."""
+
+    def __init__(self, *args, value_model, **kwargs):
         super().__init__(*args, **kwargs)
-        # Reference-free objective: drop the frozen reference copy the constructor
-        # built (it raises if you pass None without PEFT). At kl_coef=0 the loop
-        # falls back to a policy-as-ref forward whose KL is scaled by 0.
-        if self.args.kl_coef == 0.0 and self.ref_model is not None:
-            self.ref_model = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print("kl_coef=0: freed the reference model (ref-free objective).")
-        # Route per-batch gold answers to the reward sentinel.
-        self.dataloader = _GoldStashingLoader(self.dataloader, self.reward_model)
+        # Keep the critic OUT of self.model so vLLM weight-sync (which loads
+        # self.model.named_parameters() into the engine) stays a pure-policy sync.
+        value_model = value_model.to(self.accelerator.device)
+        value_model.train()
+        if self.args.gradient_checkpointing:
+            value_model.gradient_checkpointing_enable()
+            value_model.config.use_cache = False
+            # Inputs are token ids (no grad); without this, checkpointing drops the
+            # value model's gradients entirely (same fix GRPO applies to the policy).
+            value_model.enable_input_require_grads()
+        self.value_model = value_model
+        self._rewards_per_func_buf = None  # stashed by _calculate_rewards for GAE
+
+    # -- critic parameters into the optimizer -------------------------------
+
+    def create_optimizer(self):
+        optimizer = super().create_optimizer()  # built over the policy (self.model)
+        value_params = [p for p in self.value_model.parameters() if p.requires_grad]
+        optimizer.add_param_group({"params": value_params})
+        return optimizer
+
+    # -- per-token value predictions ----------------------------------------
+
+    def _get_per_token_values(self, input_ids, attention_mask, logits_to_keep):
+        """Per-token state values aligned to the completion tokens, mirroring
+        `_get_per_token_logps_and_entropies`'s shift: run the value backbone, apply the
+        scalar `.score` head at every position, drop the last (next-token) position, and
+        keep the trailing `logits_to_keep` -> (B, C)."""
+        vm = self.value_model
+        backbone = getattr(vm, vm.base_model_prefix)
+        hidden = backbone(
+            input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+        ).last_hidden_state  # (B, L, H)
+        values = vm.score(hidden).squeeze(-1)  # (B, L)
+        values = values[:, :-1]  # drop last position (predicts the token after the sequence)
+        values = values[:, -logits_to_keep:]  # (B, C) aligned to completion tokens
+        return values
+
+    # -- stash raw rewards for GAE ------------------------------------------
+
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        rewards_per_func = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        self._rewards_per_func_buf = rewards_per_func  # gathered (B_all, num_funcs)
+        return rewards_per_func
+
+    # -- replace group-norm advantages with value + GAE ---------------------
+
+    def _generate_and_score_completions(self, inputs):
+        output = super()._generate_and_score_completions(inputs)
+        device = self.accelerator.device
+
+        # Rebuild the terminal scalar reward from the stashed (gathered) rewards_per_func,
+        # then take this process's slice (super() slices `advantages` the same way).
+        rpf = self._rewards_per_func_buf  # (B_all, num_funcs)
+        weights = self.reward_weights.to(rpf.device).unsqueeze(0)
+        rewards_all = (rpf * weights).nansum(dim=1)  # (B_all,)
+        rewards_all = torch.nan_to_num(rewards_all, nan=0.0)  # unscorable -> no signal
+        prompt_ids = output["prompt_ids"]
+        completion_ids = output["completion_ids"]
+        completion_mask = output["completion_mask"]
+        b_local = completion_ids.size(0)
+        pidx = self.accelerator.process_index
+        rewards = rewards_all[pidx * b_local : (pidx + 1) * b_local].to(device)  # (B,)
+
+        # Terminal reward at each row's last real completion token (right-padded).
+        seq_len = completion_mask.sum(dim=1).long()  # (B,)
+        last_idx = (seq_len - 1).clamp(min=0)  # (B,)
+        rows = torch.arange(b_local, device=device)
+        if self.args.missing_eos_penalty and self.args.missing_eos_penalty > 0:
+            last_tok = completion_ids[rows, last_idx]
+            no_eos = last_tok != self._tokenizer.eos_token_id
+            rewards = rewards - no_eos.float() * self.args.missing_eos_penalty
+        token_rewards = torch.zeros_like(completion_mask, dtype=torch.float32)  # (B, C)
+        token_rewards[rows, last_idx] = rewards
+        token_rewards = token_rewards * completion_mask
+
+        # Old values from the critic (no grad), then GAE.
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([output["prompt_mask"], completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        with torch.no_grad():
+            old_values = self._get_per_token_values(input_ids, attention_mask, logits_to_keep)
+        old_values = old_values.float() * completion_mask
+
+        # (B, T) per-token
+        advantages, returns = compute_gae(
+            token_rewards, old_values, completion_mask, self.args.gamma, self.args.lam
+        )
+        if self.args.whiten_advantages:
+            advantages = masked_whiten(advantages, completion_mask)
+        advantages = advantages * completion_mask
+
+        output["advantages"] = advantages  # (B, C) -- GRPO's loss accepts per-token advantages
+        output["returns"] = returns
+        output["old_values"] = old_values
+
+        # Log critic-side stats.
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["ppo/value_mean"].append(masked_mean(old_values, completion_mask).item())
+        self._metrics[mode]["ppo/returns_mean"].append(masked_mean(returns, completion_mask).item())
+        return output
+
+    # -- add the clipped value loss to GRPO's policy loss -------------------
+
+    def _compute_loss(self, model, inputs):
+        pg_loss = super()._compute_loss(model, inputs)  # policy loss (already normalized)
+
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        vpred = self._get_per_token_values(input_ids, attention_mask, logits_to_keep).float()
+        old_values = inputs["old_values"]
+        returns = inputs["returns"]
+
+        vpredclipped = old_values + torch.clamp(
+            vpred - old_values, -self.args.cliprange_value, self.args.cliprange_value
+        )
+        vf_losses1 = (vpred - returns) ** 2
+        vf_losses2 = (vpredclipped - returns) ** 2
+        vf_loss = 0.5 * masked_mean(torch.max(vf_losses1, vf_losses2), mask)
+
+        # Match the policy loss's gradient-accumulation normalization so accumulated
+        # grads average correctly (vf_coef absorbs any constant scale difference).
+        mode = "train" if self.model.training else "eval"
+        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
+        vf_loss = vf_loss / normalizer
+
+        clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), mask)
+        self._metrics[mode]["ppo/vf_loss"].append(self.accelerator.gather(vf_loss.detach()).mean().item())
+        self._metrics[mode]["ppo/vf_clipfrac"].append(self.accelerator.gather(clipfrac.detach()).mean().item())
+
+        return pg_loss + self.args.vf_coef * vf_loss
 
 
 # ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-
-def build_ppo_dataset(dataset, tokenizer, max_samples=None, max_prompt_length=1024):
-    """`input_ids` = the tokenized [system, user] query (same chat format as GRPO /
-    eval, so train and inference prompts align), left-padded at collate time for
-    generation. `gold` = the final answer string, consumed by the binary reward.
-
-    Queries longer than `max_prompt_length` tokens are dropped (math prompts are
-    short; this just bounds the rollout context length / memory)."""
-    ds = load_train_dataset(dataset, max_samples=max_samples)
-
-    def _map(row):
-        # [msgs] + return_dict so we get the token list, not a BatchEncoding whose
-        # len() is the field count (the same apply_chat_template gotcha handled in
-        # train_sdft.build_sdft_dataset / gen_hints).
-        ids = tokenizer.apply_chat_template(
-            [format_prompt_math(row["question"])],
-            add_generation_prompt=True, tokenize=True, return_dict=True,
-        )["input_ids"][0]
-        return {"input_ids": ids, "gold": str(row["final_answer"])}
-
-    ds = ds.map(_map, remove_columns=ds.column_names)
-    n_before = len(ds)
-    ds = ds.filter(lambda r: len(r["input_ids"]) <= max_prompt_length, num_proc=4)
-    if len(ds) < n_before:
-        print(f"  dropped {n_before - len(ds)} queries over "
-              f"max_prompt_length={max_prompt_length}")
-    return ds
-
-
-# ---------------------------------------------------------------------------
-# Provenance
+# Resume metadata
 # ---------------------------------------------------------------------------
 
 
 def build_run_meta(args, num_train_examples: int) -> dict:
-    """Provenance for run_meta.json (PPOTrainer has no resume, so this is
-    descriptive only, not a resume guard like the other trainers)."""
     return {
-        "method": "ppo",
+        "method": "ppo_vllm",
         "model": args.model,
         "dataset": args.dataset,
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
-        "reward": "binary_verifiable",
-        "reward_correct": args.reward_correct,
-        "reward_incorrect": args.reward_incorrect,
-        "kl_coef": args.kl_coef,
+        "reward": "accuracy_reward",
         "gamma": args.gamma,
         "lam": args.lam,
-        "num_ppo_epochs": args.num_ppo_epochs,
-        "max_completion_length": args.max_completion_length,
+        "vf_coef": args.vf_coef,
+        "cliprange_value": args.cliprange_value,
+        "loss_type": args.loss_type,
+        # resume-critical (see validate_resume): dataset order + batch chunking.
         "seed": args.seed,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "max_steps": args.max_steps,
+        "num_generations": args.num_generations,
     }
 
 
@@ -295,123 +332,104 @@ def main():
     p.add_argument("--output-root", default="outputs/ppo")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>")
-    p.add_argument("--max-samples", type=int, default=None)
-    # reward
-    p.add_argument("--reward-correct", type=float, default=1.0,
-                   help="Terminal reward for a correct answer (matches GRPO's accuracy_reward=1.0).")
-    p.add_argument("--reward-incorrect", type=float, default=0.0,
-                   help="Terminal reward for a wrong/unparseable answer.")
-    # PPO objective
-    p.add_argument("--kl-coef", type=float, default=0.0,
-                   help="KL-to-reference penalty. 0.0 = reference-free (matches GRPO "
-                        "beta=0.0); the reference copy is freed post-init.")
+    p.add_argument("--max-samples", type=int, default=None, help="Subset the training set")
+    # PPO / GAE
     p.add_argument("--gamma", type=float, default=1.0,
                    help="GAE discount. 1.0 = no discounting over the reasoning episode.")
     p.add_argument("--lam", type=float, default=0.95,
-                   help="GAE lambda. ->1.0 = Monte-Carlo return minus critic baseline "
-                        "(the interpretable ablation); <1.0 leans on the critic bootstrap.")
-    p.add_argument("--num-ppo-epochs", type=int, default=4,
-                   help="Gradient passes per rollout batch (PPO clipping reuse).")
-    p.add_argument("--num-mini-batches", type=int, default=1)
-    p.add_argument("--cliprange", type=float, default=0.2)
-    p.add_argument("--cliprange-value", type=float, default=0.2)
-    p.add_argument("--vf-coef", type=float, default=0.1)
-    p.add_argument("--whiten-rewards", action=argparse.BooleanOptionalAction, default=False,
-                   help="Whiten the reward tensor. Off by default (sparse terminal reward).")
-    p.add_argument("--missing-eos-penalty", type=float, default=1.0,
-                   help="Subtracted from the score of completions with no EOS (e.g. "
-                        "reasoning truncated at the budget). Pass a negative value to disable.")
-    p.add_argument("--temperature", type=float, default=1.0,
-                   help="Rollout sampling temperature (on-policy exploration).")
-    # generation / length
-    p.add_argument("--max-completion-length", type=int, default=4096,
-                   help="Rollout completion budget (PPO's response_length). HF generate "
-                        "is slow at long lengths, so this defaults below the SDFT/GOLD "
-                        "runs' 8192; raise for parity at the cost of speed.")
-    p.add_argument("--max-prompt-length", type=int, default=1024,
-                   help="Drop queries longer than this (bounds rollout context / memory).")
-    p.add_argument("--local-rollout-forward-batch-size", type=int, default=8,
-                   help="Micro-batch for the rollout forwards (generation/value). Keep "
-                        "small at long completion lengths to bound memory.")
+                   help="GAE lambda. ->1.0 = Monte-Carlo return minus critic baseline; "
+                        "<1.0 leans on the critic bootstrap.")
+    p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
+    p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
+    p.add_argument("--no-whiten-advantages", dest="whiten_advantages",
+                   action="store_false", help="Disable GAE advantage whitening.")
+    p.add_argument("--missing-eos-penalty", type=float, default=0.0,
+                   help="Subtract from a completion's terminal reward if it did not end in EOS. "
+                        "0.0 disables (matches the GRPO baseline).")
+    p.add_argument("--num-ppo-epochs", type=int, default=1,
+                   help="Gradient passes reusing each rollout (maps to GRPO num_iterations; "
+                        ">1 enables PPO's clip-and-reuse via stored old logprobs).")
+    p.add_argument("--loss-type", default="dapo", choices=["dapo", "grpo", "dr_grpo", "bnpo"],
+                   help="Token-loss aggregation for the clipped policy surrogate.")
+    p.add_argument("--epsilon", type=float, default=0.2, help="PPO clip range (policy).")
+    p.add_argument("--temperature", type=float, default=1.0, help="Rollout sampling temperature.")
+    # generation
+    p.add_argument("--max-completion-length", type=int, default=4096)
+    p.add_argument("--num-generations", type=int, default=2,
+                   help="Rollouts per prompt. PPO uses the critic (not a group) as the "
+                        "baseline, so grouping is unused -- each rollout gets its own GAE. "
+                        "GRPO's config requires >=2, so 2 is the minimum/default.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
-                            "polynomial", "constant", "constant_with_warmup",
-                            "inverse_sqrt"])
+                            "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--optim", default="adamw_bnb_8bit")
-    p.add_argument("--max-steps", type=int, default=200,
-                   help="Optimizer updates (PPO 'num_total_batches'). Converted to "
-                        "total_episodes = max_steps * per_device_bs * grad_accum "
-                        "(single-process); multi-process scales the batch, so the "
-                        "update count divides by world size.")
+    p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
-    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction,
-                   default=True)
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    # vLLM
+    p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25,
+                   help="Fraction of GPU memory vLLM may reserve (colocate). Keep modest: "
+                        "policy + critic + colocate engine share the GPU.")
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
+    # resume
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="Resume dir ('checkpoint-<step>'). Restores the POLICY/optimizer/RNG "
+                        "and skips seen data; the critic state is NOT checkpointed, so it "
+                        "resets to init on resume -- account for this.")
+    p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, args.dataset)
     print(f"model: {model_slug}  dataset: {args.dataset}  ->  output: {output_dir}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    # Decoder-only generation needs left padding so all queries share context_length.
-    tokenizer.padding_side = "left"
-
-    train_dataset = build_ppo_dataset(
-        args.dataset, tokenizer,
-        max_samples=args.max_samples, max_prompt_length=args.max_prompt_length,
-    )
+    train_dataset = build_grpo_dataset(args.dataset, max_samples=args.max_samples)
     print(f"Loaded {len(train_dataset)} examples")
-
-    # PPO counts episodes (prompts), not steps: num_total_batches = ceil(total_episodes
-    # / batch_size). Single-process batch_size = per_device * grad_accum, so this yields
-    # ~max_steps updates. (accelerate multi-process scales batch_size by world_size.)
-    total_episodes = (
-        args.max_steps
-        * args.per_device_train_batch_size
-        * args.gradient_accumulation_steps
-    )
-    print(f"  total_episodes={total_episodes} (~{args.max_steps} updates, single-process)")
+    print(f"  sample prompt: {train_dataset[0]['prompt'][-1]['content'][:120]!r}")
+    print(f"  sample solution: {train_dataset[0]['solution']!r}")
 
     training_args = PPOConfig(
         output_dir=output_dir,
         # PPO / GAE
-        kl_coef=args.kl_coef,
         gamma=args.gamma,
         lam=args.lam,
-        num_ppo_epochs=args.num_ppo_epochs,
-        num_mini_batches=args.num_mini_batches,
-        cliprange=args.cliprange,
-        cliprange_value=args.cliprange_value,
         vf_coef=args.vf_coef,
-        whiten_rewards=args.whiten_rewards,
-        missing_eos_penalty=None if args.missing_eos_penalty < 0 else args.missing_eos_penalty,
+        cliprange_value=args.cliprange_value,
+        whiten_advantages=args.whiten_advantages,
+        missing_eos_penalty=args.missing_eos_penalty,
+        # policy surrogate (inherited GRPO machinery)
+        num_iterations=args.num_ppo_epochs,
+        loss_type=args.loss_type,
+        epsilon=args.epsilon,
         temperature=args.temperature,
-        stop_token="eos",  # truncate each completion at the first EOS before reward
-        # rollout / length
-        response_length=args.max_completion_length,
-        local_rollout_forward_batch_size=args.local_rollout_forward_batch_size,
-        num_sample_generations=0,  # no periodic sample logging (no eval set)
-        total_episodes=total_episodes,
+        num_generations=args.num_generations,
+        max_completion_length=args.max_completion_length,
+        # generation backend
+        use_vllm=args.use_vllm,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         # optimization
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
         optim=args.optim,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         bf16=True,
+        model_init_kwargs={"dtype": "bfloat16", "trust_remote_code": True},
         # bookkeeping
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
@@ -419,35 +437,30 @@ def main():
         seed=args.seed,
     )
 
-    # Policy (actor) and value (critic) as nn.Modules -- PPOTrainer takes instances,
-    # not model-id strings. The value model is the same arch with a scalar head.
-    model_kwargs = {"dtype": torch.bfloat16, "trust_remote_code": True}
-    policy = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+    # Critic: policy arch + a scalar value head, initialised from --model.
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        args.model, num_labels=1, **model_kwargs
+        args.model, num_labels=1, dtype=torch.bfloat16, trust_remote_code=True
     )
-    reward_model = BinaryRewardModel(tokenizer, args.reward_correct, args.reward_incorrect)
 
     meta = build_run_meta(args, len(train_dataset))
+    if args.resume_from_checkpoint:
+        validate_resume(args.resume_from_checkpoint, meta, args.force_resume)
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "run_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
         print(f"Wrote run metadata -> {os.path.join(output_dir, 'run_meta.json')}")
 
-    trainer = BinaryRewardPPOTrainer(
+    trainer = PPOTrainer(
+        model=args.model,
+        reward_funcs=accuracy_reward,
         args=training_args,
-        processing_class=tokenizer,
-        model=policy,
-        ref_model=None,  # built then freed post-init at kl_coef=0
-        reward_model=reward_model,
-        value_model=value_model,
         train_dataset=train_dataset,
-        data_collator=GoldPadCollator(tokenizer),
+        value_model=value_model,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     final_dir = os.path.join(output_dir, "final")
-    trainer.save_model(final_dir)
+    trainer.save_model(final_dir)  # saves the policy (eval only needs it)
     print(f"Saved model -> {final_dir}")
 
 

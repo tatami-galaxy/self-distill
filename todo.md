@@ -1,6 +1,6 @@
 - train on deepscaleR
 - base, sft and instruct models
-- eval on all aime sets, hmmt
+- eval on all aime sets, beyondaime, hmmt
 - opd from other models
 - qwen 8B student
 - coding tasks
