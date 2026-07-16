@@ -39,6 +39,29 @@ GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=0.95. lam i
 PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline
 (the interpretable ablation); lam<1 leans on the critic's bootstrap for denser credit.
 
+Loss aggregation (--loss-type) only sets the DENOMINATOR that turns per-token losses into a
+scalar, i.e. how tokens are weighted against each other. It matters more here than in GRPO:
+GRPO broadcasts one scalar advantage over a sequence's tokens, whereas our A_t genuinely
+varies per token, so a length-dependent denominator would rescale exactly the credit the
+critic just assigned. Hence only token-uniform options are exposed:
+  dapo (default) -- each token equal across the whole optimizer step (num_items_in_batch).
+                    Also train_grpo.py's default, so PPO-vs-GRPO differs only in the critic.
+  bnpo           -- each token equal within the micro-batch. This is EXACTLY the aggregation
+                    TRL's classic PPOTrainer uses (its `masked_mean(pg_loss_max, ~padding_mask)`);
+                    dapo is the same idea with the denominator promoted from the micro-batch to
+                    the full accumulation window, so bnpo/accum ~= dapo.
+Two of GRPO's loss types are deliberately NOT offered, both because they would break the
+per-token credit the critic exists to produce:
+  grpo    -- per-sequence mean: dividing by each sequence's own length down-weights tokens in
+             long traces, rescaling the per-token GAE credit by trace length.
+  dr_grpo -- a CONSTANT denominator (B * max_completion_length). Token-uniform, but it ties the
+             policy loss's scale to the budget's fill fraction while vf_loss (below) tracks the
+             realized token count -- so the pg:vf ratio, i.e. the effective vf_coef, would drift
+             as completions get shorter during training.
+vf_loss uses the bnpo-style masked_mean -- what classic PPO uses for its value loss too. Since
+both surviving loss types share that normalizer (exactly for bnpo, and ~= for dapo, whose global
+token count ~= accum * micro-batch count), vf_coef keeps its textbook meaning under either.
+
 Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
 separate value model + cross-process grad sync is a follow-up. No resume (the value-model
 state is not in the standard HF checkpoint).
@@ -200,21 +223,51 @@ class PPOTrainer(GRPOTrainer):
     # -- replace group-norm advantages with value + GAE ---------------------
 
     def _generate_and_score_completions(self, inputs):
+        # Clear the stash first so the checks below prove super() populated it for THIS
+        # batch, rather than us silently reusing a stale one from a previous step.
+        self._rewards_per_func_buf = None
         output = super()._generate_and_score_completions(inputs)
         device = self.accelerator.device
 
-        # Rebuild the terminal scalar reward from the stashed (gathered) rewards_per_func,
-        # then take this process's slice (super() slices `advantages` the same way).
-        rpf = self._rewards_per_func_buf  # (B_all, num_funcs)
-        weights = self.reward_weights.to(rpf.device).unsqueeze(0)
-        rewards_all = (rpf * weights).nansum(dim=1)  # (B_all,)
-        rewards_all = torch.nan_to_num(rewards_all, nan=0.0)  # unscorable -> no signal
         prompt_ids = output["prompt_ids"]
         completion_ids = output["completion_ids"]
         completion_mask = output["completion_mask"]
         b_local = completion_ids.size(0)
         pidx = self.accelerator.process_index
-        rewards = rewards_all[pidx * b_local : (pidx + 1) * b_local].to(device)  # (B,)
+
+        # Rebuild the terminal scalar reward from the stashed (gathered) rewards_per_func,
+        # then take this process's slice (super() slices `advantages` the same way).
+        # The stash is a side-channel: GRPO computes the raw rewards internally and only
+        # returns the group-normalized advantages, so we intercept _calculate_rewards.
+        # These guards pin the assumption that makes that sound -- super() calls it exactly
+        # once per batch -- so a TRL change breaks loudly instead of silently mis-crediting.
+        rpf = self._rewards_per_func_buf  # (B_all, num_funcs)
+        if rpf is None:
+            raise RuntimeError(
+                "GRPOTrainer._generate_and_score_completions did not call _calculate_rewards, "
+                "so the raw rewards PPO's GAE needs were never stashed. TRL's internals likely "
+                "changed; rebuild the terminal reward from the new reward path."
+            )
+        expected = b_local * self.accelerator.num_processes
+        if rpf.size(0) != expected:
+            raise RuntimeError(
+                f"Stashed rewards batch ({rpf.size(0)}) != expected gathered batch "
+                f"({expected} = {b_local} local x {self.accelerator.num_processes} processes). "
+                "The reward stash is misaligned with the completions, which would assign each "
+                "rollout the wrong terminal reward."
+            )
+        # A completion whose every reward func returned None is *unscorable* -- there is no
+        # verdict on it (e.g. accuracy_reward could not parse the gold). nansum would collapse
+        # such a row to 0.0, making it indistinguishable from a graded-WRONG answer, which
+        # would push the policy away from a possibly-correct trace. GRPO instead excludes them
+        # from its baseline and forces their advantage to 0; we mirror that below via
+        # `scorable`, so an unscorable rollout contributes no gradient to either actor or critic.
+        unscorable_all = torch.isnan(rpf).all(dim=1)  # (B_all,)
+        weights = self.reward_weights.to(rpf.device).unsqueeze(0)
+        rewards_all = (rpf * weights).nansum(dim=1)  # (B_all,); all-NaN rows collapse to 0.0
+        local = slice(pidx * b_local, (pidx + 1) * b_local)
+        rewards = rewards_all[local].to(device)  # (B,)
+        scorable = (~unscorable_all[local]).to(device=device, dtype=torch.float32).unsqueeze(1)  # (B, 1)
 
         # Terminal reward at each row's last real completion token (right-padded).
         seq_len = completion_mask.sum(dim=1).long()  # (B,)
@@ -240,18 +293,26 @@ class PPOTrainer(GRPOTrainer):
         advantages, returns = compute_gae(
             token_rewards, old_values, completion_mask, self.args.gamma, self.args.lam
         )
+        # Drop unscorable rows from the whitening statistics too (they carry a fabricated
+        # reward of 0), then zero them so they yield no policy gradient.
+        loss_mask = completion_mask * scorable  # (B, C)
         if self.args.whiten_advantages:
-            advantages = masked_whiten(advantages, completion_mask)
-        advantages = advantages * completion_mask
+            advantages = masked_whiten(advantages, loss_mask)
+        advantages = advantages * loss_mask
 
         output["advantages"] = advantages  # (B, C) -- GRPO's loss accepts per-token advantages
         output["returns"] = returns
         output["old_values"] = old_values
+        output["scorable"] = scorable  # (B, 1) -- masks the value loss in _compute_loss
 
-        # Log critic-side stats.
+        # Log critic-side stats. value/returns use loss_mask so the reported means describe
+        # the rollouts that actually train the critic. unscorable_rate is expected to be ~0
+        # (our golds come from build_grpo_dataset's \boxed{} wrap over answer-bearing rows);
+        # a non-zero reading means rollouts are being silently dropped -- worth investigating.
         mode = "train" if self.model.training else "eval"
-        self._metrics[mode]["ppo/value_mean"].append(masked_mean(old_values, completion_mask).item())
-        self._metrics[mode]["ppo/returns_mean"].append(masked_mean(returns, completion_mask).item())
+        self._metrics[mode]["ppo/value_mean"].append(masked_mean(old_values, loss_mask).item())
+        self._metrics[mode]["ppo/returns_mean"].append(masked_mean(returns, loss_mask).item())
+        self._metrics[mode]["ppo/unscorable_rate"].append(unscorable_all.float().mean().item())
         return output
 
     # -- add the clipped value loss to GRPO's policy loss -------------------
@@ -262,6 +323,11 @@ class PPOTrainer(GRPOTrainer):
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
+        # Unscorable rollouts carry a fabricated reward of 0, so their `returns` are not a
+        # real target -- keep them out of the critic's regression (their advantages were
+        # already zeroed, so the policy loss ignores them too).
+        if "scorable" in inputs:
+            mask = mask * inputs["scorable"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
@@ -349,12 +415,16 @@ def main():
     p.add_argument("--num-ppo-epochs", type=int, default=1,
                    help="Gradient passes reusing each rollout (maps to GRPO num_iterations; "
                         ">1 enables PPO's clip-and-reuse via stored old logprobs).")
-    p.add_argument("--loss-type", default="dapo", choices=["dapo", "grpo", "dr_grpo", "bnpo"],
-                   help="Token-loss aggregation for the clipped policy surrogate.")
+    p.add_argument("--loss-type", default="dapo", choices=["dapo", "bnpo"],
+                   help="Token-loss aggregation for the clipped policy surrogate (see module "
+                        "docstring). 'dapo' matches the GRPO baseline; 'bnpo' is TRL classic PPO's "
+                        "exact aggregation. Both are token-uniform and share vf_loss's normalizer. "
+                        "GRPO's 'grpo' and 'dr_grpo' are excluded: they would rescale or destabilize "
+                        "the per-token GAE credit.")
     p.add_argument("--epsilon", type=float, default=0.2, help="PPO clip range (policy).")
     p.add_argument("--temperature", type=float, default=1.0, help="Rollout sampling temperature.")
     # generation
-    p.add_argument("--max-completion-length", type=int, default=4096)
+    p.add_argument("--max-completion-length", type=int, default=8192)
     p.add_argument("--num-generations", type=int, default=2,
                    help="Rollouts per prompt. PPO uses the critic (not a group) as the "
                         "baseline, so grouping is unused -- each rollout gets its own GAE. "
