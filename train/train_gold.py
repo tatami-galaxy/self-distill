@@ -188,7 +188,7 @@ def main():
                    help="Strong external OPD teacher. Same tokenizer as --model.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
                    help="Training dataset (see utils.DATASET_REGISTRY_TRAIN).")
-    p.add_argument("--output-root", default="outputs/gold")
+    p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/gold")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>_<teacher>")
     p.add_argument("--max-samples", type=int, default=None)

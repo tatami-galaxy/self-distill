@@ -90,7 +90,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
                    help="Training dataset (see utils.DATASET_REGISTRY_TRAIN).")
-    p.add_argument("--output-root", default="outputs/grpo")
+    p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/grpo")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>")
     p.add_argument("--max-samples", type=int, default=None,

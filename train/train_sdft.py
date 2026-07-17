@@ -242,7 +242,7 @@ def main():
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
                    help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). For "
                         "--pi-mode hint/full the solution-bearing subset is used.")
-    p.add_argument("--output-root", default="outputs/sdft")
+    p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/sdft")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>")
     p.add_argument("--max-samples", type=int, default=None,
