@@ -72,9 +72,60 @@ Note each checkpoint therefore costs ~2x the model bytes; consider --save-total-
 Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
 separate value model + cross-process grad sync is a follow-up.
 
-# single GPU, colocate vLLM
+Generation backend (--vllm-mode):
+  colocate (default) -- the engine runs in-process on the training GPU. Simplest, and nothing
+                        idles (generation and training timeshare the GPU), but its KV cache
+                        competes with the policy + critic for memory: OOMs from ~4B up.
+  server             -- talk to a standalone `trl vllm-serve` on its OWN GPU, freeing that
+                        memory and giving generation a full GPU of KV cache. Costs a GPU that
+                        idles during forward/backward, so it buys memory, not throughput.
+Weight sync is the same in both: once per optimizer step (gated on global_step), only the
+POLICY (the critic is not in self.model, so vLLM never sees it). In server mode HTTP carries
+only metadata (name/dtype/shape) while the tensors go GPU->GPU over a NCCL group the trainer
+joins as the last rank -- so the per-step cost is ~2N bytes over NVLink/PCIe, negligible next
+to a 60s step. The server must serve the SAME model as --model.
+
+!!  SERVER MODE + `adamw_bnb_8bit` CORRUPTS THE POLICY -- use the default paged_adamw_8bit.  !!
+(Diagnosed 2026-07-17. An earlier note here blamed the weight sync and declared server mode
+broken outright; that was wrong, and the evidence below retires it.)
+Symptom: everything *looks* healthy -- server starts, communicator forms, all 310 params POST
+200 OK per step, /generate/ returns 200, step 1 trains with a finite loss -- then step 2 dies
+in TRL's own grpo_trainer.py:1912 `torch.tensor(logps)` / "Could not infer dtype of NoneType",
+because the server's model now emits NaN logprobs (extract_logprobs maps NaN -> None).
+
+The corruption is born in the OPTIMIZER STEP, not the sync. Instrumenting one step: gradients
+are finite (0/310) after backward, 21/310 params are non-finite immediately after
+optimizer.step(), and the NEXT broadcast leaves that count at exactly 21/310 -- the sync only
+ships NaN we had already made. The dead tensors form a contiguous run in named_parameters
+order, their grads are tiny and healthy (absmax ~5e-3), and the count varies run to run
+(6, 21, 33): memory corruption, not arithmetic.
+
+BOTH ingredients are needed, which is why colocate looked like the safe *mode*:
+    server   + adamw_bnb_8bit   -> NaN        server + adamw_torch       -> clean
+    colocate + adamw_bnb_8bit   -> clean      server + paged_adamw_8bit  -> clean
+                                              server + adafactor         -> clean
+NOT PPO-specific: a stock GRPOTrainer (no critic, none of our overrides) reproduces it.
+NOT the broadcast: at the root, vLLM sets sendbuff == recvbuff (pynccl.py) -- a legal in-place
+no-op -- and a two-process NCCL probe returns the root's buffer untouched, so P2P here is fine.
+Note lr=0 does NOT prove a corruption is upstream of the optimizer in general (0 * NaN = NaN
+under torch AdamW); it happens to hold for bnb, which survives NaN grads at lr=0.
+
+Why paged: the discriminator is where bitsandbytes puts the 8-bit state. Non-paged allocates it
+with torch.zeros_like in torch's caching allocator (corrupts); paged uses CUDA managed memory
+for params >1e5 elements -- exactly the large tensors that die. Same kernels and same update
+math, so it costs nothing numerically and keeps the 8-bit memory footprint that server mode
+exists to buy. Root cause is upstream (bitsandbytes/NCCL); this is a workaround.
+If it resurfaces, check the params right after optimizer.step() -- not after the sync.
+
+# single GPU, colocate vLLM (<=1.7B)
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 8192
+
+# 4B+: vLLM on its own GPU, policy + critic on another. Engine memory/TP are now the
+# SERVER's flags -- passing --vllm-gpu-memory-utilization to the trainer is a hard error.
+CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-utilization 0.9 &
+CUDA_VISIBLE_DEVICES=6 uv run python -m train.train_ppo \
+    --model Qwen/Qwen3-4B --dataset deepmath --vllm-mode server --vllm-server-port 8000
 
 aside :  GRPOTrainer also supports custom rollout logic, in case we want to use this later
 """
@@ -85,7 +136,7 @@ import os
 from dataclasses import dataclass, field
 
 import torch
-from transformers import AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification, set_seed
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import accuracy_reward
@@ -164,6 +215,11 @@ class PPOConfig(GRPOConfig):
     lam: float = field(default=0.95, metadata={"help": "GAE lambda."})
     vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
     cliprange_value: float = field(default=0.2, metadata={"help": "Value-clipping range."})
+    critic_max_grad_norm: float = field(
+        default=1.0,
+        metadata={"help": "Grad-norm clip for the critic, applied SEPARATELY from the policy's "
+                          "max_grad_norm. 0.0 measures the norm without clipping."},
+    )
     whiten_advantages: bool = field(default=True, metadata={"help": "Whiten GAE advantages over the mask."})
     missing_eos_penalty: float = field(
         default=0.0,
@@ -203,15 +259,55 @@ class PPOTrainer(GRPOTrainer):
 
     # -- critic parameters into the optimizer -------------------------------
 
-    def create_optimizer(self, model=None):
+    def create_optimizer(self, *args, **kwargs):
         # Appending the critic's params here (rather than giving it its own optimizer) is also
         # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
         # `optimizer.pt` Trainer already writes. This runs before _load_optimizer_and_scheduler
         # and rebuilds an identical param-group layout, so that state reloads by index.
-        optimizer = super().create_optimizer(model)  # built over the policy (self.model)
+        # *args/**kwargs, not an explicit signature: transformers 4.x is `create_optimizer(self)`
+        # while 5.x is `create_optimizer(self, model=None)`. Both call it with no arguments, so
+        # forwarding whatever we're given keeps this working across the vllm-driven version pin.
+        optimizer = super().create_optimizer(*args, **kwargs)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
         optimizer.add_param_group({"params": value_params})
         return optimizer
+
+    # -- critic gradient clipping + norm logging ----------------------------
+
+    def _clip_grad_norm(self, model):
+        """Clip the policy via super(), then the critic -- with its own, separate budget.
+
+        Trainer only ever clips `self.model`, and the critic deliberately lives outside it
+        (see __init__), so without this the policy is bounded and the critic is not.
+
+        SEPARATE rather than one joint norm over both: a joint norm would let a critic spike
+        shrink the policy's update, making the policy's effective step size a function of
+        critic noise -- PPO-vs-GRPO would then differ by more than the critic, which is the
+        same reason the 'grpo'/'dr_grpo' loss types are excluded (see module docstring).
+        Separate clipping leaves the policy's gradients byte-identical to the GRPO baseline.
+
+        Adam already normalizes per-parameter, so the clip is not what bounds the step size;
+        it exists to stop an outlier spike from polluting the second-moment estimate and
+        distorting the update direction for many steps after. `critic_max_grad_norm=0`
+        measures without clipping, so the two can be compared.
+
+        Trainer calls this only when max_grad_norm > 0; this script never sets it otherwise.
+        torch's clip_grad_norm_ rather than accelerate's because the critic is not
+        accelerator.prepare'd -- consistent with the single-GPU scope.
+        """
+        policy_grad_norm = super()._clip_grad_norm(model)
+
+        params = [p for p in self.value_model.parameters() if p.grad is not None]
+        if params:
+            limit = self.args.critic_max_grad_norm
+            # clip_grad_norm_ returns the norm from BEFORE any scaling, so the metric is the
+            # true pre-clip norm either way; an inf limit scales nothing and only measures.
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                params, limit if limit and limit > 0 else float("inf")
+            )
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["ppo/critic_grad_norm"].append(critic_grad_norm.item())
+        return policy_grad_norm
 
     # -- critic checkpointing -----------------------------------------------
     #
@@ -422,7 +518,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "lam": args.lam,
         "vf_coef": args.vf_coef,
         "cliprange_value": args.cliprange_value,
+        "critic_max_grad_norm": args.critic_max_grad_norm,
         "loss_type": args.loss_type,
+        "vllm_mode": args.vllm_mode,
         # resume-critical (see validate_resume): dataset order + batch chunking.
         "seed": args.seed,
         "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -456,6 +554,10 @@ def main():
                         "<1.0 leans on the critic bootstrap.")
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
     p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
+    p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
+                   help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
+                        "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping "
+                        "while still logging ppo/critic_grad_norm, so the two can be compared.")
     p.add_argument("--no-whiten-advantages", dest="whiten_advantages",
                    action="store_false", help="Disable GAE advantage whitening.")
     p.add_argument("--missing-eos-penalty", type=float, default=0.0,
@@ -484,17 +586,40 @@ def main():
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
     p.add_argument("--warmup-steps", type=int, default=0)
-    p.add_argument("--optim", default="adamw_bnb_8bit")
+    p.add_argument("--optim", default="paged_adamw_8bit",
+                   help="Optimizer. Default is the PAGED 8-bit AdamW rather than train_grpo.py's "
+                        "`adamw_bnb_8bit`: the non-paged one corrupts the policy in the optimizer "
+                        "step whenever --vllm-mode server is active (see the module docstring). "
+                        "It is the same 8-bit AdamW numerically -- paged only moves the state to "
+                        "CUDA managed memory -- so the GRPO baseline stays comparable.")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     # vLLM
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.25,
-                   help="Fraction of GPU memory vLLM may reserve (colocate). Keep modest: "
-                        "policy + critic + colocate engine share the GPU.")
-    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    p.add_argument("--vllm-mode", default="colocate", choices=["colocate", "server"],
+                   help="'colocate': run the engine in-process on the training GPU (simplest, "
+                        "nothing idles, but its KV cache competes with policy+critic -- OOMs from "
+                        "~4B). 'server': talk to a standalone `trl vllm-serve` on its own GPU. "
+                        "See the module docstring for the launch recipe.")
+    # Colocate-only. Defaults are None so we can tell "user set it" from "left alone" and
+    # reject it in server mode, where it is the SERVER's property (see main()).
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
+                   help="COLOCATE ONLY (default 0.25): fraction of the training GPU vLLM may "
+                        "reserve. Keep modest -- policy + critic + engine share it. In server mode "
+                        "pass --gpu-memory-utilization to `trl vllm-serve` instead.")
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=None,
+                   help="COLOCATE ONLY (default 1). In server mode pass --tensor-parallel-size to "
+                        "`trl vllm-serve` instead.")
+    p.add_argument("--vllm-server-host", default="0.0.0.0", help="SERVER MODE: vLLM server host.")
+    p.add_argument("--vllm-server-port", type=int, default=8000, help="SERVER MODE: vLLM server port.")
+    p.add_argument("--vllm-server-timeout", type=float, default=240.0,
+                   help="SERVER MODE: seconds to wait for the server to be reachable.")
+    p.add_argument("--vllm-group-port", type=int, default=51216,
+                   help="SERVER MODE: port for the NCCL weight-sync group the trainer joins as the "
+                        "last rank. Weights cross GPU->GPU over this group; HTTP carries only "
+                        "metadata.")
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=20)
@@ -510,9 +635,46 @@ def main():
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
+    # In server mode the engine's memory/TP are the SERVER's properties, configured when it is
+    # launched; TRL ignores these config fields entirely. Accepting them here would silently do
+    # nothing -- exactly the flag you'd reach for after an OOM -- so reject them instead.
+    if args.vllm_mode == "server":
+        misplaced = [
+            f"{flag} (use `trl vllm-serve {serve_flag}`)"
+            for flag, val, serve_flag in (
+                ("--vllm-gpu-memory-utilization", args.vllm_gpu_memory_utilization,
+                 "--gpu-memory-utilization"),
+                ("--vllm-tensor-parallel-size", args.vllm_tensor_parallel_size,
+                 "--tensor-parallel-size"),
+            )
+            if val is not None
+        ]
+        if misplaced:
+            p.error(
+                "these only apply to --vllm-mode colocate and would be silently ignored in server "
+                "mode, where they are the server's properties: " + "; ".join(misplaced)
+            )
+    # Refuse the one combination that trains silently and wrong: the non-paged bnb 8-bit AdamW
+    # NaNs the policy inside the optimizer step once the NCCL weight-sync group exists (module
+    # docstring). It surfaces two steps later as an unrelated-looking dtype error in TRL, so a
+    # hard stop here is worth more than the flexibility.
+    if args.vllm_mode == "server" and args.optim == "adamw_bnb_8bit":
+        p.error(
+            "--optim adamw_bnb_8bit corrupts the policy under --vllm-mode server: finite "
+            "gradients, NaN params straight out of optimizer.step(). Use the default "
+            "--optim paged_adamw_8bit (same 8-bit AdamW, state in CUDA managed memory), or "
+            "adafactor / adamw_torch. See the module docstring."
+        )
+
+    vllm_gpu_mem = 0.25 if args.vllm_gpu_memory_utilization is None else args.vllm_gpu_memory_utilization
+    vllm_tp = 1 if args.vllm_tensor_parallel_size is None else args.vllm_tensor_parallel_size
+
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, args.dataset)
     print(f"model: {model_slug}  dataset: {args.dataset}  ->  output: {output_dir}")
+    if args.vllm_mode == "server":
+        print(f"  vLLM: server at {args.vllm_server_host}:{args.vllm_server_port} "
+              f"(weight-sync group port {args.vllm_group_port})")
 
     train_dataset = build_grpo_dataset(args.dataset, max_samples=args.max_samples)
     print(f"Loaded {len(train_dataset)} examples")
@@ -526,6 +688,7 @@ def main():
         lam=args.lam,
         vf_coef=args.vf_coef,
         cliprange_value=args.cliprange_value,
+        critic_max_grad_norm=args.critic_max_grad_norm,
         whiten_advantages=args.whiten_advantages,
         missing_eos_penalty=args.missing_eos_penalty,
         # policy surrogate (inherited GRPO machinery)
@@ -537,9 +700,15 @@ def main():
         max_completion_length=args.max_completion_length,
         # generation backend
         use_vllm=args.use_vllm,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_mode=args.vllm_mode,
+        # colocate-only; ignored by TRL in server mode (the server owns these)
+        vllm_gpu_memory_utilization=vllm_gpu_mem,
+        vllm_tensor_parallel_size=vllm_tp,
+        # server-only; ignored in colocate
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
+        vllm_server_timeout=args.vllm_server_timeout,
+        vllm_group_port=args.vllm_group_port,
         # optimization
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
@@ -559,6 +728,13 @@ def main():
     )
 
     # Critic: policy arch + a scalar value head, initialised from --model.
+    # Seed FIRST: the `.score` head is the one weight in this script with no pretrained values
+    # to load, so it is randomly initialised right here -- and Trainer only calls set_seed()
+    # when it is constructed, several lines below. Without this the critic starts from ambient
+    # OS entropy on every run: --seed would not reproduce a run, run_meta.json's `seed` would
+    # be a lie about the critic, and any A/B over critic hyperparameters would be confounded
+    # by a different value function in each arm.
+    set_seed(args.seed)
     value_model = AutoModelForSequenceClassification.from_pretrained(
         args.model, num_labels=1, dtype=torch.bfloat16, trust_remote_code=True
     )
