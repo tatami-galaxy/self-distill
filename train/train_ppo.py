@@ -62,9 +62,15 @@ vf_loss uses the bnpo-style masked_mean -- what classic PPO uses for its value l
 both surviving loss types share that normalizer (exactly for bnpo, and ~= for dapo, whose global
 token count ~= accum * micro-batch count), vf_coef keeps its textbook meaning under either.
 
+Resume (--resume-from-checkpoint) restores the policy/optimizer/scheduler/RNG, skips seen
+data, and restores the CRITIC too: its optimizer state rides in the standard optimizer.pt
+(the value params share the policy's optimizer), and its weights are saved alongside each
+checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a hard error --
+a critic restarting from random init would make every advantage meaningless.
+Note each checkpoint therefore costs ~2x the model bytes; consider --save-total-limit.
+
 Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
-separate value model + cross-process grad sync is a follow-up. No resume (the value-model
-state is not in the standard HF checkpoint).
+separate value model + cross-process grad sync is a follow-up.
 
 # single GPU, colocate vLLM
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo \
@@ -80,6 +86,7 @@ from dataclasses import dataclass, field
 
 import torch
 from transformers import AutoModelForSequenceClassification
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import accuracy_reward
 
@@ -91,6 +98,12 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 # Small masked reducers (defined here rather than imported from trl's experimental
 # PPO internals, to avoid depending on that module's private surface).
 # ---------------------------------------------------------------------------
+
+
+# Critic weights inside each `checkpoint-<step>` dir. A bare state_dict (not save_pretrained):
+# one file regardless of model size, no sharding to reassemble, and no shared-tensor errors.
+# The critic's config is reconstructible from --model + num_labels=1 (see main()).
+VALUE_MODEL_FILE = "value_model.pt"
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -190,11 +203,47 @@ class PPOTrainer(GRPOTrainer):
 
     # -- critic parameters into the optimizer -------------------------------
 
-    def create_optimizer(self):
-        optimizer = super().create_optimizer()  # built over the policy (self.model)
+    def create_optimizer(self, model=None):
+        # Appending the critic's params here (rather than giving it its own optimizer) is also
+        # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
+        # `optimizer.pt` Trainer already writes. This runs before _load_optimizer_and_scheduler
+        # and rebuilds an identical param-group layout, so that state reloads by index.
+        optimizer = super().create_optimizer(model)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
         optimizer.add_param_group({"params": value_params})
         return optimizer
+
+    # -- critic checkpointing -----------------------------------------------
+    #
+    # Trainer only saves `self.model`, so the critic's WEIGHTS need handling here; its
+    # optimizer state already rides along (see create_optimizer). `final/` stays policy-only
+    # -- eval loads a plain causal LM and never needs the critic.
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)  # GRPO's override (model card) -> HF's
+        if self.args.should_save:  # rank 0 only
+            ckpt_dir = os.path.join(
+                self._get_output_dir(trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            )
+            torch.save(self.value_model.state_dict(), os.path.join(ckpt_dir, VALUE_MODEL_FILE))
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        path = os.path.join(resume_from_checkpoint, VALUE_MODEL_FILE)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"No critic weights ({VALUE_MODEL_FILE}) in {resume_from_checkpoint}. Resuming "
+                "would restart the value function from its random init while the policy carries "
+                "on, so every GAE advantage would be measured against a meaningless baseline -- "
+                "silently, since training would still look healthy. Was this checkpoint written "
+                "before critic checkpointing existed?"
+            )
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        # Load IN-PLACE. The optimizer holds references to these exact tensors, so the module
+        # must not be reassigned: that would leave the optimizer updating orphaned parameters
+        # while the forward pass used new ones, and the critic would never learn.
+        self.value_model.load_state_dict(state)
+        print(f"Restored critic weights <- {path}")
 
     # -- per-token value predictions ----------------------------------------
 
@@ -224,7 +273,7 @@ class PPOTrainer(GRPOTrainer):
 
     def _generate_and_score_completions(self, inputs):
         # Clear the stash first so the checks below prove super() populated it for THIS
-        # batch, rather than us silently reusing a stale one from a previous step.
+        # batch, rather than us reusing a stale one from a previous step.
         self._rewards_per_func_buf = None
         output = super()._generate_and_score_completions(inputs)
         device = self.accelerator.device
@@ -308,7 +357,7 @@ class PPOTrainer(GRPOTrainer):
         # Log critic-side stats. value/returns use loss_mask so the reported means describe
         # the rollouts that actually train the critic. unscorable_rate is expected to be ~0
         # (our golds come from build_grpo_dataset's \boxed{} wrap over answer-bearing rows);
-        # a non-zero reading means rollouts are being silently dropped -- worth investigating.
+        # a non-zero reading means rollouts are being dropped -- worth investigating.
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["ppo/value_mean"].append(masked_mean(old_values, loss_mask).item())
         self._metrics[mode]["ppo/returns_mean"].append(masked_mean(returns, loss_mask).item())
@@ -453,9 +502,11 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     # resume
     p.add_argument("--resume-from-checkpoint", default=None,
-                   help="Resume dir ('checkpoint-<step>'). Restores the POLICY/optimizer/RNG "
-                        "and skips seen data; the critic state is NOT checkpointed, so it "
-                        "resets to init on resume -- account for this.")
+                   help="Resume dir ('checkpoint-<step>'). Restores policy, critic (weights + "
+                        "optimizer state), scheduler and RNG, and skips already-seen examples. "
+                        "Pass the SAME --model, --dataset, --max-samples, --seed and batch config "
+                        "as the original run (verified against its run_meta.json). --max-steps is "
+                        "the TOTAL budget: training continues up to it.")
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
