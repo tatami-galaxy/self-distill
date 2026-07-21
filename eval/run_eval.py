@@ -1,24 +1,125 @@
 """
 Evaluate language models on math benchmarks.
 
+Results are filed by ARM (see arm_path below), so every checkpoint of every training
+method lands in a predictable place and a whole sweep can be read by globbing.
+
 Usage:
 
+    # the untrained model -- results/aime24/base/Qwen3-4B/
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.run_eval \
-    --model Qwen/Qwen3-4B \
-    --dataset aime24 \
+    --model Qwen/Qwen3-4B --dataset aime24 --algo base
+
+    # a trained checkpoint -- results/aime24/deepmath/Qwen3-4B/sdft/hint/checkpoint-120/
+    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.run_eval \
+    --model /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-4B/deepmath_hint/checkpoint-120 \
+    --dataset aime24 --algo sdft --model_name Qwen3-4B --train_dataset deepmath --variant hint
 
 """
 
 import argparse
 import json
 import os
+import re
 import time
 from vllm import LLM, SamplingParams
 from utils import (
     grade,
     DATASET_REGISTRY_EVAL,
+    DATASET_REGISTRY_TRAIN,
     format_prompt_math,
 )
+
+
+# ---------------------------------------------------------------------------
+# Result layout
+# ---------------------------------------------------------------------------
+#
+#   <output_dir>/<eval dataset>/base/<model>/
+#   <output_dir>/<eval dataset>/<train dataset>/<model>/<algo>[/<variant>][/<run>]/<step>/
+#
+# each holding results.json + summary.json. The untrained model sits at `base/`, a sibling
+# of the train-dataset dirs, because it belongs to no training run -- one evaluation serves
+# every train dataset.
+#
+# Every component is passed EXPLICITLY rather than parsed out of --model. A checkpoint path
+# encodes its arm only by convention, and the convention has already been broken once: the
+# two PPO runs live in output dirs that were renamed to `Qwen3-1.7B-run-{1,2}` after the
+# fact, so their checkpoints' own paths (and the `model` field of the summaries written from
+# them) still say plain `Qwen3-1.7B`. Inferring from a path would have silently merged the
+# two runs into one folder -- a misfiling that looks entirely plausible afterwards. The cost
+# is a longer command; the benefit is that an hours-long eval cannot land in the wrong arm.
+
+ALGOS = ("base", "grpo", "ppo", "gold", "sdft")
+
+# Algorithms the algorithm name alone does not identify: for SDFT the privileged context and
+# for GOLD the teacher ARE the independent variable under study, so filing two of them under
+# a bare `sdft/` or `gold/` would merge runs that the experiment exists to tell apart.
+VARIANT_REQUIRED = {
+    "sdft": "the privileged context, e.g. --variant hint",
+    "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
+}
+
+# What a checkpoint directory is called: `checkpoint-<N>`, TRL's end-of-training `final/`, or
+# a prefixed variant like `base-token-checkpoint-20`.
+_STEP_RE = re.compile(r"(?:^final$|checkpoint-\d+$)")
+
+
+def arm_path(args, error) -> tuple[list[str], dict]:
+    """Resolve this evaluation's arm to (path components, provenance dict).
+
+    Components are appended below `<output_dir>/<eval dataset>`. `error` is the
+    ArgumentParser's error hook, so a bad flag combination fails immediately rather than
+    after the model has loaded and generated.
+    """
+    leaf = os.path.basename(args.model.rstrip("/"))
+    is_checkpoint = bool(_STEP_RE.search(leaf))
+
+    model = args.model_name
+    if model is None:
+        if is_checkpoint:
+            error(f"--model's last path component ({leaf!r}) names a checkpoint, not the model "
+                  "being evaluated, so the results folder cannot be named from it. Pass "
+                  "--model_name (e.g. --model_name Qwen3-4B).")
+        model = leaf  # a hub id like Qwen/Qwen3-4B -- the basename IS the model
+
+    if args.algo == "base":
+        misplaced = [
+            flag for flag, val in (("--train_dataset", args.train_dataset),
+                                   ("--variant", args.variant), ("--run", args.run),
+                                   ("--step", args.step)) if val is not None
+        ]
+        if misplaced:
+            error(f"{', '.join(misplaced)} do not apply to --algo base: the untrained model "
+                  "belongs to no training run, and its results are shared across train datasets "
+                  "at base/<model>/. Accepting them would silently file the same numbers twice.")
+        return ["base", model], {"algo": "base", "model": model}
+
+    if args.train_dataset is None:
+        error(f"--train_dataset is required for --algo {args.algo}: it names the dataset this "
+              "checkpoint was trained on, which is the top level of the results tree.")
+    if args.algo in VARIANT_REQUIRED and args.variant is None:
+        error(f"--variant is required for --algo {args.algo}: it names {VARIANT_REQUIRED[args.algo]}. "
+              "Without it, runs differing in exactly the variable under study share one folder.")
+
+    step = args.step or (leaf if is_checkpoint else None)
+    if step is None:
+        error(f"--step is required: --model's last path component ({leaf!r}) is not a "
+              "'checkpoint-<N>' or 'final' dir, so the step cannot be taken from it.")
+
+    # `run` only earns a directory level when there is more than one run to separate; pass it
+    # for every run of a repeated arm, so the sibling folders are symmetric.
+    run = args.run
+    if run is not None and run.isdigit():
+        run = f"run-{run}"  # --run 2 and --run run-2 name the same folder
+
+    parts = [args.train_dataset, model, args.algo]
+    parts += [p for p in (args.variant, run) if p]
+    parts.append(step)
+    return parts, {
+        "algo": args.algo, "model": model, "train_dataset": args.train_dataset,
+        "variant": args.variant, "run": run, "step": step,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -169,13 +270,17 @@ def print_report(eval_output: dict, ks: list[int]):
         print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total_samples} samples")
 
 
-def save_results(eval_output: dict, output_dir: str, ks: list[int]):
-    """Save full results and summary to disk."""
+def save_results(eval_output: dict, output_dir: str, ks: list[int], arm: dict):
+    """Save full results and summary to disk.
+
+    Fixed filenames: the arm is carried by the directory path (see arm_path), so a summary
+    is found the same way in every folder and a sweep is one glob. `arm` is also embedded in
+    the summary, so a file that gets moved still says which run produced it.
+    """
     os.makedirs(output_dir, exist_ok=True)
-    model_slug = eval_output["model"].replace("/", "_")
 
     # Full per-problem results
-    results_path = os.path.join(output_dir, f"{model_slug}_results.json")
+    results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(eval_output["results"], f, indent=2)
 
@@ -187,6 +292,7 @@ def save_results(eval_output: dict, output_dir: str, ks: list[int]):
 
     summary = {
         "model": eval_output["model"],
+        "arm": arm,
         "dataset_size": total,
         "n_samples": eval_output["n_samples"],
         "pass_at_k": {f"pass@{k}": acc for k, acc in pass_at_ks.items()},
@@ -198,7 +304,7 @@ def save_results(eval_output: dict, output_dir: str, ks: list[int]):
         "total_samples": total_samples,
     }
 
-    summary_path = os.path.join(output_dir, f"{model_slug}_summary.json")
+    summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -220,6 +326,40 @@ def main():
         "--dataset", default="aime24", choices=list(DATASET_REGISTRY_EVAL.keys()),
         help="Benchmark dataset to evaluate on",
     )
+    # Arm identification -- where the results are filed (see arm_path).
+    parser.add_argument(
+        "--algo", required=True, choices=ALGOS,
+        help="Training method that produced --model, or 'base' for the untrained model. "
+             "Required: it is the folder the results are compared in, and nothing in the "
+             "checkpoint reliably reports it.",
+    )
+    parser.add_argument(
+        "--model_name", default=None,
+        help="Model folder name, e.g. Qwen3-4B. Defaults to --model's basename, which is "
+             "right for a hub id but not for a checkpoint path (there the basename is the "
+             "step), so it is required whenever --model points at a checkpoint dir.",
+    )
+    parser.add_argument(
+        "--train_dataset", default=None, choices=list(DATASET_REGISTRY_TRAIN.keys()),
+        help="Dataset --model was TRAINED on (top level of the results tree). Required for "
+             "every --algo except base; see utils.DATASET_REGISTRY_TRAIN.",
+    )
+    parser.add_argument(
+        "--variant", default=None,
+        help="What distinguishes this arm within its algorithm: the privileged context for "
+             "sdft (full/answer/hint), the teacher slug for gold. Required for those two, "
+             "optional elsewhere (e.g. a PI-conditioned PPO critic).",
+    )
+    parser.add_argument(
+        "--run", default=None,
+        help="Repeat label when an arm was trained more than once, e.g. --run 2 or "
+             "--run run-2 (both file under run-2/). Omit for a single run.",
+    )
+    parser.add_argument(
+        "--step", default=None,
+        help="Checkpoint folder name, e.g. checkpoint-120. Defaults to --model's basename "
+             "when that is a 'checkpoint-<N>' or 'final' dir.",
+    )
     parser.add_argument("--output_dir", default="results")
     parser.add_argument("--n", type=int, default=16,
                         help="Number of samples to draw per problem (n>=max(k) for pass@k)")
@@ -240,6 +380,13 @@ def main():
 
     if max(args.k) > args.n:
         parser.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
+
+    # Resolve the destination BEFORE loading anything: an eval is hours of generation, and a
+    # flag combination that cannot be filed should fail in the first second, not the last.
+    parts, arm = arm_path(args, parser.error)
+    output_dir = os.path.join(args.output_dir, args.dataset, *parts)
+    print(f"Results -> {output_dir}")
+
     if args.n > 1:
         print("Note: pass@k needs stochastic sampling; relying on vLLM's model "
               "default sampling (ensure temperature > 0 in the model's generation config)")
@@ -266,8 +413,6 @@ def main():
         print(f"Using chat template from: {args.chat_template_model}")
 
     # Evaluate model
-    model_slug = args.model.replace("/", "_")
-    output_dir = args.output_dir+'/'+args.dataset+'/'+model_slug
     eval_output = evaluate_model(
         model_name=args.model,
         problems=problems,
@@ -277,7 +422,7 @@ def main():
         n_samples=args.n,
     )
     print_report(eval_output, args.k)
-    save_results(eval_output, output_dir, args.k)
+    save_results(eval_output, output_dir, args.k, arm)
 
 
 if __name__ == "__main__":
