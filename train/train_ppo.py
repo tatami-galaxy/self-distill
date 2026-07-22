@@ -69,6 +69,25 @@ checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a ha
 a critic restarting from random init would make every advantage meaningless.
 Note each checkpoint therefore costs ~2x the model bytes; consider --save-total-limit.
 
+What resume does and does not let you change:
+  * --max-steps IS free to change -- it is the TOTAL budget and is deliberately absent from
+    run_meta.json, so resuming a finished 200-step run with --max-steps 400 trains 200 more.
+    Verified end to end (a run that had reached its budget, resumed to a larger one).
+  * LEARNING RATES COME FROM THE CHECKPOINT, not the command line. optimizer.load_state_dict
+    restores each param group's `lr` AND `initial_lr`, and Trainer calls it after create_scheduler
+    -- so a different --learning-rate / --critic-learning-rate on the resume command would be
+    silently discarded, and the run would quietly continue at the old rate. Both are recorded in
+    run_meta.json so validate_resume raises instead of ignoring you. To change a rate, start a
+    new run. (Checkpoints written before those keys existed simply skip the check.)
+  * Changing --max-steps is only safe with lr_scheduler_type=constant (the default). LambdaLR's
+    state_dict excludes the lambda, so it is rebuilt from the NEW budget while last_epoch is
+    restored: a cosine run resumed at step 200 with --max-steps 400 jumps its LR back UP to the
+    new schedule's midpoint.
+  * Extending far enough re-enters the dataset. One epoch is
+    len(dataset) / (per_device_train_batch_size * gradient_accumulation_steps / num_generations)
+    steps -- 12,877 on full DeepMath at the defaults, but only 2,438 on a 19.5k hint cache.
+    Past that the seeded permutation reshuffles and prompts start repeating.
+
 Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
 separate value model + cross-process grad sync is a follow-up.
 
@@ -214,6 +233,13 @@ class PPOConfig(GRPOConfig):
     gamma: float = field(default=1.0, metadata={"help": "GAE discount (1.0 = no discounting)."})
     lam: float = field(default=0.95, metadata={"help": "GAE lambda."})
     vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
+    critic_learning_rate: float | None = field(
+        default=None,
+        metadata={"help": "Learning rate for the critic's parameter group. None inherits the "
+                          "policy's `learning_rate` -- which is the RLVR-appropriate 1e-6, far "
+                          "below what the randomly-initialised `.score` head needs to converge "
+                          "inside a 200-step run."},
+    )
     cliprange_value: float = field(default=0.2, metadata={"help": "Value-clipping range."})
     critic_max_grad_norm: float = field(
         default=1.0,
@@ -269,7 +295,13 @@ class PPOTrainer(GRPOTrainer):
         # forwarding whatever we're given keeps this working across the vllm-driven version pin.
         optimizer = super().create_optimizer(*args, **kwargs)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
-        optimizer.add_param_group({"params": value_params})
+        # The lr is set HERE rather than patched onto param_groups[-1] afterwards, so the
+        # scheduler (built right after this, and which records each group's `initial_lr`)
+        # schedules the critic from its own base rate rather than the policy's.
+        group = {"params": value_params}
+        if self.args.critic_learning_rate is not None:
+            group["lr"] = self.args.critic_learning_rate
+        optimizer.add_param_group(group)
         return optimizer
 
     # -- critic gradient clipping + norm logging ----------------------------
@@ -343,6 +375,23 @@ class PPOTrainer(GRPOTrainer):
 
     # -- per-token value predictions ----------------------------------------
 
+    def _value_inputs(self, batch):
+        """What the critic reads: (input_ids, attention_mask, logits_to_keep).
+
+        Here that is exactly what the POLICY reads -- the same prompt, the same completion,
+        one tensor shared by both models. It is a method, and takes the whole `batch`, so
+        that a subclass can give the critic a DIFFERENT prompt (train_ppo_pi.py conditions
+        it on privileged info) without touching either call site.
+
+        `batch` is the rollout dict during `_generate_and_score_completions` and the
+        micro-batch dict during `_compute_loss`; both carry these four keys, and both must
+        resolve to the same sequence for a row, or `cliprange_value` would be clipping
+        `vpred` against an `old_values` computed from a different state.
+        """
+        input_ids = torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1)
+        attention_mask = torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1)
+        return input_ids, attention_mask, batch["completion_ids"].size(1)
+
     def _get_per_token_values(self, input_ids, attention_mask, logits_to_keep):
         """Per-token state values aligned to the completion tokens, mirroring
         `_get_per_token_logps_and_entropies`'s shift: run the value backbone, apply the
@@ -374,7 +423,6 @@ class PPOTrainer(GRPOTrainer):
         output = super()._generate_and_score_completions(inputs)
         device = self.accelerator.device
 
-        prompt_ids = output["prompt_ids"]
         completion_ids = output["completion_ids"]
         completion_mask = output["completion_mask"]
         b_local = completion_ids.size(0)
@@ -427,11 +475,8 @@ class PPOTrainer(GRPOTrainer):
         token_rewards = token_rewards * completion_mask
 
         # Old values from the critic (no grad), then GAE.
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([output["prompt_mask"], completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
         with torch.no_grad():
-            old_values = self._get_per_token_values(input_ids, attention_mask, logits_to_keep)
+            old_values = self._get_per_token_values(*self._value_inputs(output))
         old_values = old_values.float() * completion_mask
 
         # (B, T) per-token
@@ -449,6 +494,10 @@ class PPOTrainer(GRPOTrainer):
         output["returns"] = returns
         output["old_values"] = old_values
         output["scorable"] = scorable  # (B, 1) -- masks the value loss in _compute_loss
+        # The per-rollout outcome the critic is regressing towards, kept so subclasses can
+        # score the critic against it (train_ppo_pi.py's calibration metrics) without
+        # re-deriving it from the reward stash.
+        output["terminal_reward"] = rewards.unsqueeze(1)  # (B, 1)
 
         # Log critic-side stats. value/returns use loss_mask so the reported means describe
         # the rollouts that actually train the critic. unscorable_rate is expected to be ~0
@@ -465,19 +514,15 @@ class PPOTrainer(GRPOTrainer):
     def _compute_loss(self, model, inputs):
         pg_loss = super()._compute_loss(model, inputs)  # policy loss (already normalized)
 
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        completion_mask = inputs["completion_mask"]
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
         # Unscorable rollouts carry a fabricated reward of 0, so their `returns` are not a
         # real target -- keep them out of the critic's regression (their advantages were
         # already zeroed, so the policy loss ignores them too).
         if "scorable" in inputs:
             mask = mask * inputs["scorable"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
 
-        vpred = self._get_per_token_values(input_ids, attention_mask, logits_to_keep).float()
+        vpred = self._get_per_token_values(*self._value_inputs(inputs)).float()
         old_values = inputs["old_values"]
         returns = inputs["returns"]
 
@@ -521,7 +566,13 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "critic_max_grad_norm": args.critic_max_grad_norm,
         "loss_type": args.loss_type,
         "vllm_mode": args.vllm_mode,
-        # resume-critical (see validate_resume): dataset order + batch chunking.
+        # resume-critical, learning rates: on resume these come from the CHECKPOINT, not the CLI.
+        # optimizer.load_state_dict restores each param group's `lr` and `initial_lr`, and it runs
+        # after create_scheduler, so a different --learning-rate on the command line is silently
+        # ignored. Recording both here turns that into a validate_resume error.
+        "learning_rate": args.learning_rate,
+        "critic_learning_rate": args.critic_learning_rate,
+        # resume-critical: dataset order + batch chunking.
         "seed": args.seed,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
@@ -582,6 +633,11 @@ def main():
                         "GRPO's config requires >=2, so 2 is the minimum/default.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
+    p.add_argument("--critic-learning-rate", type=float, default=None,
+                   help="Learning rate for the critic. Omit to inherit --learning-rate. That "
+                        "default (1e-6) suits a pretrained policy but is very slow for the "
+                        "critic's RANDOMLY INITIALISED scalar head, which has to learn "
+                        "P(correct|prefix) from scratch within --max-steps.")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
@@ -711,6 +767,7 @@ def main():
         vllm_group_port=args.vllm_group_port,
         # optimization
         learning_rate=args.learning_rate,
+        critic_learning_rate=args.critic_learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         warmup_steps=args.warmup_steps,
         optim=args.optim,

@@ -35,6 +35,13 @@ CUDA_VISIBLE_DEVICES=6,7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 
 Validated at 8192 completions: GPU6 (student+vLLM) peak ~60GB, GPU7 (teacher) ~64GB,
 ~58s / optimizer step at grad-accum 2. expandable_segments avoids fragmentation OOM.
+
+Resume (--resume-from-checkpoint) restores weights/optimizer/scheduler/RNG and skips seen data;
+pass the same hyperparameters (verified against run_meta.json). The teacher needs no restoring --
+it is frozen and re-loaded from --teacher-model. --max-steps is the TOTAL budget and is free to
+raise, but the LEARNING RATE comes from the checkpoint rather than the command line, so a changed
+--learning-rate is refused rather than silently ignored (full rules in utils.validate_resume). At
+the defaults (num_generations 1 -> 16 prompts per step) one epoch of full DeepMath is ~6,438 steps.
 """
 
 import argparse
@@ -72,6 +79,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "lmbda": args.lmbda,
         "beta": args.beta,
         "max_completion_length": args.max_completion_length,
+        # resume-critical: on resume the LR comes from the CHECKPOINT, not the CLI (see
+        # validate_resume), so recording it turns a silently-ignored change into an error.
+        "learning_rate": args.learning_rate,
         # resume-critical: dataset order (seed, length) + batch chunking. If any of
         # these differ from the original run, the shuffle permutation or the per-step
         # batch boundary shifts and the skip resumes on the wrong data.

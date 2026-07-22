@@ -35,7 +35,28 @@ def validate_resume(resume_path: str, this_meta: dict, force: bool = False) -> N
     a mismatch is a hard error (data would silently misalign) unless `force` downgrades
     it to a warning. A missing run_meta.json warns and skips the check.
 
-    Shared by train_sdft / train_grpo / train_gold; each passes its own build_run_meta.
+    Shared by train_sdft / train_grpo / train_gold / train_ppo / train_ppo_pi; each passes its
+    own build_run_meta.
+
+    What resume does NOT let you change, even though the CLI happily accepts it:
+      * LEARNING RATES come from the checkpoint. Trainer calls optimizer.load_state_dict AFTER
+        create_scheduler, and that restores every param group's `lr` and `initial_lr` -- so a
+        different --learning-rate is silently discarded and the run carries on at the old rate.
+        Each caller records `learning_rate` in its meta so this raises here instead of ignoring
+        you. To actually change a rate, start a new run.
+
+    What it DOES let you change:
+      * --max-steps, the TOTAL budget: deliberately absent from every build_run_meta, so a
+        finished 200-step run resumes with --max-steps 400 and trains 200 more. Sound only with
+        lr_scheduler_type=constant (the default in every script here). LambdaLR's state_dict
+        excludes the lambda, so a cosine/linear schedule is rebuilt over the NEW budget while
+        last_epoch is restored -- resuming a 200-step cosine run at --max-steps 400 jumps the LR
+        back UP to the new schedule's midpoint.
+      * ...but only while the data lasts. One epoch is
+        len(dataset) * num_generations / (per_device_train_batch_size * gradient_accumulation_steps)
+        optimizer steps (every trainer here draws prompts through TRL's RepeatSampler). Past that
+        the seeded permutation reshuffles and prompts start repeating -- which is fine, but it is
+        no longer "training on unseen data", so it should be a choice rather than a surprise.
     """
     if not os.path.isdir(resume_path):
         raise FileNotFoundError(f"--resume-from-checkpoint {resume_path} is not a directory")
@@ -74,6 +95,82 @@ def hint_path(model: str, dataset: str, root: str = "data/pi/hint") -> str:
     are never crossed between datasets or between models (self-hint purity). Written
     by train/gen_hints.py; read by train/train_sdft.py and eval/passk_pi.py."""
     return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
+
+
+# ---------------------------------------------------------------------------
+# Privileged context (PI)
+#
+# The PI *content* templates (PI_FULL / PI_ANSWER / PI_HINT) live in
+# train/train_sdft.py, next to the trainer whose vocabulary they are. What lives
+# here is how a PI string is STITCHED into a prompt -- shared by SDFT (where the
+# teacher scores under it) and PPO-PI (where the critic values under it), and
+# needed by utils itself, so it cannot live in train_sdft without a cycle.
+# ---------------------------------------------------------------------------
+
+# How the privileged context is folded into the teacher/critic's user turn.
+# TRL's SDFTTrainer default; train_sdft.py re-exports this and passes it to
+# SDFTConfig, so the trainer and every reconstruction of its prompt agree.
+TEACHER_PROMPT_TEMPLATE = "{prompt}\n\n{privileged_context}"
+
+
+def compose_pi_messages(messages: list[dict], privileged_context: str) -> list[dict]:
+    """Fold `privileged_context` into the LAST user turn of `messages`, mirroring
+    SDFTTrainer._compose_teacher_prompt: earlier turns (the system prompt) are kept
+    verbatim and the PI is appended to the user turn via TEACHER_PROMPT_TEMPLATE.
+
+    Appending to the existing user turn rather than adding a new message is the
+    locked f-injection convention: the message list still ends on a user turn, so
+    `add_generation_prompt=True` renders the SAME generation header as the
+    un-privileged prompt and a completion attaches at the same boundary.
+
+    Returns a new list; `messages` is not mutated.
+    """
+    user_text = TEACHER_PROMPT_TEMPLATE.format(
+        prompt=messages[-1]["content"], privileged_context=privileged_context
+    )
+    return messages[:-1] + [{"role": messages[-1]["role"], "content": user_text}]
+
+
+def load_hint_cache(
+    model: str, dataset: str, max_samples: int | None = None, root: str = "data/pi/hint"
+) -> "Dataset":
+    """Load the validated self-hint cache written by train/gen_hints.py.
+
+    Returns the raw cache columns (question, final_answer, hint, ...) so each caller
+    can wrap them in its own PI template. The asserts are the point: hints are only
+    "self" if the same weights wrote them, so the cache's `gen_model` stamp must match
+    `model`. The `dataset` stamp is checked leniently -- caches migrated into the
+    dataset-keyed layout predate that column and rely on the path instead.
+    """
+    from datasets import load_from_disk
+
+    path = hint_path(model, dataset, root)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"No hint cache for {model} on {dataset} at {path}. Generate it first:\n"
+            f"  python -m train.gen_hints --model {model} --dataset {dataset} --max-samples <N>"
+        )
+
+    ds = load_from_disk(path)
+    gen_models = set(ds.unique("gen_model"))
+    if gen_models != {model}:
+        raise ValueError(
+            f"Hint cache at {path} was generated by {gen_models}, not {model!r}. "
+            f"Regenerate with `python -m train.gen_hints --model {model} --dataset {dataset}`."
+        )
+    if "dataset" in ds.column_names and set(ds.unique("dataset")) != {dataset}:
+        raise ValueError(
+            f"Hint cache at {path} was generated for dataset "
+            f"{set(ds.unique('dataset'))}, not {dataset!r}."
+        )
+    if max_samples is not None:
+        if max_samples > len(ds):
+            raise ValueError(
+                f"Requested {max_samples} hint rows but the cache holds only "
+                f"{len(ds)}. Regenerate with a larger --max-samples."
+            )
+        ds = ds.select(range(max_samples))
+    return ds
 
 # math_verify normalizes units, prioritizes a \boxed{} match, and (with
 # try_extract_without_anchor=False) only extracts a properly formatted answer.

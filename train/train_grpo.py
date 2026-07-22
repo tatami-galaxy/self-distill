@@ -1,4 +1,12 @@
 """
+Resume (--resume-from-checkpoint) restores weights/optimizer/scheduler/RNG and skips seen data;
+pass the same hyperparameters (verified against run_meta.json). --max-steps is the TOTAL budget
+and is free to raise, but the LEARNING RATE comes from the checkpoint rather than the command
+line -- a changed --learning-rate is refused rather than silently ignored. See
+utils.validate_resume for the full rules. At the defaults (num_generations 8 -> 2 prompts per
+step) one epoch of full DeepMath is ~51,510 steps, so data exhaustion is not a practical limit
+here.
+
 # single GPU, colocate vLLM
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_grpo \
     --model Qwen/Qwen3-4B --max-samples 8192 --dataset deepmath
@@ -41,6 +49,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
         "loss_type": args.loss_type,
+        # resume-critical: on resume the LR comes from the CHECKPOINT, not the CLI (see
+        # validate_resume), so recording it turns a silently-ignored change into an error.
+        "learning_rate": args.learning_rate,
         # resume-critical: dataset order (seed, length) + batch chunking. If any of
         # these differ from the original run, the shuffle_dataset permutation or the
         # per-step batch boundary shifts and the skip resumes on the wrong data.

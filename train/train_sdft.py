@@ -16,6 +16,11 @@ CAVEAT: only sound for `--teacher-model-kind base` (the frozen base teacher is r
 from the base model id, so resume can't corrupt it). For `ema` the EMA teacher state is
 held in a callback and is NOT in the checkpoint, so resuming resets it to the base weights
 and silently loses the accumulated EMA -- don't resume `ema` runs without accounting for this.
+--max-steps is the TOTAL budget and is free to raise, but the LEARNING RATE comes from the
+checkpoint rather than the command line, so a changed --learning-rate is refused rather than
+silently ignored (full rules in utils.validate_resume). Watch the data here: at the defaults
+(num_generations 1 -> 16 prompts per step) one epoch is only ~1,219 steps on a 19.5k hint cache
+and ~248 on a 4k one, so a long `hint` run can quietly start revisiting prompts.
 
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sdft \
@@ -38,6 +43,7 @@ from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from utils import (
     DATASET_REGISTRY_TRAIN,
+    TEACHER_PROMPT_TEMPLATE,
     format_prompt_math,
     hint_path,
     load_train_dataset,
@@ -65,10 +71,10 @@ PI_HINT = (
     "Use them for your own complete solution if needed."
 )
 
-# How SDFTTrainer stitches the student prompt and privileged context into the
-# teacher's user turn. Kept here (and passed to SDFTConfig) so the length filter
-# below tokenizes the exact teacher prompt the trainer will build.
-TEACHER_PROMPT_TEMPLATE = "{prompt}\n\n{privileged_context}"
+# How SDFTTrainer stitches the student prompt and privileged context into the teacher's
+# user turn: imported from utils (train_ppo_pi builds the same prompt for its critic, and
+# utils.compose_pi_messages applies it) and passed to SDFTConfig below, so the length
+# filter here tokenizes the exact teacher prompt the trainer will build.
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +224,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "distillation_mode": args.distillation_mode,
         "distillation_alpha": args.distillation_alpha,
         "teacher_model_kind": args.teacher_model_kind,
+        # resume-critical: on resume the LR comes from the CHECKPOINT, not the CLI (see
+        # validate_resume), so recording it turns a silently-ignored change into an error.
+        "learning_rate": args.learning_rate,
         # resume-critical: dataset order (seed, length) + batch chunking. If any of
         # these differ from the original run, the shuffle_dataset permutation or the
         # per-step batch boundary shifts and the skip resumes on the wrong data.
