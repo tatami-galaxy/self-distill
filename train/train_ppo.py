@@ -239,11 +239,9 @@ class PPOTrainer(GRPOTrainer):
     def create_optimizer(self, *args, **kwargs):
         # Appending the critic's params here (rather than giving it its own optimizer) is also
         # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
-     # `optimizer.pt` Trainer already writes. This runs before _load_optimizer_and_scheduler
-        # and rebuilds an identical param-group layout, so that state reloads by index.
-        # *args/**kwargs, not an explicit signature: transformers 4.x is `create_optimizer(self)`
-        # while 5.x is `create_optimizer(self, model=None)`. Both call it with no arguments, so
-        # forwarding whatever we're given keeps this working across the vllm-driven version pin.
+        # `optimizer.pt` file as the policy's, so it gets loaded automatically by Trainer.
+        # This runs before _load_optimizer_and_scheduler and rebuilds an identical
+        # param-group layout, so that state reloads by index.
         optimizer = super().create_optimizer(*args, **kwargs)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
         # The lr is set HERE rather than patched onto param_groups[-1] afterwards, so the
@@ -253,6 +251,7 @@ class PPOTrainer(GRPOTrainer):
         if self.args.critic_learning_rate is not None:
             group["lr"] = self.args.critic_learning_rate
         optimizer.add_param_group(group)
+        # 3 groups : decay, no decay, critic
         return optimizer
 
     # -- critic gradient clipping + norm logging ----------------------------
@@ -414,6 +413,7 @@ class PPOTrainer(GRPOTrainer):
         # Clear the stash first so the checks below prove super() populated it for THIS
         # batch, rather than us reusing a stale one from a previous step.
         self._rewards_per_func_buf = None
+        # each input repeated num_generations times to match GRPOConfig
         output = super()._generate_and_score_completions(inputs)
         device = self.accelerator.device
 
@@ -818,12 +818,8 @@ def main():
     )
 
     # Critic: policy arch + a scalar value head, initialised from --model.
-    # Seed FIRST: the `.score` head is the one weight in this script with no pretrained values
-    # to load, so it is randomly initialised right here -- and Trainer only calls set_seed()
-    # when it is constructed, several lines below. Without this the critic starts from ambient
-    # OS entropy on every run: --seed would not reproduce a run, run_meta.json's `seed` would
-    # be a lie about the critic, and any A/B over critic hyperparameters would be confounded
-    # by a different value function in each arm.
+    # The `.score` head is the one weight in this script with no pretrained values
+    # to load, so it is randomly initialised here
     set_seed(args.seed)
     value_model = AutoModelForSequenceClassification.from_pretrained(
         args.model, num_labels=1, dtype=torch.bfloat16, trust_remote_code=True
