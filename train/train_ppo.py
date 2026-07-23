@@ -1,23 +1,11 @@
 """
-Train the PPO baseline -- the actor-critic RL contrast to GRPO, in our RLVR setting
-(verifiable binary outcome reward, NO reward model, NO reference model, vLLM rollouts).
-
-Where GRPO scores a rollout against a *group-relative* mean baseline (no critic), PPO
-learns a **value function** and estimates per-token advantages with GAE. On our sparse
-terminal binary reward that learned critic is the whole point: it is the dense per-token
-credit-assignment signal, the RL analogue of the OPD/OPSD credit this project studies.
-
-Design -- built ON TOP of GRPOTrainer rather than TRL's classic PPOTrainer, so we inherit
-the fast machinery for free and only add the critic:
+Design -- built ON TOP of GRPOTrainer rather than TRL's PPOTrainer :
 
   * vLLM colocate generation + policy->vLLM weight sync, prompt tokenization, reward-func
-    invocation, per-token logprobs, and the clipped-surrogate policy loss are ALL reused
+    invocation, per-token logprobs, and the clipped-surrogate policy loss are reused
     from GRPOTrainer unchanged. GRPO's `_compute_loss` already accepts per-token (B,T)
     advantages (for subclasses like MiniLLM), so our GAE advantages plug straight in.
-  * NO reference model: GRPO builds one only when beta>0; we force beta=0 (matches our
-    GRPO baseline). NO reward model: the outcome reward is `trl.rewards.accuracy_reward`
-    over the gold `solution` column -- identical to the GRPO baseline, so PPO-vs-GRPO
-    isolates exactly the critic.
+  * NO reference model: GRPO builds one only when beta>0; we force beta=0. No reward model
   * The critic is a SEPARATE value model (policy arch + scalar `.score` head, via
     AutoModelForSequenceClassification num_labels=1), kept out of `self.model` so the
     vLLM weight-sync (which iterates `self.model.named_parameters()`) is untouched.
@@ -36,17 +24,17 @@ What we override on GRPOTrainer:
   * `create_optimizer`    -- add the value model's parameters so the critic trains.
 
 GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=0.95. lam is the
-PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline
-(the interpretable ablation); lam<1 leans on the critic's bootstrap for denser credit.
+PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline;
+                    lam<1 leans on the critic's bootstrap.
 
 Loss aggregation (--loss-type) only sets the DENOMINATOR that turns per-token losses into a
 scalar, i.e. how tokens are weighted against each other. It matters more here than in GRPO:
-GRPO broadcasts one scalar advantage over a sequence's tokens, whereas our A_t genuinely
-varies per token, so a length-dependent denominator would rescale exactly the credit the
-critic just assigned. Hence only token-uniform options are exposed:
+GRPO broadcasts one scalar advantage over a sequence's tokens, whereas our A_t varies per token,
+so a length-dependent denominator would rescale exactly the credit the critic just assigned.
+Hence only token-uniform options are exposed:
   dapo (default) -- each token equal across the whole optimizer step (num_items_in_batch).
                     Also train_grpo.py's default, so PPO-vs-GRPO differs only in the critic.
-  bnpo           -- each token equal within the micro-batch. This is EXACTLY the aggregation
+  bnpo           -- each token equal within the micro-batch. This is the aggregation
                     TRL's classic PPOTrainer uses (its `masked_mean(pg_loss_max, ~padding_mask)`);
                     dapo is the same idea with the denominator promoted from the micro-batch to
                     the full accumulation window, so bnpo/accum ~= dapo.
@@ -67,12 +55,11 @@ data, and restores the CRITIC too: its optimizer state rides in the standard opt
 (the value params share the policy's optimizer), and its weights are saved alongside each
 checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a hard error --
 a critic restarting from random init would make every advantage meaningless.
-Note each checkpoint therefore costs ~2x the model bytes; consider --save-total-limit.
+Note each checkpoint therefore costs ~2x the model bytes.
 
 What resume does and does not let you change:
   * --max-steps IS free to change -- it is the TOTAL budget and is deliberately absent from
     run_meta.json, so resuming a finished 200-step run with --max-steps 400 trains 200 more.
-    Verified end to end (a run that had reached its budget, resumed to a larger one).
   * LEARNING RATES COME FROM THE CHECKPOINT, not the command line. optimizer.load_state_dict
     restores each param group's `lr` AND `initial_lr`, and Trainer calls it after create_scheduler
     -- so a different --learning-rate / --critic-learning-rate on the resume command would be
@@ -88,8 +75,8 @@ What resume does and does not let you change:
     steps -- 12,877 on full DeepMath at the defaults, but only 2,438 on a 19.5k hint cache.
     Past that the seeded permutation reshuffles and prompts start repeating.
 
-Scope (v1): single-GPU (like the 1.7B student baseline). Multi-GPU DDP wrapping of the
-separate value model + cross-process grad sync is a follow-up.
+Scope (v1): single-GPU (like the 1.7B student baseline).
+Todo : Multi-GPU DDP wrapping of the separate value model + cross-process grad sync.
 
 Generation backend (--vllm-mode):
   colocate (default) -- the engine runs in-process on the training GPU. Simplest, and nothing
@@ -98,55 +85,30 @@ Generation backend (--vllm-mode):
   server             -- talk to a standalone `trl vllm-serve` on its OWN GPU, freeing that
                         memory and giving generation a full GPU of KV cache. Costs a GPU that
                         idles during forward/backward, so it buys memory, not throughput.
-Weight sync is the same in both: once per optimizer step (gated on global_step), only the
-POLICY (the critic is not in self.model, so vLLM never sees it). In server mode HTTP carries
-only metadata (name/dtype/shape) while the tensors go GPU->GPU over a NCCL group the trainer
-joins as the last rank -- so the per-step cost is ~2N bytes over NVLink/PCIe, negligible next
-to a 60s step. The server must serve the SAME model as --model.
 
-!!  SERVER MODE + `adamw_bnb_8bit` CORRUPTS THE POLICY -- use the default paged_adamw_8bit.  !!
-(Diagnosed 2026-07-17. An earlier note here blamed the weight sync and declared server mode
-broken outright; that was wrong, and the evidence below retires it.)
-Symptom: everything *looks* healthy -- server starts, communicator forms, all 310 params POST
-200 OK per step, /generate/ returns 200, step 1 trains with a finite loss -- then step 2 dies
-in TRL's own grpo_trainer.py:1912 `torch.tensor(logps)` / "Could not infer dtype of NoneType",
-because the server's model now emits NaN logprobs (extract_logprobs maps NaN -> None).
-
-The corruption is born in the OPTIMIZER STEP, not the sync. Instrumenting one step: gradients
-are finite (0/310) after backward, 21/310 params are non-finite immediately after
-optimizer.step(), and the NEXT broadcast leaves that count at exactly 21/310 -- the sync only
-ships NaN we had already made. The dead tensors form a contiguous run in named_parameters
-order, their grads are tiny and healthy (absmax ~5e-3), and the count varies run to run
-(6, 21, 33): memory corruption, not arithmetic.
-
-BOTH ingredients are needed, which is why colocate looked like the safe *mode*:
-    server   + adamw_bnb_8bit   -> NaN        server + adamw_torch       -> clean
-    colocate + adamw_bnb_8bit   -> clean      server + paged_adamw_8bit  -> clean
-                                              server + adafactor         -> clean
-NOT PPO-specific: a stock GRPOTrainer (no critic, none of our overrides) reproduces it.
-NOT the broadcast: at the root, vLLM sets sendbuff == recvbuff (pynccl.py) -- a legal in-place
-no-op -- and a two-process NCCL probe returns the root's buffer untouched, so P2P here is fine.
-Note lr=0 does NOT prove a corruption is upstream of the optimizer in general (0 * NaN = NaN
-under torch AdamW); it happens to hold for bnb, which survives NaN grads at lr=0.
-
-Why paged: the discriminator is where bitsandbytes puts the 8-bit state. Non-paged allocates it
-with torch.zeros_like in torch's caching allocator (corrupts); paged uses CUDA managed memory
-for params >1e5 elements -- exactly the large tensors that die. Same kernels and same update
-math, so it costs nothing numerically and keeps the 8-bit memory footprint that server mode
-exists to buy. Root cause is upstream (bitsandbytes/NCCL); this is a workaround.
-If it resurfaces, check the params right after optimizer.step() -- not after the sync.
+!!  SERVER MODE + ANY bitsandbytes 8-bit OPTIMIZER CORRUPTS THE POLICY.  Use adafactor.  !!
+Symptom: step 1 trains fine, then step 2 dies in TRL's grpo_trainer.py `torch.tensor(logps)` with
+"Could not infer dtype of NoneType" -- because the policy is NaN, vLLM emits NaN logprobs, and
+TRL maps NaN -> None. The corruption is born in the OPTIMIZER STEP: gradients are finite after
+backward, and params are non-finite immediately after optimizer.step(). Not the weight sync,
+not PPO-specific (plain GRPO reproduces), not arithmetic (the count varies run to run).
+UPDATE 2026-07-23: `paged_adamw_8bit` was the documented workaround, and IT NO LONGER WORKS --
+re-measured at 1.7B in server mode, it corrupts the policy on the very first optimizer step,
+with and without the PI critic. Re-verified clean in the same harness: **adafactor** and
+**adamw_torch**. Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param and
+this script trains TWO models (policy + critic), i.e. ~64GB of state at 4B.
+`_assert_policy_finite` (below) now catches this at the step it happens.
 
 # single GPU, colocate vLLM (<=1.7B)
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 8192
 
-# 4B+: vLLM on its own GPU, policy + critic on another. Engine memory/TP are now the
-# SERVER's flags -- passing --vllm-gpu-memory-utilization to the trainer is a hard error.
+# 4B+: vLLM on its own GPU, policy + critic on another.
 CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-utilization 0.9 &
 CUDA_VISIBLE_DEVICES=6 uv run python -m train.train_ppo \
     --model Qwen/Qwen3-4B --dataset deepmath --vllm-mode server --vllm-server-port 8000
 
-aside :  GRPOTrainer also supports custom rollout logic, in case we want to use this later
+aside :  GRPOTrainer also supports custom rollout logic, in case we want to use that later
 """
 
 import argparse
@@ -174,6 +136,19 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 # one file regardless of model size, no sharding to reassemble, and no shared-tensor errors.
 # The critic's config is reconstructible from --model + num_labels=1 (see main()).
 VALUE_MODEL_FILE = "value_model.pt"
+
+
+def is_bitsandbytes_optim(optim: str) -> bool:
+    """True for bitsandbytes optimizers, which are unsafe under --vllm-mode server.
+
+    Both 8-bit variants tested (`adamw_bnb_8bit`, `paged_adamw_8bit`) corrupt the policy in the
+    optimizer step; the other bnb variants are untested. Matched by NAME, and deliberately
+    including the untested ones ("paged" implies bnb), because this failure is silent, costs a
+    full instrumented reproduction to diagnose, and the alternative -- adafactor -- is known
+    good. Refusing an optimizer that might be fine is much cheaper than the reverse.
+    """
+    o = optim.lower()
+    return "8bit" in o or "bnb" in o or "paged" in o
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -288,7 +263,7 @@ class PPOTrainer(GRPOTrainer):
     def create_optimizer(self, *args, **kwargs):
         # Appending the critic's params here (rather than giving it its own optimizer) is also
         # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
-        # `optimizer.pt` Trainer already writes. This runs before _load_optimizer_and_scheduler
+     # `optimizer.pt` Trainer already writes. This runs before _load_optimizer_and_scheduler
         # and rebuilds an identical param-group layout, so that state reloads by index.
         # *args/**kwargs, not an explicit signature: transformers 4.x is `create_optimizer(self)`
         # while 5.x is `create_optimizer(self, model=None)`. Both call it with no arguments, so
@@ -372,6 +347,38 @@ class PPOTrainer(GRPOTrainer):
         # while the forward pass used new ones, and the critic would never learn.
         self.value_model.load_state_dict(state)
         print(f"Restored critic weights <- {path}")
+
+    # -- catch a corrupted policy at the step it happens ---------------------
+
+    def _maybe_log_save_evaluate(self, *args, **kwargs):
+        """Trainer calls this immediately after `optimizer.step()`, which is exactly where the
+        server-mode optimizer corruption is born (module docstring). Check there.
+
+        Without this the failure is SILENT for a full step and then surfaces somewhere else
+        entirely: the NaN policy is broadcast to vLLM, generation returns NaN logprobs, TRL maps
+        those to None, and the run dies in `torch.tensor(logps)` with "Could not infer dtype of
+        NoneType" -- a message that points at TRL's tokenization and says nothing about the
+        optimizer. Diagnosing that cost a full instrumented reproduction; this turns it into one
+        line naming the actual cause.
+
+        Cost is ~one small kernel per parameter per optimizer step, negligible against a step
+        that spends tens of seconds in generation.
+        """
+        self._assert_policy_finite()
+        return super()._maybe_log_save_evaluate(*args, **kwargs)
+
+    def _assert_policy_finite(self):
+        bad = [n for n, p in self.model.named_parameters() if not torch.isfinite(p).all()]
+        if not bad:
+            return
+        raise RuntimeError(
+            f"Policy corrupted: {len(bad)}/{sum(1 for _ in self.model.parameters())} parameters "
+            f"are non-finite immediately after optimizer.step() at step {self.state.global_step} "
+            f"(first: {bad[:3]}). Gradients are typically FINITE here -- the corruption is in the "
+            f"optimizer, not the loss. Known cause: a bitsandbytes 8-bit optimizer "
+            f"(--optim {self.args.optim}) while --vllm-mode server holds an NCCL weight-sync "
+            f"group. Use --optim adafactor. See the module docstring."
+        )
 
     # -- per-token value predictions ----------------------------------------
 
@@ -566,6 +573,10 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "critic_max_grad_norm": args.critic_max_grad_norm,
         "loss_type": args.loss_type,
         "vllm_mode": args.vllm_mode,
+        # Recorded because the optimizer x vllm_mode combination decides whether the policy
+        # silently NaNs (module docstring), and a crashed run leaves no training_args.bin to
+        # read it back from.
+        "optim": args.optim,
         # resume-critical, learning rates: on resume these come from the CHECKPOINT, not the CLI.
         # optimizer.load_state_dict restores each param group's `lr` and `initial_lr`, and it runs
         # after create_scheduler, so a different --learning-rate on the command line is silently
@@ -643,11 +654,10 @@ def main():
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--optim", default="paged_adamw_8bit",
-                   help="Optimizer. Default is the PAGED 8-bit AdamW rather than train_grpo.py's "
-                        "`adamw_bnb_8bit`: the non-paged one corrupts the policy in the optimizer "
-                        "step whenever --vllm-mode server is active (see the module docstring). "
-                        "It is the same 8-bit AdamW numerically -- paged only moves the state to "
-                        "CUDA managed memory -- so the GRPO baseline stays comparable.")
+                   help="Optimizer. The 8-bit default keeps the memory footprint of the GRPO "
+                        "baseline and is fine in COLOCATE mode. In --vllm-mode server EVERY "
+                        "bitsandbytes 8-bit optimizer corrupts the policy (hard error below); "
+                        "pass --optim adafactor there. See the module docstring.")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
@@ -691,6 +701,12 @@ def main():
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Verify CLI options
+# ---------------------------------------------------------------------------
+
+
     # In server mode the engine's memory/TP are the SERVER's properties, configured when it is
     # launched; TRL ignores these config fields entirely. Accepting them here would silently do
     # nothing -- exactly the flag you'd reach for after an OOM -- so reject them instead.
@@ -714,16 +730,23 @@ def main():
     # NaNs the policy inside the optimizer step once the NCCL weight-sync group exists (module
     # docstring). It surfaces two steps later as an unrelated-looking dtype error in TRL, so a
     # hard stop here is worth more than the flexibility.
-    if args.vllm_mode == "server" and args.optim == "adamw_bnb_8bit":
+    if args.vllm_mode == "server" and is_bitsandbytes_optim(args.optim):
         p.error(
-            "--optim adamw_bnb_8bit corrupts the policy under --vllm-mode server: finite "
-            "gradients, NaN params straight out of optimizer.step(). Use the default "
-            "--optim paged_adamw_8bit (same 8-bit AdamW, state in CUDA managed memory), or "
-            "adafactor / adamw_torch. See the module docstring."
+            f"--optim {args.optim} corrupts the policy under --vllm-mode server: finite "
+            "gradients, NaN params straight out of optimizer.step(), which surfaces two steps "
+            "later as an unrelated-looking dtype error inside TRL. Use --optim adafactor "
+            "(recommended -- adamw_torch is also clean but its fp32 moments cost ~64GB across "
+            "policy + critic at 4B). See the module docstring."
         )
 
     vllm_gpu_mem = 0.25 if args.vllm_gpu_memory_utilization is None else args.vllm_gpu_memory_utilization
     vllm_tp = 1 if args.vllm_tensor_parallel_size is None else args.vllm_tensor_parallel_size
+
+
+# ---------------------------------------------------------------------------
+# Set output directory
+# ---------------------------------------------------------------------------
+
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, args.dataset)
@@ -731,6 +754,12 @@ def main():
     if args.vllm_mode == "server":
         print(f"  vLLM: server at {args.vllm_server_host}:{args.vllm_server_port} "
               f"(weight-sync group port {args.vllm_group_port})")
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 
     train_dataset = build_grpo_dataset(args.dataset, max_samples=args.max_samples)
     print(f"Loaded {len(train_dataset)} examples")

@@ -89,7 +89,7 @@ from transformers import AutoModelForSequenceClassification, set_seed
 from trl.rewards import accuracy_reward
 from trl.trainer.utils import pad
 
-from train.train_ppo import PPOConfig, PPOTrainer
+from train.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
 from train.train_sdft import PI_ANSWER, PI_FULL, PI_HINT
 from utils import (
     DATASET_REGISTRY_TRAIN,
@@ -364,6 +364,8 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "max_value_prompt_length": args.max_value_prompt_length,
         "loss_type": args.loss_type,
         "vllm_mode": args.vllm_mode,
+        # See train_ppo.build_run_meta: optim x vllm_mode decides whether the policy NaNs.
+        "optim": args.optim,
         # resume-critical, learning rates: on resume these come from the CHECKPOINT, not the CLI
         # (see train_ppo.build_run_meta). Recorded so validate_resume errors instead of silently
         # ignoring a changed rate.
@@ -431,9 +433,13 @@ def main():
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
     p.add_argument("--warmup-steps", type=int, default=0)
-    p.add_argument("--optim", default="paged_adamw_8bit",
-                   help="See train_ppo.py: `adamw_bnb_8bit` corrupts the policy under "
-                        "--vllm-mode server.")
+    p.add_argument("--optim", default="adafactor",
+                   help="Optimizer. Defaults to adafactor, NOT train_ppo.py's paged_adamw_8bit, "
+                        "because this script defaults to --vllm-mode server, where every "
+                        "bitsandbytes 8-bit optimizer corrupts the policy on the first "
+                        "optimizer step (re-measured 2026-07-23; see train_ppo.py's docstring). "
+                        "adamw_torch is also clean but its fp32 moments cost ~64GB across policy "
+                        "+ critic at 4B. In colocate mode the 8-bit optimizers are fine.")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
@@ -484,11 +490,11 @@ def main():
                 "these only apply to --vllm-mode colocate and would be silently ignored in server "
                 "mode, where they are the server's properties: " + "; ".join(misplaced)
             )
-    if args.vllm_mode == "server" and args.optim == "adamw_bnb_8bit":
+    if args.vllm_mode == "server" and is_bitsandbytes_optim(args.optim):
         p.error(
-            "--optim adamw_bnb_8bit corrupts the policy under --vllm-mode server: finite "
+            f"--optim {args.optim} corrupts the policy under --vllm-mode server: finite "
             "gradients, NaN params straight out of optimizer.step(). Use the default "
-            "--optim paged_adamw_8bit. See train_ppo.py's module docstring."
+            "--optim adafactor. See train_ppo.py's module docstring."
         )
 
     vllm_gpu_mem = 0.25 if args.vllm_gpu_memory_utilization is None else args.vllm_gpu_memory_utilization
