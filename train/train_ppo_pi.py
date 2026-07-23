@@ -114,6 +114,7 @@ def build_ppo_pi_dataset(
     pi_mode: str = "hint",
     model: str | None = None,
     max_samples: int | None = None,
+    max_value_prompt_length: int | None = None,
 ):
     """Columns:
       `prompt`             -- conversational [system, user], identical to train_grpo /
@@ -125,6 +126,12 @@ def build_ppo_pi_dataset(
     `hint` draws its rows from the hint cache (every row has a hint), so the example pool is the
     dataset's solution-bearing subset rather than the full set -- see KNOWN CONFOUNDS above.
     `full` needs a worked solution; `answer` and `none` run on the whole pool.
+
+    When `model` and `max_value_prompt_length` are given, rows whose CRITIC prompt would not fit
+    the cap are dropped, so PPOPITrainer never has to truncate one (see _build_value_prompts).
+    Mirrors build_sdft_dataset's `full` filter, which solves the same problem for the teacher.
+    Applied after `max_samples`, so the result may hold fewer rows. A no-op for `hint`/`answer`
+    /`none`, whose PI is a line or two; `full` is the arm that needs it.
     """
     if pi_mode not in PI_MODES:
         raise ValueError(f"unknown pi_mode {pi_mode!r}; expected one of {PI_MODES}")
@@ -153,7 +160,37 @@ def build_ppo_pi_dataset(
             "privileged_context": privileged_context,
         }
 
-    return ds.map(_map, remove_columns=ds.column_names)
+    ds = ds.map(_map, remove_columns=ds.column_names)
+
+    # Drop rows the critic could not read intact. Truncation is a poor fallback here: the value
+    # prompt's user turn is "{question}\n\n{privileged_context}" (utils.TEACHER_PROMPT_TEMPLATE),
+    # so left-truncating to the tail throws away the QUESTION and the chat template's opening
+    # header, leaving the critic to score a completion against a headerless fragment of the demo.
+    # Dropping the row instead costs data and keeps every surviving value prompt well-formed.
+    if model is not None and max_value_prompt_length is not None:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+        def _value_prompt_fits(row):
+            # Reconstruct exactly what _build_value_prompts will tokenize.
+            messages = (
+                compose_pi_messages(row["prompt"], row["privileged_context"])
+                if row["privileged_context"]
+                else row["prompt"]
+            )
+            ids = tok.apply_chat_template(
+                [messages], add_generation_prompt=True, tokenize=True, return_dict=True
+            )["input_ids"][0]
+            return len(ids) <= max_value_prompt_length
+
+        n_before = len(ds)
+        ds = ds.filter(_value_prompt_fits, num_proc=4)
+        if len(ds) < n_before:
+            print(f"  pi={pi_mode}: kept {len(ds)}/{n_before} rows whose critic prompt fits "
+                  f"max_value_prompt_length={max_value_prompt_length}")
+
+    return ds
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +215,7 @@ class PPOPITrainer(PPOTrainer):
         super().__init__(*args, **kwargs)
         self.max_value_prompt_length = max_value_prompt_length
         self._pi_rows = None  # dataset rows for the batch being scored (set below)
+        self._warned_truncation = False  # one-shot guard for the backstop warning
 
     # -- the PI value prompt ------------------------------------------------
 
@@ -262,9 +300,15 @@ class PPOPITrainer(PPOTrainer):
         )
         ids_list = tokenized["input_ids"]
 
-        # No truncation happens upstream (TRL 1.6.0's GRPOTrainer has no max_prompt_length), so
-        # the cap is ours. Left-truncate, like SDFT's teacher prompt: the tail (the question and
-        # the PI's closing instruction) is what the critic most needs.
+        # Nothing truncates upstream (TRL 1.6.0's GRPOTrainer has no max_prompt_length), so the
+        # cap is ours -- but it is a BACKSTOP, not the plan: build_ppo_pi_dataset drops rows that
+        # do not fit, so a truncation here means a row slipped past that filter (a dataset built
+        # without --max-value-prompt-length, or a chat template that renders longer than the
+        # filter's). Left-truncation is lossy in a way that is easy to misread: the user turn is
+        # "{question}\n\n{privileged_context}", so cutting from the left removes the QUESTION and
+        # the template's opening header first, and keeps the PI -- the critic would then be
+        # scoring a completion against a headerless fragment of the demo, with no problem
+        # statement. Hence the one-time warning.
         n_truncated = 0
         if self.max_value_prompt_length is not None:
             capped = []
@@ -274,6 +318,13 @@ class PPOPITrainer(PPOTrainer):
                     ids = ids[-self.max_value_prompt_length:]
                 capped.append(ids)
             ids_list = capped
+            if n_truncated and not self._warned_truncation:
+                self._warned_truncation = True
+                print(f"  WARNING: {n_truncated}/{len(ids_list)} critic prompts exceeded "
+                      f"--max-value-prompt-length {self.max_value_prompt_length} and were "
+                      f"left-truncated, which drops the question and the chat template header. "
+                      f"build_ppo_pi_dataset should have filtered these out -- rebuild the "
+                      f"dataset with the same cap. Watch ppo/value_prompt_truncated_rate.")
 
         n = max(len(ids_list), 1)
         mode = "train" if self.model.training else "eval"
@@ -328,12 +379,32 @@ class PPOPITrainer(PPOTrainer):
         self._metrics[mode]["ppo/outcome_mean"].append(outcome[valid].mean().item())
 
         # Where the credit lands. A critic that has learned to string-match the answer only moves
-        # at the very end, concentrating |A| in the last quartile: late blame, not process credit.
+        # at the very end, concentrating credit in the last quartile: late blame, not process
+        # credit. Two readings of that, both from tensors already in hand.
+        pos = torch.arange(mask.size(1), device=mask.device).unsqueeze(0)  # (1, C)
+        last_q_tok = (pos.float() >= 0.75 * lengths.unsqueeze(1).float()) & mask.bool()
+
+        # PRIMARY -- the first difference of the RAW value curve, V(y<=t) - V(y<t), which is the
+        # counterfactual credit this project treats as the ideal signal. Read this one: a FLAT
+        # critic has zero first difference everywhere, so it drops out of the average instead of
+        # scoring a misleading 0.25, and a late-firing verifier goes to ~1.0.
+        deltas = (values[:, 1:] - values[:, :-1]).abs()  # (B, C-1); column j holds t = j+1
+        d_mask = mask[:, 1:] * mask[:, :-1]  # both endpoints real
+        d_total = (deltas * d_mask).sum(dim=1)  # (B,)
+        d_last_q = last_q_tok[:, 1:] & d_mask.bool()
+        d_share = (deltas * d_last_q).sum(dim=1) / d_total.clamp(min=1e-8)
+        d_keep = valid & (d_total > 0)
+        if d_keep.any():
+            self._metrics[mode]["ppo/value_move_last_quartile"].append(d_share[d_keep].mean().item())
+
+        # SECONDARY -- the same share over the whitened advantages, kept only so runs started
+        # before this metric existed stay comparable. It CANNOT separate "critic learned nothing"
+        # from "credit spread perfectly evenly": whitening subtracts a batch-global mean, so a
+        # flat critic still gets a constant non-zero |A| at every position and the share pins to
+        # exactly 0.25, the uniform value.
         advantages = (output["advantages"] * mask).abs()
         total = advantages.sum(dim=1)  # (B,)
-        pos = torch.arange(mask.size(1), device=mask.device).unsqueeze(0)  # (1, C)
-        last_q = (pos.float() >= 0.75 * lengths.unsqueeze(1).float()) & mask.bool()
-        share = (advantages * last_q).sum(dim=1) / total.clamp(min=1e-8)
+        share = (advantages * last_q_tok).sum(dim=1) / total.clamp(min=1e-8)
         keep = valid & (total > 0)
         if keep.any():
             self._metrics[mode]["ppo/credit_mass_last_quartile"].append(share[keep].mean().item())
@@ -510,7 +581,8 @@ def main():
               f"(weight-sync group port {args.vllm_group_port})")
 
     train_dataset = build_ppo_pi_dataset(
-        args.dataset, args.pi_mode, model=args.model, max_samples=args.max_samples
+        args.dataset, args.pi_mode, model=args.model, max_samples=args.max_samples,
+        max_value_prompt_length=args.max_value_prompt_length,
     )
     print(f"Loaded {len(train_dataset)} examples")
     print(f"  sample prompt: {train_dataset[0]['prompt'][-1]['content'][:120]!r}")

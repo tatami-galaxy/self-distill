@@ -53,27 +53,14 @@ token count ~= accum * micro-batch count), vf_coef keeps its textbook meaning un
 Resume (--resume-from-checkpoint) restores the policy/optimizer/scheduler/RNG, skips seen
 data, and restores the CRITIC too: its optimizer state rides in the standard optimizer.pt
 (the value params share the policy's optimizer), and its weights are saved alongside each
-checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a hard error --
-a critic restarting from random init would make every advantage meaningless.
-Note each checkpoint therefore costs ~2x the model bytes.
+checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a hard error.
 
 What resume does and does not let you change:
-  * --max-steps IS free to change -- it is the TOTAL budget and is deliberately absent from
-    run_meta.json, so resuming a finished 200-step run with --max-steps 400 trains 200 more.
-  * LEARNING RATES COME FROM THE CHECKPOINT, not the command line. optimizer.load_state_dict
-    restores each param group's `lr` AND `initial_lr`, and Trainer calls it after create_scheduler
-    -- so a different --learning-rate / --critic-learning-rate on the resume command would be
-    silently discarded, and the run would quietly continue at the old rate. Both are recorded in
-    run_meta.json so validate_resume raises instead of ignoring you. To change a rate, start a
-    new run. (Checkpoints written before those keys existed simply skip the check.)
-  * Changing --max-steps is only safe with lr_scheduler_type=constant (the default). LambdaLR's
-    state_dict excludes the lambda, so it is rebuilt from the NEW budget while last_epoch is
-    restored: a cosine run resumed at step 200 with --max-steps 400 jumps its LR back UP to the
-    new schedule's midpoint.
-  * Extending far enough re-enters the dataset. One epoch is
-    len(dataset) / (per_device_train_batch_size * gradient_accumulation_steps / num_generations)
-    steps -- 12,877 on full DeepMath at the defaults, but only 2,438 on a 19.5k hint cache.
-    Past that the seeded permutation reshuffles and prompts start repeating.
+  * --max-steps IS free to change --
+  * LEARNING RATES COME FROM THE CHECKPOINT, not the command line. To change a rate, start a
+    new run.
+  * Changing --max-steps is only safe with lr_scheduler_type=constant (the default).
+  * Extending far enough re-enters the dataset.
 
 Scope (v1): single-GPU (like the 1.7B student baseline).
 Todo : Multi-GPU DDP wrapping of the separate value model + cross-process grad sync.
@@ -87,16 +74,8 @@ Generation backend (--vllm-mode):
                         idles during forward/backward, so it buys memory, not throughput.
 
 !!  SERVER MODE + ANY bitsandbytes 8-bit OPTIMIZER CORRUPTS THE POLICY.  Use adafactor.  !!
-Symptom: step 1 trains fine, then step 2 dies in TRL's grpo_trainer.py `torch.tensor(logps)` with
-"Could not infer dtype of NoneType" -- because the policy is NaN, vLLM emits NaN logprobs, and
-TRL maps NaN -> None. The corruption is born in the OPTIMIZER STEP: gradients are finite after
-backward, and params are non-finite immediately after optimizer.step(). Not the weight sync,
-not PPO-specific (plain GRPO reproduces), not arithmetic (the count varies run to run).
-UPDATE 2026-07-23: `paged_adamw_8bit` was the documented workaround, and IT NO LONGER WORKS --
-re-measured at 1.7B in server mode, it corrupts the policy on the very first optimizer step,
-with and without the PI critic. Re-verified clean in the same harness: **adafactor** and
-**adamw_torch**. Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param and
-this script trains TWO models (policy + critic), i.e. ~64GB of state at 4B.
+`paged_adamw_8bit` was the documented workaround, and IT NO LONGER WORKS.
+Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param
 `_assert_policy_finite` (below) now catches this at the step it happens.
 
 # single GPU, colocate vLLM (<=1.7B)
@@ -142,10 +121,7 @@ def is_bitsandbytes_optim(optim: str) -> bool:
     """True for bitsandbytes optimizers, which are unsafe under --vllm-mode server.
 
     Both 8-bit variants tested (`adamw_bnb_8bit`, `paged_adamw_8bit`) corrupt the policy in the
-    optimizer step; the other bnb variants are untested. Matched by NAME, and deliberately
-    including the untested ones ("paged" implies bnb), because this failure is silent, costs a
-    full instrumented reproduction to diagnose, and the alternative -- adafactor -- is known
-    good. Refusing an optimizer that might be fine is much cheaper than the reverse.
+    optimizer step; the other bnb variants are untested. Matched by NAME.
     """
     o = optim.lower()
     return "8bit" in o or "bnb" in o or "paged" in o
@@ -348,11 +324,12 @@ class PPOTrainer(GRPOTrainer):
         self.value_model.load_state_dict(state)
         print(f"Restored critic weights <- {path}")
 
-    # -- catch a corrupted policy at the step it happens ---------------------
+    # -- end-of-step: reset the critic's grads, catch a corrupted policy ------
 
     def _maybe_log_save_evaluate(self, *args, **kwargs):
-        """Trainer calls this immediately after `optimizer.step()`, which is exactly where the
-        server-mode optimizer corruption is born (module docstring). Check there.
+        """Trainer calls this immediately after `optimizer.step()` and `model.zero_grad()`, which
+        is both where the server-mode optimizer corruption is born (module docstring) and the only
+        seam at which the critic's gradients can be cleared. Do both here.
 
         Without this the failure is SILENT for a full step and then surfaces somewhere else
         entirely: the NaN policy is broadcast to vLLM, generation returns NaN logprobs, TRL maps
@@ -365,6 +342,16 @@ class PPOTrainer(GRPOTrainer):
         that spends tens of seconds in generation.
         """
         self._assert_policy_finite()
+        # Trainer's `model.zero_grad()` clears the POLICY only, and the critic deliberately lives
+        # outside self.model (see __init__), so without this it enters the next step still holding
+        # the last one's gradient: G_k = clip(G_{k-1}) + sum(step k grads). The clip bounds the
+        # carry-over to a unit-norm vector, but it is largely ALIGNED with the fresh gradient, so
+        # it acts as an undocumented momentum term: measured at 1.7B, removing it moved the
+        # critic's clip-time norm 9.09 -> 8.54 (~6%). Under --critic-max-grad-norm 0 nothing
+        # clips, and the carry-over is an unbounded running sum. It also inflated
+        # ppo/critic_grad_norm, which is measured at clip time. Here rather than in
+        # _clip_grad_norm, which runs BEFORE optimizer.step().
+        self.value_model.zero_grad(set_to_none=True)
         return super()._maybe_log_save_evaluate(*args, **kwargs)
 
     def _assert_policy_finite(self):
@@ -538,13 +525,30 @@ class PPOTrainer(GRPOTrainer):
         )
         vf_losses1 = (vpred - returns) ** 2
         vf_losses2 = (vpredclipped - returns) ** 2
-        vf_loss = 0.5 * masked_mean(torch.max(vf_losses1, vf_losses2), mask)
+        vf_loss_max = torch.max(vf_losses1, vf_losses2)
 
-        # Match the policy loss's gradient-accumulation normalization so accumulated
-        # grads average correctly (vf_coef absorbs any constant scale difference).
+        # Normalize EXACTLY as the policy loss does for this loss_type, so the critic weights
+        # tokens against each other the same way the actor does.
+        #   dapo -- every token equal across the whole optimizer step. `num_items_in_batch` is the
+        #           generation batch's total completion token count (a 0-dim tensor, which TRL's
+        #           split/shuffle pass through unchanged), so summing the micro-batches gives one
+        #           token-uniform mean and no /grad_accum belongs here.
+        #   bnpo -- every token equal within the micro-batch, then /grad_accum.
+        # Both used to take the bnpo form. Under dapo that made the critic's weighting
+        # SEQUENCE-uniform -- token t of rollout i carried weight 1/(accum * L_i) -- while the
+        # policy's stayed token-uniform. At per_device_train_batch_size=1 a micro-batch IS one
+        # rollout, so with completion lengths spanning ~2.5k-8.2k, tokens in short traces got up
+        # to ~3x the weight of tokens in long ones: exactly the length-rescaling of per-token
+        # credit that excludes the 'grpo' loss type (module docstring), applied to the critic.
+        # Both forms are a mean of squared errors, so vf_coef keeps its previous magnitude.
         mode = "train" if self.model.training else "eval"
-        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
-        vf_loss = vf_loss / normalizer
+        if self.loss_type == "dapo":
+            vf_loss = 0.5 * (vf_loss_max * mask).sum() / (
+                inputs["num_items_in_batch"] / self.accelerator.num_processes
+            )
+        else:  # bnpo -- the only other type this script exposes
+            vf_loss = 0.5 * masked_mean(vf_loss_max, mask)
+            vf_loss = vf_loss / (self.current_gradient_accumulation_steps if mode == "train" else 1.0)
 
         clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), mask)
         self._metrics[mode]["ppo/vf_loss"].append(self.accelerator.gather(vf_loss.detach()).mean().item())
