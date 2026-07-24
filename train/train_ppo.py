@@ -1,10 +1,11 @@
 """
 Design -- built ON TOP of GRPOTrainer rather than TRL's PPOTrainer :
 
-  * vLLM colocate generation + policy->vLLM weight sync, prompt tokenization, reward-func
-    invocation, per-token logprobs, and the clipped-surrogate policy loss are reused
-    from GRPOTrainer unchanged. GRPO's `_compute_loss` already accepts per-token (B,T)
+  * vLLM colocate generation + policy->vLLM weight sync, POLICY prompt tokenization,
+    reward-func invocation, per-token logprobs, and the clipped-surrogate policy loss are
+    reused from GRPOTrainer unchanged. GRPO's `_compute_loss` already accepts per-token (B,T)
     advantages (for subclasses like MiniLLM), so our GAE advantages plug straight in.
+    The CRITIC's prompt is tokenized on our own path -- see "The critic's prompt" below.
   * NO reference model: GRPO builds one only when beta>0; we force beta=0. No reward model
   * The critic is a SEPARATE value model (policy arch + scalar `.score` head, via
     AutoModelForSequenceClassification num_labels=1), kept out of `self.model` so the
@@ -22,6 +23,37 @@ What we override on GRPOTrainer:
   * `_compute_loss`       -- reuse GRPO's policy loss (super) and ADD a clipped value
                             (MSE) loss over the critic's fresh predictions vs returns.
   * `create_optimizer`    -- add the value model's parameters so the critic trains.
+
+The critic's prompt (VERIFIER FRAMING)
+The policy is asked to SOLVE; the critic is asked to JUDGE. `compose_value_messages` swaps the
+dataset's problem-solving system turn for VALUE_SYSTEM_PROMPT and keeps every other turn verbatim,
+so the critic reads the SAME question under a verifier instruction -- policy-prompt vs
+verifier-prompt is a one-variable change. WHY: the `.score` head is randomly initialised and has to
+learn P(correct|prefix) from an MSE signal alone; framing the context as verification lets the
+instruction-tuned backbone carry part of that load instead of leaving all of it to the head.
+
+Two invariants make this safe. Both are cross-library (they depend on TRL's prompt rendering), so
+both are pinned by tests in tests/test_ppo_config.py rather than left to inspection:
+  * PREFIX ONLY. The completion must remain the literal SUFFIX of the critic's sequence --
+    `cat([value_prompt, completion])[:, -C:] == completion_ids` -- because
+    `_get_per_token_values` slices values from the END. Hence the verifier instruction goes in
+    FRONT of the completion; a verifier QUESTION appended after it would silently break every
+    per-token alignment. A longer value prompt is otherwise free: values[:, 0] is still V(state
+    before the first completion token), whatever the prefix length.
+  * SAME GENERATION BOUNDARY. `_build_value_prompts` mirrors GRPOTrainer._tokenize_prompts (same
+    chat_template, chat_template_kwargs, tools, add_generation_prompt=True) so the critic's prompt
+    ends on the IDENTICAL assistant/<think> header the completion was sampled after.
+The framing does not leak action information: it is a deterministic function of the prompt, fixed
+at episode start, so it is valid baseline input. With lam=1, before optional batch whitening, it
+changes only the action-independent baseline in the Monte-Carlo advantage estimator. With lam<1,
+GAE bootstraps from the learned critic, so changing the critic's representation can also change the
+estimator's bias while that critic is imperfect.
+
+This changes what the critic's state representation IS, so old critic weights/optimizer state are
+not transferable. `build_run_meta` stamps `value_prompt_version`, and main() passes it to
+validate_resume's `strict_keys` -- for those keys a checkpoint that never recorded the key counts
+as a MISMATCH rather than a skipped comparison, so a pre-verifier checkpoint is refused instead of
+silently resumed into a critic that now reads a different prompt.
 
 GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=0.95. lam is the
 PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline;
@@ -100,6 +132,7 @@ from transformers import AutoModelForSequenceClassification, set_seed
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import accuracy_reward
+from trl.trainer.utils import pad
 
 from train.train_grpo import build_grpo_dataset
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
@@ -115,6 +148,29 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 # one file regardless of model size, no sharding to reassemble, and no shared-tensor errors.
 # The critic's config is reconstructible from --model + num_labels=1 (see main()).
 VALUE_MODEL_FILE = "value_model.pt"
+
+# The policy still receives the dataset's ordinary problem-solving prompt. Only the
+# critic sees this verifier instruction, followed by the same user problem and then
+# the sampled completion whose prefixes it scores.
+VALUE_SYSTEM_PROMPT = (
+    "You are a careful mathematics verifier. The assistant response below is a "
+    "candidate solution produced by another model which may or may not be correct. "
+    "Read it incrementally and track how likely this attempt is to reach the correct "
+    "final answer. Use the reasoning seen so far as evidence, but judge eventual "
+    "final-answer correctness, not writing style."
+)
+VALUE_PROMPT_VERSION = "verifier_v1"
+
+
+def compose_value_messages(policy_messages):
+    """Replace policy system messages with the critic's verifier instruction.
+
+    Make fresh message dictionaries so constructing the critic input cannot mutate the
+    policy conversation retained in the dataset or consumed by GRPOTrainer.
+    """
+    return [{"role": "system", "content": VALUE_SYSTEM_PROMPT}] + [
+        dict(message) for message in policy_messages if message.get("role") != "system"
+    ]
 
 
 def is_bitsandbytes_optim(optim: str) -> bool:
@@ -255,6 +311,7 @@ class PPOTrainer(GRPOTrainer):
             value_model.enable_input_require_grads()
         self.value_model = value_model
         self._rewards_per_func_buf = None  # stashed by _calculate_rewards for GAE
+        self._value_rows = None  # raw rows needed to build the critic-only prompt once
 
     # -- critic parameters into the optimizer -------------------------------
 
@@ -388,21 +445,69 @@ class PPOTrainer(GRPOTrainer):
 
     # -- per-token value predictions ----------------------------------------
 
+    def _build_value_prompts(self, rows, device):
+        """Tokenize verifier conversations exactly as GRPO tokenizes policy prompts."""
+        conversations = [compose_value_messages(row["prompt"]) for row in rows]
+        tokenized = self.processing_class.apply_chat_template(
+            conversation=conversations,
+            tools=self.tools or None,
+            chat_template=self.chat_template,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            **self.chat_template_kwargs,
+        )
+        ids_list = tokenized["input_ids"]
+
+        mode = "train" if self.model.training else "eval"
+        n = max(len(ids_list), 1)
+        self._metrics[mode]["ppo/value_prompt_len_mean"].append(
+            sum(map(len, ids_list)) / n
+        )
+
+        tensors = [torch.tensor(ids, dtype=torch.long) for ids in ids_list]
+        masks = [torch.ones_like(tensor) for tensor in tensors]
+        ids = pad(
+            tensors, padding_value=self._tokenizer.pad_token_id, padding_side="left"
+        ).to(device)
+        mask = pad(masks, padding_value=0, padding_side="left").to(device)
+        return ids, mask
+
     def _value_inputs(self, batch):
-        """What the critic reads: (input_ids, attention_mask, logits_to_keep).
+        """Build critic inputs from its verifier prompt and the sampled completion.
 
-        Here that is exactly what the POLICY reads -- the same prompt, the same completion,
-        one tensor shared by both models. It is a method, and takes the whole `batch`, so
-        that a subclass can give the critic a DIFFERENT prompt (train_ppo_pi.py conditions
-        it on privileged info) without touching either call site.
+        The verifier prompt tensors are cached in the rollout dict. GRPO's buffering then
+        shuffles and slices them with every other per-row tensor, ensuring the old and fresh
+        value forwards see the same critic state when applying value clipping.
 
-        `batch` is the rollout dict during `_generate_and_score_completions` and the
-        micro-batch dict during `_compute_loss`; both carry these four keys, and both must
-        resolve to the same sequence for a row, or `cliprange_value` would be clipping
-        `vpred` against an `old_values` computed from a different state.
+        This remains an override seam: train_ppo_pi.py supplies its own PI-conditioned
+        `value_prompt_ids` through its `_value_inputs` implementation.
         """
-        input_ids = torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1)
-        attention_mask = torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1)
+        if "value_prompt_ids" not in batch:
+            if self._value_rows is None:
+                raise RuntimeError(
+                    "_value_inputs must be reached either inside "
+                    "_generate_and_score_completions (which stashes the raw rows) or on a "
+                    "batch that already carries 'value_prompt_ids'; a TRL change to the "
+                    "buffering may have dropped the key."
+                )
+            n_rows = len(self._value_rows)
+            n_completions = batch["completion_ids"].size(0)
+            if n_rows != n_completions:
+                raise RuntimeError(
+                    f"Stashed value-prompt rows ({n_rows}) != completions in the batch "
+                    f"({n_completions}). The verifier prompt would be paired with the wrong "
+                    "rollout."
+                )
+            ids, mask = self._build_value_prompts(
+                self._value_rows, batch["completion_ids"].device
+            )
+            batch["value_prompt_ids"], batch["value_prompt_mask"] = ids, mask
+
+        input_ids = torch.cat([batch["value_prompt_ids"], batch["completion_ids"]], dim=1)
+        attention_mask = torch.cat(
+            [batch["value_prompt_mask"], batch["completion_mask"]], dim=1
+        )
         return input_ids, attention_mask, batch["completion_ids"].size(1)
 
     def _get_per_token_values(self, input_ids, attention_mask, logits_to_keep):
@@ -431,8 +536,8 @@ class PPOTrainer(GRPOTrainer):
 
     def _generate_and_score_completions(self, inputs):
         # inputs -> solution, prompt
-        # Clear the stash first so the checks below prove super() populated it for THIS
-        # batch, rather than us reusing a stale one from a previous step.
+        # Clear the stash first so the checks below prove super() populated it for this batch
+        # rather than us reusing a stale one from a previous step.
         self._rewards_per_func_buf = None
         # each input repeated num_generations times to match GRPOConfig
         # update : default is now 1, no repeated examples
@@ -487,11 +592,19 @@ class PPOTrainer(GRPOTrainer):
         token_rewards[rows, last_idx] = rewards
         token_rewards = token_rewards * completion_mask
 
-        # Old values from the critic (no grad), then GAE.
-        # Note : The current critic currently doesn't use the value model
-        # as an instruction tuned language model
-        with torch.no_grad():
-            old_values = self._get_per_token_values(*self._value_inputs(output))
+        # Old values from the critic's verifier-conditioned prompt (no grad), then GAE.
+        # `_value_inputs` renders that prompt from the RAW rows -- GRPO's rollout dict carries
+        # only tokenized POLICY prompts -- so stash them across just this call. Cleared in
+        # `finally` rather than at method entry: a later `_value_inputs` arriving WITHOUT
+        # 'value_prompt_ids' (i.e. TRL's buffering dropped the key) must raise, and a stale
+        # stash would instead sail past the n_rows == n_completions guard -- the batch sizes
+        # match -- and silently pair each verifier prompt with a previous batch's question.
+        self._value_rows = inputs
+        try:
+            with torch.no_grad():
+                old_values = self._get_per_token_values(*self._value_inputs(output))
+        finally:
+            self._value_rows = None
         old_values = old_values.float() * completion_mask
 
         # (B, T) per-token
@@ -586,6 +699,13 @@ class PPOTrainer(GRPOTrainer):
 def build_run_meta(args, num_train_examples: int) -> dict:
     return {
         "method": "ppo_vllm",
+        # Critic-state identity. Changing the verifier prompt changes what `value_model.pt`
+        # and its optimizer state MEAN, so an older checkpoint is not resumable into a newer
+        # prompt. main() passes this key to validate_resume's `strict_keys`, which is what
+        # makes a checkpoint that never recorded it (i.e. predates the verifier prompt) a
+        # hard error rather than a silently skipped comparison. `method` stays the trainer's
+        # name so runs remain groupable by it.
+        "value_prompt_version": VALUE_PROMPT_VERSION,
         "model": args.model,
         "dataset": args.dataset,
         "max_samples": args.max_samples,
@@ -847,7 +967,14 @@ def main():
 
     meta = build_run_meta(args, len(train_dataset))
     if args.resume_from_checkpoint:
-        validate_resume(args.resume_from_checkpoint, meta, args.force_resume)
+        validate_resume(
+            args.resume_from_checkpoint,
+            meta,
+            args.force_resume,
+            # Absence is disqualifying: a checkpoint written before the verifier prompt holds
+            # a critic trained on a different state representation entirely.
+            strict_keys=("value_prompt_version",),
+        )
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "run_meta.json"), "w") as f:

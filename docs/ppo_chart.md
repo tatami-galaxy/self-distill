@@ -31,6 +31,13 @@ The batch *size* is `per_device_bs × num_procs × steps_per_generation` and doe
 8 prompts × 2 rollouts and changes nothing else in this trace — `generation_batch_size`, the step
 count, and the control flow are all identical.
 
+**The policy and the critic read different prompts.** The policy gets the dataset's
+problem-solving prompt; the critic gets the same question under `VALUE_SYSTEM_PROMPT`, a verifier
+instruction. That second prompt is tokenized on our own path (`_build_value_prompts`), not TRL's,
+and is built **once per generation batch** then cached into the rollout dict — see Phase A. Both
+forwards still end on the identical generation header, so the completion attaches where it was
+sampled.
+
 ---
 
 ## Top level
@@ -185,15 +192,31 @@ TRL _prepare_inputs(generation_batch)                            grpo_trainer.py
  │  │  ├─ ★ rewards = (rpf × weights).nansum(1)[local_slice];  scorable = ~all-NaN
  │  │  ├─ ★ optional: −missing_eos_penalty for rows not ending in EOS
  │  │  ├─ ★ token_rewards: place the scalar reward at each row's LAST real token
- │  │  ├─ ★ torch.no_grad():
+ │  │  │
+ │  │  ├─ ★ self._value_rows = inputs        # raw rows; GRPO's dict has only TOKENIZED
+ │  │  │                                     #   policy prompts.  try/finally -> cleared
+ │  │  ├─ ★ torch.no_grad():                 #   (note 5)
  │  │  │     _get_per_token_values( *★_value_inputs(output) )  → old_values (B,C)
- │  │  │      ├─ ★ _value_inputs → [prompt ‖ completion]  ◀── PPO-PI overrides exactly here
- │  │  │      └─ ★ backbone fwd → .score → [:, :-1][:, -C:]
+ │  │  │      ├─ ★ _value_inputs: 'value_prompt_ids' not in batch → build it once
+ │  │  │      │   └─ ★ _build_value_prompts(self._value_rows)      train_ppo.py:445
+ │  │  │      │      ├─ compose_value_messages: swap the SOLVER system turn for
+ │  │  │      │      │     VALUE_SYSTEM_PROMPT, keep the question verbatim
+ │  │  │      │      ├─ apply_chat_template(add_generation_prompt=True, same
+ │  │  │      │      │     chat_template/kwargs/tools as TRL _tokenize_prompts)
+ │  │  │      │      ├─ pad(..., padding_side="left")   ⟵ must be LEFT: right-padding
+ │  │  │      │      │     would put PADs between prompt and completion (note 6)
+ │  │  │      │      └─ log ppo/value_prompt_len_mean
+ │  │  │      │   └─ ★ cache batch['value_prompt_ids'/'value_prompt_mask']
+ │  │  │      │         ⟵ written into the dict super() returned, so it rides the
+ │  │  │      │            shuffle/split below and Phase B reuses it (no rebuild)
+ │  │  │      ├─ ★ → [value_prompt ‖ completion]   ◀── PPO-PI overrides exactly here
+ │  │  │      └─ ★ backbone fwd → .score → [:, :-1][:, -C:]      train_ppo.py:510
  │  │  │            ONE unchunked B=16 forward at ~8k tokens            (note 3)
  │  │  ├─ ★ compute_gae(token_rewards, old_values, mask, gamma, lam) → advantages, returns
  │  │  ├─ ★ masked_whiten(advantages, completion_mask × scorable)
  │  │  │        ⟵ OVERWRITES GRPO's group-normalized advantages
  │  │  ├─ ★ output += {returns, old_values, scorable, terminal_reward}
+ │  │  │        (+ value_prompt_ids / value_prompt_mask, cached above)
  │  │  └─ ★ log ppo/{value_mean, returns_mean, unscorable_rate}
  │  │
  │  ├─ TRL shuffle_sequence_dict(generation_batch)
@@ -202,7 +225,7 @@ TRL _prepare_inputs(generation_batch)                            grpo_trainer.py
  └─ return self._buffered_inputs[self._step % 16]   ◀── i = 1..15 take ONLY this line
 ```
 
-`compute_gae` (`train_ppo.py:144`) walks `t` backwards over the completion axis with
+`compute_gae` (`train_ppo.py:197`) walks `t` backwards over the completion axis with
 `gamma=1.0`; padding carries zero reward and zero value, so GAE decays to 0 there and the
 bootstrap at the terminal token uses next-value = 0. `returns = advantages + values` is taken
 from the **raw** (pre-whitening) advantages.
@@ -213,7 +236,7 @@ from the **raw** (pre-whitening) advantages.
 
 ```
 HF  Trainer.compute_loss()  →  TRL GRPOTrainer.compute_loss()          grpo_trainer.py:2408
- └─ ★ PPOTrainer._compute_loss(model, inputs)                           train_ppo.py:508
+ └─ ★ PPOTrainer._compute_loss(model, inputs)                           train_ppo.py:639
     │
     ├─ TRL super()._compute_loss(model, inputs)  ───────────── POLICY LOSS        2489
     │  ├─ _get_per_token_logps_and_entropies(model, ...)   ← policy fwd WITH grad
@@ -230,6 +253,8 @@ HF  Trainer.compute_loss()  →  TRL GRPOTrainer.compute_loss()          grpo_tr
     │
     ├─ ★ mask = completion_mask × scorable   (× tool_mask if present)
     ├─ ★ vpred = _get_per_token_values( *★_value_inputs(inputs) )  ← critic fwd WITH grad
+    │        _value_inputs finds 'value_prompt_ids' already in the micro-batch (Phase A
+    │        cached it before the shuffle/split), so it reuses — never rebuilds — here
     ├─ ★ vpredclipped = old_values + clamp(vpred − old_values, ±cliprange_value)
     ├─ ★ vf_loss = 0.5 · max((vpred−returns)², (vpredclipped−returns)²)
     │        normalized to MATCH the policy's loss_type:
@@ -242,7 +267,9 @@ HF  Trainer.compute_loss()  →  TRL GRPOTrainer.compute_loss()          grpo_tr
 Two full-size forwards **with** grad per micro-batch: the policy (inside
 `super()._compute_loss`) and the critic (`_get_per_token_values`). `_value_inputs` must resolve
 to the same sequence here as it did in Phase A, or `cliprange_value` would be clipping `vpred`
-against an `old_values` computed from a different state.
+against an `old_values` computed from a different state. Caching `value_prompt_ids` into the
+rollout dict in Phase A — rather than re-rendering the verifier prompt here — is what makes that
+hold by construction.
 
 ---
 
@@ -250,7 +277,7 @@ against an `old_values` computed from a different state.
 
 ```
 if do_sync_step (i == 15):                                              trainer.py:1762
- ├─ ★ PPOTrainer._clip_grad_norm(model)                                 train_ppo.py:260
+ ├─ ★ PPOTrainer._clip_grad_norm(model)                                 train_ppo.py:333
  │  ├─ HF super()._clip_grad_norm → accelerator.clip_grad_norm_(model.parameters(), 1.0)
  │  │                                                                          POLICY
  │  └─ ★ torch.nn.utils.clip_grad_norm_(value_model.parameters(),
@@ -263,7 +290,7 @@ if do_sync_step (i == 15):                                              trainer.
  ├─ HF  state.global_step += 1    # ⟵ what makes the NEXT step's sync_weights() fire
  ├─ HF  callback_handler.on_step_end()
  │
- └─ ★ PPOTrainer._maybe_log_save_evaluate(...)                          train_ppo.py:329
+ └─ ★ PPOTrainer._maybe_log_save_evaluate(...)                          train_ppo.py:402
     ├─ ★ _assert_policy_finite()          # catches the server-mode optimizer NaN here,
     │                                     #   at the step it happens
     ├─ ★ value_model.zero_grad(set_to_none=True)
@@ -271,7 +298,7 @@ if do_sync_step (i == 15):                                              trainer.
     │       enters the next step holding clip(G_{k−1}), an undocumented momentum term
     └─ HF super()._maybe_log_save_evaluate()                              trainer.py:2055
        ├─ if should_log:  TRL log() → flush self._metrics (all ppo/* land here)
-       └─ if should_save: ★ PPOTrainer._save_checkpoint(model, trial)   train_ppo.py:301
+       └─ if should_save: ★ PPOTrainer._save_checkpoint(model, trial)   train_ppo.py:374
           ├─ TRL super()._save_checkpoint (model card) → HF Trainer._save_checkpoint
           │     save_model / _save_optimizer_and_scheduler / _save_rng_state
           │     (the critic's optimizer state rides along in optimizer.pt for free)
@@ -298,7 +325,7 @@ if do_sync_step (i == 15):                                              trainer.
 
 3. **The critic's rollout-time forward is unchunked.** TRL calls
    `_get_per_token_logps_and_entropies(..., batch_size=per_device_train_batch_size)`, i.e. 16
-   sequential 1-row forwards. `_get_per_token_values` (`train_ppo.py:389`) runs a single
+   sequential 1-row forwards. `_get_per_token_values` (`train_ppo.py:510`) runs a single
    forward over all 16 rows at ~8k tokens. It is under `no_grad` so there is no activation
    graph, but it is the largest single activation footprint in the step and the first thing
    that will OOM if `steps_per_generation` or the completion budget rises.
@@ -310,3 +337,20 @@ if do_sync_step (i == 15):                                              trainer.
    never used. At the default `num_generations=1` every "group" is a single rollout, so its std
    is trivially zero and the metric pins to **1.0**; at `num_generations=2` it drifts (the older
    runs logged 0.75–0.83). Either way it describes a mechanism this trainer does not use.
+
+5. **Why `_value_rows` is cleared in `finally`, not at method entry.** The neighbouring
+   `_rewards_per_func_buf` clears at entry, which is safe because it is *read* in the same
+   method right after `super()`. `_value_rows` is read from a different method
+   (`_value_inputs`), which `_compute_loss` also calls. If a TRL buffering change ever dropped
+   `value_prompt_ids` from the micro-batch, a stale stash would be the same length as the batch
+   — the `n_rows == n_completions` guard compares batch sizes, which always match — so it would
+   sail through and pair every verifier prompt with a *previous* batch's question. Clearing in
+   `finally` makes that case raise instead.
+
+6. **The padding side is the real alignment invariant.** `cat([value_prompt, completion])[:, -C:]
+   == completion_ids` is a tautology of the concatenation and cannot fail. What can fail is the
+   padding side: right-padding the value prompt leaves PADs *between* prompt and completion, so
+   `values[:, 0]` — which `_get_per_token_values` reads from the position just before the first
+   completion token — comes off a pad instead of the generation header, offsetting each row's
+   value curve by its own pad count. Both this and the generation-boundary match against TRL's
+   `_tokenize_prompts` are pinned in `tests/test_ppo_config.py`.

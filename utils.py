@@ -24,7 +24,15 @@ def format_prompt_math(problem: str) -> list[dict]:
     ]
 
 
-def validate_resume(resume_path: str, this_meta: dict, force: bool = False) -> None:
+_ABSENT = object()
+
+
+def validate_resume(
+    resume_path: str,
+    this_meta: dict,
+    force: bool = False,
+    strict_keys: "tuple[str, ...]" = (),
+) -> None:
     """Guard a `--resume-from-checkpoint`: check the checkpoint against the original
     run's run_meta.json (written at the run root = the checkpoint's parent dir).
 
@@ -34,6 +42,18 @@ def validate_resume(resume_path: str, this_meta: dict, force: bool = False) -> N
     the batch config). Every key in `this_meta` present in the prior meta is compared;
     a mismatch is a hard error (data would silently misalign) unless `force` downgrades
     it to a warning. A missing run_meta.json warns and skips the check.
+
+    Keys ABSENT from the prior meta are normally skipped, which is what lets a new key be
+    added to a build_run_meta without invalidating every existing checkpoint (`optim` and
+    `critic_learning_rate` were both added that way). The consequence is that a NEW key can
+    never, on its own, refuse an old checkpoint -- so a setting that genuinely changes what
+    the checkpoint MEANS has nothing to assert against.
+
+    `strict_keys` is the opt-out: for those keys the absence IS the verdict -- a checkpoint
+    that never recorded the key predates the feature and therefore cannot be resumed into a
+    run that has it. Use it only for settings that change the meaning of the saved tensors
+    (e.g. train_ppo's `value_prompt_version`: the critic's state representation), not for
+    ordinary hyperparameters. `force` still downgrades these to a warning, as everywhere else.
 
     Shared by train_sdft / train_grpo / train_gold / train_ppo / train_ppo_pi; each passes its
     own build_run_meta.
@@ -71,11 +91,18 @@ def validate_resume(resume_path: str, this_meta: dict, force: bool = False) -> N
 
     with open(meta_path) as f:
         prior = json.load(f)
-    mismatches = [
-        f"    {k}: checkpoint={prior[k]!r} vs now={this_meta[k]!r}"
-        for k in this_meta
-        if k in prior and prior[k] != this_meta[k]
-    ]
+    mismatches = []
+    for k, now in this_meta.items():
+        prior_value = prior.get(k, _ABSENT)
+        if prior_value is _ABSENT:
+            if k in strict_keys:
+                mismatches.append(
+                    f"    {k}: not recorded in the checkpoint (it predates this setting) "
+                    f"vs now={now!r}"
+                )
+            continue
+        if prior_value != now:
+            mismatches.append(f"    {k}: checkpoint={prior_value!r} vs now={now!r}")
     if mismatches:
         msg = ("Resume config differs from the checkpoint's run_meta.json "
                f"({meta_path}):\n" + "\n".join(mismatches))
