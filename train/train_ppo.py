@@ -262,8 +262,6 @@ class PPOTrainer(GRPOTrainer):
         # Appending the critic's params here (rather than giving it its own optimizer) is also
         # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
         # `optimizer.pt` file as the policy's, so it gets loaded automatically by Trainer.
-        # This runs before _load_optimizer_and_scheduler and rebuilds an identical
-        # param-group layout, so that state reloads by index.
         optimizer = super().create_optimizer(*args, **kwargs)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
         # The lr is set HERE rather than patched onto param_groups[-1] afterwards, so the
@@ -432,6 +430,7 @@ class PPOTrainer(GRPOTrainer):
     # -- replace group-norm advantages with value + GAE ---------------------
 
     def _generate_and_score_completions(self, inputs):
+        # inputs -> solution, prompt
         # Clear the stash first so the checks below prove super() populated it for THIS
         # batch, rather than us reusing a stale one from a previous step.
         self._rewards_per_func_buf = None
@@ -637,7 +636,7 @@ def main():
     # PPO / GAE
     p.add_argument("--gamma", type=float, default=1.0,
                    help="GAE discount. 1.0 = no discounting over the reasoning episode.")
-    p.add_argument("--lam", type=float, default=0.95,
+    p.add_argument("--lam", type=float, default=1.0,
                    help="GAE lambda. ->1.0 = Monte-Carlo return minus critic baseline; "
                         "<1.0 leans on the critic bootstrap.")
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
@@ -681,7 +680,7 @@ def main():
     p.add_argument("--optim", default="paged_adamw_8bit",
                    help="Optimizer. The 8-bit default keeps the memory footprint of the GRPO "
                         "baseline and is fine in COLOCATE mode. In --vllm-mode server EVERY "
-                        "bitsandbytes 8-bit optimizer corrupts the policy (hard error below); "
+                        "bitsandbytes 8-bit optimizer corrupts the policy; "
                         "pass --optim adafactor there. See the module docstring.")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
