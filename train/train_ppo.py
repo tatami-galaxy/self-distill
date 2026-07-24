@@ -155,7 +155,7 @@ def compute_gae(
     Because padding tails carry zero reward and zero value, GAE decays to 0 there and the
     bootstrap at the terminal token uses next-value = 0 (episode end). Returns
     (advantages, returns) with returns = advantages + values (the value-fn targets),
-    both computed from the RAW (un-whitened) advantages.
+    both computed from un-whitened advantages.
     """
     values = values * mask
     T = rewards.size(1)
@@ -436,6 +436,8 @@ class PPOTrainer(GRPOTrainer):
         # batch, rather than us reusing a stale one from a previous step.
         self._rewards_per_func_buf = None
         # each input repeated num_generations times to match GRPOConfig
+        # update : default is now 1, no repeated examples
+        # output contains non-zero GRPO advantage if num_generations > 1
         output = super()._generate_and_score_completions(inputs)
         device = self.accelerator.device
 
@@ -448,8 +450,6 @@ class PPOTrainer(GRPOTrainer):
         # then take this process's slice (super() slices `advantages` the same way).
         # The stash is a side-channel: GRPO computes the raw rewards internally and only
         # returns the group-normalized advantages, so we intercept _calculate_rewards.
-        # These guards pin the assumption that makes that sound -- super() calls it exactly
-        # once per batch -- so a TRL change breaks loudly instead of silently mis-crediting.
         rpf = self._rewards_per_func_buf  # (B_all, num_funcs)
         if rpf is None:
             raise RuntimeError(
@@ -465,12 +465,10 @@ class PPOTrainer(GRPOTrainer):
                 "The reward stash is misaligned with the completions, which would assign each "
                 "rollout the wrong terminal reward."
             )
-        # A completion whose every reward func returned None is *unscorable* -- there is no
-        # verdict on it (e.g. accuracy_reward could not parse the gold). nansum would collapse
-        # such a row to 0.0, making it indistinguishable from a graded-WRONG answer, which
-        # would push the policy away from a possibly-correct trace. GRPO instead excludes them
-        # from its baseline and forces their advantage to 0; we mirror that below via
-        # `scorable`, so an unscorable rollout contributes no gradient to either actor or critic.
+        # A completion whose every reward func returned None is unscorable.
+        # GRPO excludes them from its baseline and forces their advantage to 0;
+        # we mirror that below via `scorable`,
+        # so an unscorable rollout contributes no gradient to either actor or critic.
         unscorable_all = torch.isnan(rpf).all(dim=1)  # (B_all,)
         weights = self.reward_weights.to(rpf.device).unsqueeze(0)
         rewards_all = (rpf * weights).nansum(dim=1)  # (B_all,); all-NaN rows collapse to 0.0
@@ -491,6 +489,8 @@ class PPOTrainer(GRPOTrainer):
         token_rewards = token_rewards * completion_mask
 
         # Old values from the critic (no grad), then GAE.
+        # Note : The current critic currently doesn't use the value model
+        # as an instruction tuned language model
         with torch.no_grad():
             old_values = self._get_per_token_values(*self._value_inputs(output))
         old_values = old_values.float() * completion_mask
