@@ -64,8 +64,9 @@ RESUME behaves exactly as in train_ppo.py -- read that docstring for the full ru
 bite most often: --max-steps is the TOTAL budget and is free to raise on resume, but LEARNING
 RATES COME FROM THE CHECKPOINT (a changed --learning-rate / --critic-learning-rate is refused by
 validate_resume rather than silently ignored). Note this arm's example pool is the hint cache, so
-one epoch is ~2,438 steps on the 4B cache and ~495 on the 1.7B one -- extend past that and prompts
-start repeating. PI-specific: `pi_mode`, `gen_model` and `max_value_prompt_length` are all in
+at the default num_generations=1 one epoch is ~1,219 steps on the 4B cache and ~247 on the 1.7B
+one (double both at num_generations=2) -- extend past that and prompts start repeating.
+PI-specific: `pi_mode`, `gen_model` and `max_value_prompt_length` are all in
 run_meta.json, so resuming a hint run under a different --pi-mode is a hard error rather than a
 silent change to what the critic conditions on halfway through a run.
 
@@ -497,7 +498,13 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     # generation
     p.add_argument("--max-completion-length", type=int, default=8192)
-    p.add_argument("--num-generations", type=int, default=2)
+    p.add_argument("--num-generations", type=int, default=1,
+                   help="Rollouts per prompt. PPO uses the critic (not a group) as the "
+                        "baseline, so grouping is unused -- each rollout gets its own GAE. "
+                        "Defaults to 1, which fills the generation batch with DISTINCT prompts "
+                        "(max prompt diversity per step); stock GRPO's config forbids <2, so "
+                        "PPOConfig accepts it via an override. Pass 2 to match the earlier "
+                        "runs, whose checkpoints were trained at 2.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--lr-scheduler-type", default="constant",

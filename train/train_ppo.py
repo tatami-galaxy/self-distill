@@ -208,7 +208,29 @@ class PPOConfig(GRPOConfig):
         # Reference-free objective; advantages are GAE, so no group-normalization.
         self.beta = 0.0
         self.scale_rewards = "none"
-        super().__post_init__()
+
+        requested_num_generations = self.num_generations
+        if requested_num_generations < 1:
+            raise ValueError(
+                "PPO requires num_generations to be at least 1; "
+                f"got {requested_num_generations}."
+            )
+
+        # GRPOConfig rejects num_generations=1 because ordinary GRPO needs at least two
+        # completions to form a within-prompt baseline. PPO does not: below we replace
+        # GRPO's advantages with critic-based GAE. Temporarily satisfy that GRPO-only
+        # validation, then restore the value that the sampler and trainer should use.
+        #
+        # The inherited validation therefore still checks divisibility as if G=2. This is
+        # intentionally acceptable for this script's even generation batches (16 by
+        # default), and avoids copying TRL's large, version-sensitive __post_init__.
+        self.num_generations = max(2, requested_num_generations)
+        try:
+            super().__post_init__()
+        finally:
+            # Restore even when another parent validation fails, so an exception never
+            # leaves a partially constructed config reporting the wrong value.
+            self.num_generations = requested_num_generations
 
 
 # ---------------------------------------------------------------------------
@@ -642,10 +664,9 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0, help="Rollout sampling temperature.")
     # generation
     p.add_argument("--max-completion-length", type=int, default=8192)
-    p.add_argument("--num-generations", type=int, default=2,
+    p.add_argument("--num-generations", type=int, default=1,
                    help="Rollouts per prompt. PPO uses the critic (not a group) as the "
-                        "baseline, so grouping is unused -- each rollout gets its own GAE. "
-                        "GRPO's config requires >=2, so 2 is the minimum/default.")
+                        "baseline, so grouping is unused -- each rollout gets its own GAE. ")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--critic-learning-rate", type=float, default=None,

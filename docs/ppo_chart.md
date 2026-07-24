@@ -14,7 +14,7 @@ training loop. Traced against the pinned libraries, not from memory:
 **Config assumed throughout** (the script's defaults):
 
 ```
-per_device_train_batch_size = 1     num_generations   = 2
+per_device_train_batch_size = 1     num_generations   = 1
 gradient_accumulation_steps = 16    num_iterations    = 1   (--num-ppo-epochs)
 steps_per_generation        = 16    loss_type         = dapo
    (GRPOConfig defaults it to gradient_accumulation_steps)
@@ -22,8 +22,14 @@ generation_batch_size       = per_device_bs × num_procs × steps_per_generation
 generate_every              = steps_per_generation × num_iterations            = 16
 ```
 
-So one optimizer step consumes **one generation batch of 16 rows = 8 prompts × 2 rollouts**,
-generated once and reused across all 16 micro-batches.
+So one optimizer step consumes **one generation batch of 16 rows**, generated once and reused
+across all 16 micro-batches. At the default `num_generations=1` those 16 rows are 16 **distinct**
+prompts — stock GRPO's config forbids `<2`, but `PPOConfig` overrides that since the critic, not
+a group, is the baseline (see [`train_ppo.py`](../train/train_ppo.py) `PPOConfig.__post_init__`).
+The batch *size* is `per_device_bs × num_procs × steps_per_generation` and does **not** depend on
+`num_generations`, so passing 2 instead (the earlier runs' value) fills the same 16 rows with
+8 prompts × 2 rollouts and changes nothing else in this trace — `generation_batch_size`, the step
+count, and the control flow are all identical.
 
 ---
 
@@ -45,9 +51,10 @@ Trainer.train()                                                          trainer
    ├─ HF  get_train_dataloader()                          ── TRL override      1454
    │  │     batch_size = per_device_bs × steps_per_generation = 16 rows
    │  └─ TRL _get_train_sampler() → RepeatSampler(
-   │           mini_repeat_count = num_generations   = 2,
+   │           mini_repeat_count = num_generations   = 1,   (2 ⇒ each prompt ×2)
    │           repeat_count      = num_iterations × steps_per_generation = 16)
-   │        ⇒ the SAME 16-row batch is yielded 16× in a row
+   │        ⇒ 16 distinct prompts; that SAME 16-row batch is yielded 16× in a row
+   │          (repeat_count is the buffering reuse, independent of num_generations)
    │
    ├─ HF  set_initial_training_values(...)  → max_steps, steps_in_epoch        1467
    ├─ HF  _init_training_state(...)         → epochs_trained, steps_to_skip    1469
@@ -77,7 +84,8 @@ Trainer.train()                                                          trainer
    │     └─ for update_step in range(...):        ◀══ ONE ITERATION = ONE OPTIMIZER STEP
    │        │                                                                  1706
    │        ├─ HF  get_batch_samples(epoch_iterator, num_batches=16)           1710
-   │        │      → 16 dataloader items, all the SAME 16 rows (8 prompts × 2)
+   │        │      → 16 dataloader items, all the SAME 16 rows (16 distinct prompts,
+   │        │        or 8 prompts × 2 at num_generations=2)
    │        │      → _get_num_items_in_batch(...) = None  ⚠ no "labels"; the
    │        │        collator yields a list, not a dict            (note 1)
    │        │
@@ -125,7 +133,7 @@ Trainer.train()                                                          trainer
    └─ HF  _finalize_training(...)                                              1531
 ```
 
-Two structural points worth calling out:
+Two important points:
 
 * **`create_optimizer_and_scheduler()` (`trainer.py:1141`) is dead code** — it has no call site
   anywhere in `trainer.py` (the other mentions are docstrings and error messages at 601, 660,
@@ -298,5 +306,7 @@ if do_sync_step (i == 15):                                              trainer.
 4. **GRPO's group-normalized advantages are fully computed, then discarded** — `nanstd`,
    `repeat_interleave`, the gather, all of it — before we overwrite `output["advantages"]`.
    Cheap (it is `(B,)` arithmetic), but it is why `frac_reward_zero_std` still appears in the
-   logs at 0.75–0.83 and means nothing for PPO: with `num_generations=2` and no group
-   baseline, that metric describes a mechanism this trainer does not use.
+   logs and means nothing for PPO: the critic is the baseline, so GRPO's group statistics are
+   never used. At the default `num_generations=1` every "group" is a single rollout, so its std
+   is trivially zero and the metric pins to **1.0**; at `num_generations=2` it drifts (the older
+   runs logged 0.75–0.83). Either way it describes a mechanism this trainer does not use.
