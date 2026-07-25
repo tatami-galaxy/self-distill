@@ -52,6 +52,13 @@ from utils import (
 
 ALGOS = ("base", "grpo", "ppo", "gold", "sdft")
 
+# Bumped whenever summary.json gains or changes a field. Summaries written before this
+# existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones
+# (e.g. results/aime24/base/) do not even carry that. A reader comparing two runs needs to
+# distinguish "this field is absent because it was never recorded" from "absent because it
+# was null", and only a version stamp answers that.
+SUMMARY_SCHEMA_VERSION = 2
+
 # Algorithms the algorithm name alone does not identify: for SDFT the privileged context and
 # for GOLD the teacher ARE the independent variable under study, so filing two of them under
 # a bare `sdft/` or `gold/` would merge runs that the experiment exists to tell apart.
@@ -166,13 +173,24 @@ def evaluate_model(
     tensor_parallel_size: int = 1,
     chat_template_tokenizer=None,
     n_samples: int = 1,
+    gpu_memory_utilization: float = 0.9,
 ) -> dict:
     """Run evaluation and return results dict.
 
     Samples ``n_samples`` completions per problem (one vLLM request with
     ``n=n_samples``, which shares the prompt prefix across rollouts) and grades
-    each, so the caller can compute pass@k for any ``k <= n_samples``. Sampling
-    (temperature, top_p, ...) is left to vLLM's model defaults.
+    each, so the caller can compute pass@k for any ``k <= n_samples``.
+
+    Sampling is left at vLLM's ``SamplingParams`` defaults, which already are the
+    distribution the trainers roll out at (temperature 1.0, top_p 1.0, top_k 0 =
+    all tokens; GRPOConfig uses the same three). Note this is NOT the checkpoint's
+    generation_config -- vLLM consults that only when ``sampling_params is None``
+    (``vllm/entrypoints/llm.py``), and we always build one, so Qwen3's shipped
+    0.6/0.95/20 never applies here.
+
+    The resolved values are read back off the constructed object and returned under
+    ``sampling``, so the summary records what actually ran rather than a literal
+    that could drift from vLLM's defaults.
     """
     print(f"\n{'='*60}")
     print(f"Evaluating: {model_name}")
@@ -183,6 +201,7 @@ def evaluate_model(
     llm_kwargs = dict(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
     )
     llm = LLM(**llm_kwargs)
@@ -191,6 +210,18 @@ def evaluate_model(
         n=n_samples,
         max_tokens=max_tokens,
     )
+    # Read back rather than hardcode: these are vLLM's defaults, so the record stays
+    # truthful if a future vLLM changes one (top_k's disabled sentinel already moved
+    # from -1 to 0 between 0.6.x and 0.25.x).
+    sampling = {
+        "temperature": sampling_params.temperature,
+        "top_p": sampling_params.top_p,
+        "top_k": sampling_params.top_k,
+        "min_p": sampling_params.min_p,
+        "repetition_penalty": sampling_params.repetition_penalty,
+        "seed": sampling_params.seed,
+    }
+    print(f"Sampling (vLLM defaults): {sampling}")
 
     # Build prompts
     template_tok = chat_template_tokenizer or tokenizer
@@ -233,6 +264,7 @@ def evaluate_model(
         "elapsed_s": elapsed,
         "max_tokens": max_tokens,
         "n_samples": n_samples,
+        "sampling": sampling,
     }
 
 
@@ -270,12 +302,21 @@ def print_report(eval_output: dict, ks: list[int]):
         print(f"\nExtraction failures (no \\boxed{{}}): {no_answer}/{total_samples} samples")
 
 
-def save_results(eval_output: dict, output_dir: str, ks: list[int], arm: dict):
+def save_results(
+    eval_output: dict, output_dir: str, ks: list[int], arm: dict, eval_config: dict
+):
     """Save full results and summary to disk.
 
     Fixed filenames: the arm is carried by the directory path (see arm_path), so a summary
     is found the same way in every folder and a sweep is one glob. `arm` is also embedded in
     the summary, so a file that gets moved still says which run produced it.
+
+    `eval_config` extends that self-description to HOW the numbers were produced -- the
+    sampling distribution, the completion budget, the prompt template, the subset, and the
+    library versions. pass@k is a property of the sampling distribution, so a summary that
+    omits it cannot be compared against another summary except on trust. Older summaries
+    predate this block (and some predate `arm`), hence `schema_version`: a reader can tell
+    "recorded and equal" from "never recorded" instead of guessing.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -291,8 +332,10 @@ def save_results(eval_output: dict, output_dir: str, ks: list[int], arm: dict):
     total_samples = sum(r["n_samples"] for r in results)
 
     summary = {
+        "schema_version": SUMMARY_SCHEMA_VERSION,
         "model": eval_output["model"],
         "arm": arm,
+        "eval_config": eval_config,
         "dataset_size": total,
         "n_samples": eval_output["n_samples"],
         "pass_at_k": {f"pass@{k}": acc for k, acc in pass_at_ks.items()},
@@ -367,6 +410,11 @@ def main():
                         help="pass@k value(s) to report, e.g. --k 1 8 16")
     parser.add_argument("--max_tokens", type=int, default=32000)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9,
+                        help="Fraction of the GPU vLLM may reserve. This is measured against "
+                             "TOTAL device memory, not free memory, so the 0.9 default requires "
+                             "an essentially idle GPU -- lower it to share one with another job. "
+                             "Matches the flag on eval/passk_pi.py and train/gen_hints.py.")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
     parser.add_argument("--seed", type=int, default=42,
@@ -388,8 +436,14 @@ def main():
     print(f"Results -> {output_dir}")
 
     if args.n > 1:
-        print("Note: pass@k needs stochastic sampling; relying on vLLM's model "
-              "default sampling (ensure temperature > 0 in the model's generation config)")
+        # pass@k needs stochastic sampling, and it gets it: vLLM's SamplingParams defaults
+        # are temperature 1.0 / top_p 1.0 / top_k 0 (= all tokens), the same distribution
+        # the trainers roll out at. The checkpoint's own generation_config is NOT consulted
+        # -- vLLM reads that only when sampling_params is None, and evaluate_model always
+        # constructs one. The resolved values are printed there and recorded in summary.json.
+        print("Note: sampling uses vLLM's SamplingParams defaults (temperature 1.0, "
+              "top_p 1.0, top_k 0 = all tokens), which match the training rollout config; "
+              "the checkpoint's generation_config does not apply.")
 
     # Load dataset
     loader = DATASET_REGISTRY_EVAL[args.dataset]
@@ -420,9 +474,32 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         chat_template_tokenizer=chat_template_tokenizer,
         n_samples=args.n,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
     print_report(eval_output, args.k)
-    save_results(eval_output, output_dir, args.k, arm)
+
+    # Everything that shaped the numbers but is not derivable from them. `sampling` comes
+    # back resolved from the SamplingParams object rather than restated here. `num_samples`
+    # and `seed` together identify the subset: dataset_size alone cannot distinguish a full
+    # 30-problem AIME24 from a 30-problem draw out of a larger set.
+    import transformers
+    import vllm
+
+    eval_config = {
+        "eval_dataset": args.dataset,
+        "n": args.n,
+        "k": args.k,
+        "max_tokens": args.max_tokens,
+        "sampling": eval_output["sampling"],
+        "num_samples": args.num_samples,
+        "seed": args.seed,
+        "chat_template_model": args.chat_template_model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "vllm_version": vllm.__version__,
+        "transformers_version": transformers.__version__,
+    }
+    save_results(eval_output, output_dir, args.k, arm, eval_config)
 
 
 if __name__ == "__main__":

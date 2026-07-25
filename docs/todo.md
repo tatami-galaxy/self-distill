@@ -1,10 +1,12 @@
 ### Baselines
-- train on deepscaleR
-- base, sft and instruct models
-- eval on all aime sets, beyondaime, hmmt
-- opd from other models
-- qwen 8B student, teacher
-- coding, knowledge tasks
+- [x] eval with temp 1.0 (default TRL configs)
+- [ ] train on deepscaleR
+- [ ] base, sft and instruct models
+- [ ] eval on all aime sets, beyondaime, hmmt
+- [ ]opd from other models
+- [ ] qwen 8B student, teacher
+- [ ]coding, knowledge tasks
+
 
 ### Research
 - Leverage ICL ability of LLM value functions
