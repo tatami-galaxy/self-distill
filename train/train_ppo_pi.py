@@ -479,7 +479,7 @@ def main():
     # PPO / GAE
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--lam", type=float, default=1.0,
-                   help="GAE lambda. Defaults to 1.0 here (not train_ppo's 0.95): no bootstrap, "
+                   help="GAE lambda. Defaults to 1.0, as train_ppo.py does: no bootstrap, "
                         "so critic error cannot bias the advantages, and the critic's target is "
                         "exactly the 0/1 outcome at every position.")
     p.add_argument("--vf-coef", type=float, default=0.1)

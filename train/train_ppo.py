@@ -55,9 +55,12 @@ validate_resume's `strict_keys` -- for those keys a checkpoint that never record
 as a MISMATCH rather than a skipped comparison, so a pre-verifier checkpoint is refused instead of
 silently resumed into a critic that now reads a different prompt.
 
-GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=0.95. lam is the
+GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=1.0. lam is the
 PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline;
                     lam<1 leans on the critic's bootstrap.
+At the default lam=1.0 nothing bootstraps, so a wrong critic cannot bias the advantages and
+its regression target is the realized 0/1 outcome at every real position -- a clean
+calibration problem. train_ppo_pi.py defaults the same way, and the 4B runs used it.
 
 Loss aggregation (--loss-type) only sets the DENOMINATOR that turns per-token losses into a
 scalar, i.e. how tokens are weighted against each other. It matters more here than in GRPO:
@@ -238,7 +241,10 @@ class PPOConfig(GRPOConfig):
     and scale_rewards to 'none' (advantages come from GAE, not group normalization)."""
 
     gamma: float = field(default=1.0, metadata={"help": "GAE discount (1.0 = no discounting)."})
-    lam: float = field(default=0.95, metadata={"help": "GAE lambda."})
+    # Matches the --lam CLI default. main() always passes args.lam, so this field default is
+    # only reachable when PPOConfig is built directly (tests); keeping the two in agreement
+    # stops the docstring's "lam=1.0" from being contradicted by the dataclass.
+    lam: float = field(default=1.0, metadata={"help": "GAE lambda."})
     vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
     critic_learning_rate: float | None = field(
         default=None,

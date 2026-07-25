@@ -61,7 +61,14 @@ class FakeChatTokenizer:
 
 
 def make_prompt_stub(tokenizer):
-    """Attributes read by our prompt builder and TRL's `_tokenize_prompts`."""
+    """Attributes read by our prompt builder and TRL's `_tokenize_prompts`.
+
+    Listed EXPLICITLY rather than defaulted via a catch-all `__getattr__`: an
+    AttributeError here means TRL's prompt rendering grew a branch, which is exactly the
+    drift these tests exist to catch, so it should stop the suite and be read. A stub that
+    answered None to anything would swallow it and let the alignment assertions pass
+    against a path TRL no longer takes.
+    """
     return types.SimpleNamespace(
         processing_class=tokenizer,
         _tokenizer=tokenizer,
@@ -69,6 +76,10 @@ def make_prompt_stub(tokenizer):
         chat_template="test-template",
         chat_template_kwargs={"test_option": "sentinel"},
         _is_vlm=False,
+        # TRL 1.9.0: `_tokenize_prompts` renders each prompt with its own tool schema when
+        # environments are configured. None selects the single batched apply_chat_template
+        # call -- the path `_build_value_prompts` mirrors, and the one under test.
+        environment_factories=None,
         _metrics={"train": defaultdict(list)},
         model=types.SimpleNamespace(training=True),
     )
@@ -325,6 +336,7 @@ class ValuePromptAlignmentTest(unittest.TestCase):
             chat_template=None,
             chat_template_kwargs={},
             _is_vlm=False,
+            environment_factories=None,  # see make_prompt_stub
             _metrics={"train": defaultdict(list)},
             model=types.SimpleNamespace(training=True),
         )
