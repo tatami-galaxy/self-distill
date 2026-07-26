@@ -1,64 +1,18 @@
 """
-PPO with a **verifier-framed value function**: the critic reads the same question the policy
-does, but under a VERIFIER instruction instead of the dataset's problem-solving one. The policy
-is asked to SOLVE; the critic is asked to JUDGE.
+PPO with value function modifications:
+    * the critic reads the same question the policy does, but under a VERIFIER instruction;
+    the critic is asked to JUDGE.
 
-Everything except the critic's prompt is inherited from train/train_ppo.py -- same GRPOTrainer
-machinery, same accuracy_reward, same GAE, same clipped value loss, same checkpointing -- so this
-arm is structurally "train_ppo with the critic's system turn swapped", and train_ppo.py with
-`--pi-mode`-free defaults is its exact control.
-
-WHY FRAME THE CRITIC AS A VERIFIER
-The `.score` head is randomly initialised and has to learn P(correct | prefix) from an MSE signal
-alone. Framing the context as verification lets the instruction-tuned backbone carry part of that
-load instead of leaving all of it to the head -- the same ICL bet the todo's `logit(Yes) -
-logit(No)` readout makes more directly. `compose_value_messages` swaps the dataset's
-problem-solving system turn for VALUE_SYSTEM_PROMPT and keeps every other turn verbatim, so
-policy-prompt vs verifier-prompt is a one-variable change.
-
-Two invariants make this safe. Both are cross-library (they depend on TRL's prompt rendering), so
-both are pinned by tests in tests/test_ppo_val.py rather than left to inspection:
-  * PREFIX ONLY. The completion must remain the literal SUFFIX of the critic's sequence --
-    `cat([value_prompt, completion])[:, -C:] == completion_ids` -- because
-    `_get_per_token_values` slices values from the END. Hence the verifier instruction goes in
-    FRONT of the completion; a verifier QUESTION appended after it would silently break every
-    per-token alignment (and would need one forward per position, not one per sequence). A longer
-    value prompt is otherwise free: values[:, 0] is still V(state before the first completion
-    token), whatever the prefix length.
-  * SAME GENERATION BOUNDARY. `_build_value_prompts` renders through the base class's
-    `_render_value_prompts`, which mirrors GRPOTrainer._tokenize_prompts (same chat_template,
-    chat_template_kwargs, tools, add_generation_prompt=True), so the critic's prompt ends on the
-    IDENTICAL assistant/<think> header the completion was sampled after.
-The framing does not leak action information: it is a deterministic function of the prompt, fixed
-at episode start, so it is valid baseline input. With lam=1, before optional batch whitening, it
-changes only the action-independent baseline in the Monte-Carlo advantage estimator. With lam<1,
-GAE bootstraps from the learned critic, so changing the critic's representation can also change
-the estimator's bias while that critic is imperfect.
-
-WHAT IS ACTUALLY DIFFERENT FROM train_ppo.py
+Differences from train_ppo.py
   * `_value_inputs` is overridden to hand the critic `[value_prompt || completion]` instead of
     `[prompt || completion]`, building that prompt once per generation batch and caching it into
     the rollout dict -- so it rides GRPO's shuffle/split buffering and `_compute_loss` reuses the
     same tensors, which is what makes `vpred` and `old_values` provably the same state, as
     `cliprange_value` assumes.
   * `build_run_meta` stamps `value_prompt_version` and `method: ppo_val_vllm`.
-Nothing about generation, reward or the policy loss changes.
 
 RESUME. This arm's critic state representation is not train_ppo.py's, so their checkpoints are
-not interchangeable, and neither direction is allowed to happen quietly:
-  * A pre-verifier checkpoint into this trainer -> refused by `strict_keys`, for which an ABSENT
-    key counts as a mismatch rather than a skipped comparison.
-  * A verifier checkpoint into train_ppo.py -> refused because that trainer stamps
-    `value_prompt_version: None`, so the comparison fires.
-Everything else behaves as train_ppo.py documents; the two that bite most often are that
---max-steps is the TOTAL budget and free to raise, but LEARNING RATES COME FROM THE CHECKPOINT
-(a changed --learning-rate / --critic-learning-rate is refused, not silently ignored).
-
-NOTE ON `method`: runs written before this file existed were produced by train_ppo.py carrying
-the verifier prompt, so their run_meta.json says `method: ppo_vllm` with
-`value_prompt_version: verifier_v1`. This trainer writes `ppo_val_vllm`, so resuming one of those
-needs either `--force-resume` (after checking the rest of the meta matches) or a hand-edit of the
-old `method` field.
+not interchangeable, and neither direction is allowed to happen quietly.
 
 # single GPU, colocate vLLM (<=1.7B)
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo_val \
