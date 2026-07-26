@@ -1,8 +1,11 @@
 import json
 import os
 import tempfile
+import types
 import unittest
 
+from train.train_ppo import build_run_meta as ppo_meta
+from train.train_ppo_val import build_run_meta as ppo_val_meta
 from utils import validate_resume
 
 
@@ -74,6 +77,75 @@ class ValidateResumeStrictKeysTest(unittest.TestCase):
             ckpt = self.make_checkpoint(tmp, {"seed": 42})
             with self.assertRaisesRegex(ValueError, "seed"):
                 validate_resume(ckpt, {"seed": 7})
+
+
+class CrossArmResumeTest(unittest.TestCase):
+    """A critic cannot be resumed into an arm that feeds it a different prompt.
+
+    The two arms' critics read different state representations, so `value_model.pt` and its
+    optimizer state are not interchangeable -- and neither direction may fail quietly. Built
+    from the REAL `build_run_meta`s rather than hand-written dicts, because the guard is only
+    as good as what those functions actually stamp.
+    """
+
+    def make_args(self):
+        return types.SimpleNamespace(
+            model="Qwen/Qwen3-1.7B", dataset="deepmath", max_samples=None,
+            gamma=1.0, lam=1.0, vf_coef=0.1, cliprange_value=0.2, critic_max_grad_norm=1.0,
+            loss_type="dapo", vllm_mode="colocate", optim="paged_adamw_8bit",
+            learning_rate=1e-6, critic_learning_rate=None, seed=42,
+            per_device_train_batch_size=1, gradient_accumulation_steps=16, num_generations=1,
+        )
+
+    def make_checkpoint(self, tmp, prior_meta):
+        with open(os.path.join(tmp, "run_meta.json"), "w") as f:
+            json.dump(prior_meta, f)
+        ckpt = os.path.join(tmp, "checkpoint-20")
+        os.makedirs(ckpt)
+        return ckpt
+
+    def test_verifier_checkpoint_refused_by_the_baseline_trainer(self):
+        # The direction `strict_keys` CANNOT catch: validate_resume only iterates the keys of
+        # the meta it is handed, so the baseline has to stamp the key itself (as None) for the
+        # comparison to fire at all. Without that, a verifier-trained critic would resume into
+        # the baseline silently and be fed policy prompts.
+        args = self.make_args()
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = self.make_checkpoint(tmp, ppo_val_meta(args, 100))
+            with self.assertRaisesRegex(ValueError, "value_prompt_version"):
+                validate_resume(ckpt, ppo_meta(args, 100))
+
+    def test_baseline_checkpoint_refused_by_the_verifier_trainer(self):
+        args = self.make_args()
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = self.make_checkpoint(tmp, ppo_meta(args, 100))
+            with self.assertRaisesRegex(ValueError, "value_prompt_version"):
+                validate_resume(
+                    ckpt, ppo_val_meta(args, 100), strict_keys=("value_prompt_version",)
+                )
+
+    def test_legacy_baseline_checkpoint_still_resumes_into_the_baseline(self):
+        # Checkpoints written before `value_prompt_version` existed have no such key. The
+        # baseline stamps None, and an ABSENT key is skipped when it is not strict -- so
+        # adding the key must not invalidate the runs already on disk.
+        args = self.make_args()
+        legacy = ppo_meta(args, 100)
+        del legacy["value_prompt_version"]
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = self.make_checkpoint(tmp, legacy)
+            validate_resume(ckpt, ppo_meta(args, 100))
+
+    def test_each_arm_resumes_itself(self):
+        args = self.make_args()
+        for meta_fn, strict in ((ppo_meta, ()), (ppo_val_meta, ("value_prompt_version",))):
+            with self.subTest(meta_fn.__module__):
+                with tempfile.TemporaryDirectory() as tmp:
+                    ckpt = self.make_checkpoint(tmp, meta_fn(args, 100))
+                    validate_resume(ckpt, meta_fn(args, 100), strict_keys=strict)
+
+    def test_the_arms_are_distinguishable_by_method_too(self):
+        args = self.make_args()
+        self.assertNotEqual(ppo_meta(args, 100)["method"], ppo_val_meta(args, 100)["method"])
 
 
 if __name__ == "__main__":

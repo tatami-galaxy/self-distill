@@ -51,7 +51,12 @@ from utils import (
 # two runs into one folder -- a misfiling that looks entirely plausible afterwards. The cost
 # is a longer command; the benefit is that an hours-long eval cannot land in the wrong arm.
 
-ALGOS = ("base", "grpo", "ppo", "gold", "sdft")
+# `ppo_val` is its own algorithm rather than a --variant of `ppo`: the two trainers are
+# separate files writing separate `method` stamps, and filing them together would leave the
+# verifier arm and its own control distinguished only by a --run label -- the same merge the
+# VARIANT_REQUIRED note below exists to prevent. Adding a name here does not move any results
+# already on disk.
+ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft")
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
 # existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones
