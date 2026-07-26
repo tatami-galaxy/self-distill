@@ -110,7 +110,8 @@ def validate_resume(
             print(f"  warning (--force-resume): {msg}")
         else:
             raise ValueError(
-                msg + "\n  These affect which examples the data-skip lands on. "
+                msg + "\n  These settings must match for data alignment or checkpoint "
+                "compatibility. "
                 "Pass the original run's args, or --force-resume to override."
             )
     else:
