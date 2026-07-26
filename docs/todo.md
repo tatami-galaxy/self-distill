@@ -1,11 +1,12 @@
 ### Baselines
 - [x] eval with temp 1.0 (default TRL configs)
+- [ ] train with KL
 - [ ] train on deepscaleR
 - [ ] base, sft and instruct models
 - [ ] eval on all aime sets, beyondaime, hmmt
-- [ ]opd from other models
+- [ ] opd from other models
 - [ ] qwen 8B student, teacher
-- [ ]coding, knowledge tasks
+- [ ] coding, knowledge tasks
 
 
 ### Research

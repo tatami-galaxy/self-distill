@@ -13,7 +13,8 @@ Usage:
     # a trained checkpoint -- results/aime24/deepmath/Qwen3-4B/sdft/hint/checkpoint-120/
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.run_eval \
     --model /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-4B/deepmath_hint/checkpoint-120 \
-    --dataset aime24 --algo sdft --model_name Qwen3-4B --train_dataset deepmath --variant hint
+    --dataset aime24 --algo sdft --model_name Qwen3-4B --train_dataset deepmath --variant hint \
+    --run run-2 --step checkpoint-120
 
 """
 
@@ -164,7 +165,7 @@ def build_prompt(problem: str, tokenizer, template_tok=None) -> str:
 
 # ---------------------------------------------------------------------------
 # Evaluation
-# ---------------------------------------------------------------------------    
+# ---------------------------------------------------------------------------
 
 def evaluate_model(
     model_name: str,
@@ -422,7 +423,7 @@ def main():
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="Load chat template from this model (e.g. the instruct variant) "
                              "for base models that lack one")
-    
+
 
     args = parser.parse_args()
 
