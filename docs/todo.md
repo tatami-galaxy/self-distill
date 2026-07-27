@@ -26,4 +26,5 @@
   - [ ] LoRA
 - PI conditioned value function
 - Train self-teacher in SDFT (analogous to ppo value pretraining)
--  [ ] SDFT formulation, but train self-teacher to predict success probability from each token
+  - [ ] SDFT with negative advantage clipped at high-entropy positions (or in general)
+  - [ ] SDFT formulation, but train self-teacher to predict success probability from each token
