@@ -56,7 +56,12 @@ from utils import (
 # verifier arm and its own control distinguished only by a --run label -- the same merge the
 # VARIANT_REQUIRED note below exists to prevent. Adding a name here does not move any results
 # already on disk.
-ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft")
+#
+# `sft` takes no --variant today because there is exactly one corpus (the dataset's reference
+# traces). If train_sft.py ever grows a second one -- teacher-sampled or rejection-sampled
+# completions -- the corpus becomes the variable under study and `sft` should join
+# VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
+ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft", "sft")
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
 # existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones

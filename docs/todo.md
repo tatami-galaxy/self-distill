@@ -11,7 +11,9 @@
 
 ### Research
 - Leverage ICL ability of LLM value functions
-  - [x] value function prompt 
+  - [x] value function prompt
+  - [ ] value pretraining?
+  - [ ] Qwen 8B 
   - [ ] sweep, anneal lambda with modified value functions
   - [ ] `value(h_t) = ⟨h_t, e_Yes − e_No⟩ = logit(Yes) − logit(No)`
   - [ ] Model value = σ(margin) with a 0/1 target -> make the output a calibrated probability
@@ -19,3 +21,4 @@
   - [ ] Compare value function behaviours
   - [ ] Different LR for head and backbone? LoRA?
 - PI conditioned value function
+- Train self-teacher in SDFT (analogous to ppo value pretraining)
