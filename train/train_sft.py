@@ -254,9 +254,9 @@ def main():
     p.add_argument("--max-samples", type=int, default=None, help="Subset the training set")
     # data
     p.add_argument("--max-completion-length", type=int, default=8192,
-                   help="Token cap on the completion alone.Rows above "
+                   help="Token cap on the completion alone. Rows above "
                         "it are DROPPED by the dataset builder, not truncated. "
-                        "Keeps ~85% of DeepMath.")
+                        "Keeps approximately 85 percent of DeepMath.")
     p.add_argument("--max-prompt-length", type=int, default=1024,
                    help="Token cap on the PROMPT half; rows above it are dropped too. Bounds "
                         "the total so SFTConfig.max_length (their sum) is a backstop that never "

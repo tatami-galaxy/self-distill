@@ -128,11 +128,12 @@ class RenderedTargetTest(unittest.TestCase):
     def test_prompt_and_completion_tokenize_independently_at_the_seam(self):
         """The invariant that puts the -100 boundary in the right place.
 
-        SFTTrainer tokenizes the two halves SEPARATELY (`add_special_tokens=False` each) and
-        concatenates, then masks the first `len(prompt_ids)` labels. If a token spanned the
-        seam -- i.e. the pieces did not tokenize the same apart as together -- the boundary
-        would drift by a token and the first supervised position would be the tail of the
-        generation header rather than the model's first generated token.
+        SFTTrainer tokenizes the prompt alone and the combined prompt-plus-completion, then
+        uses the rendered prompt length to construct the completion mask. This test makes
+        the stronger seam assertion that separately tokenizing the two halves gives exactly
+        the combined tokenization. If a token spanned the seam, the first supervised position
+        could be the tail of the generation header rather than the model's first generated
+        token.
 
         It holds because the seam falls on the `<|im_start|>assistant\\n` special-token
         boundary, but that is a property of the chat template, not something we control, so
