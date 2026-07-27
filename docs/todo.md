@@ -25,6 +25,6 @@
   - [ ] Different LR for head and backbone
   - [ ] LoRA
 - PI conditioned value function
-- Train self-teacher in SDFT (analogous to ppo value pretraining)
+- Train self-teacher in SDFT (analogous to ppo value-pretraining)
   - [ ] SDFT with negative advantage clipped at high-entropy positions (or in general)
-  - [ ] SDFT formulation, but train self-teacher to predict success probability from each token
+  - [ ] Train SDFT self-teacher -> what should be the target for the self-teacher?
