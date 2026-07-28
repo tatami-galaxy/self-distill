@@ -72,11 +72,13 @@ from train.opsd.train_self_teacher.lib import (
     TEACHER_VERSION,
     build_teacher_dataset,
     calibration_metrics,
+    cohort_mean_ratio,
     collate_teacher_batch,
+    concat_padded,
     log_ratio,
     objective_endpoint,
     objective_pointwise,
-    concat_padded,
+    penalized_correct_indices,
     penalized_correct_mean,
     rollout_path,
     teacher_prompt_template,
@@ -113,6 +115,7 @@ class SelfTeacherTrainer(Trainer):
         )
         self._diag_rows = None
         self._diag_collate = None
+        self._initially_penalized_indices = None
         self._init_penalized = None
 
     # -- the bias needs its own, much larger learning rate ---------------------
@@ -130,6 +133,17 @@ class SelfTeacherTrainer(Trainer):
         """
         optimizer = super().create_optimizer(*args, **kwargs)
         optimizer.add_param_group({"params": [self.calibration_bias], "lr": self.bias_learning_rate})
+
+        # Transformers clears gradients with `model.zero_grad()` after each optimizer update. The
+        # calibration scalar deliberately lives outside `model`, so without an explicit clear its
+        # gradient would leak across optimizer steps forever. An optimizer post-step hook preserves
+        # accumulation across all microbatches in THIS update and clears exactly at its boundary.
+        bias = self.calibration_bias
+
+        def clear_bias_grad(_optimizer, _args, _kwargs):
+            bias.grad = None
+
+        self._bias_grad_clear_hook = optimizer.register_step_post_hook(clear_bias_grad)
         return optimizer
 
     # -- loss ------------------------------------------------------------------
@@ -176,6 +190,10 @@ class SelfTeacherTrainer(Trainer):
         unpadded (see self_teacher.per_token_logps)."""
         self._diag_rows = rows
         self._diag_collate = collate
+        # Row positions define the cohort. A new diagnostic set therefore requires a new initial
+        # selection rather than reusing indices into the previous set.
+        self._initially_penalized_indices = None
+        self._init_penalized = None
 
     @torch.no_grad()
     def diagnostics(self) -> dict[str, float]:
@@ -218,11 +236,24 @@ class SelfTeacherTrainer(Trainer):
             beta=self.beta, bias=float(self.calibration_bias.detach()),
             length_norm=self.length_norm,
         )
-        penalized = penalized_correct_mean(ratios, mask, reward)
-        if penalized is not None:
-            metrics["penalized_correct_mean"] = penalized
+
+        # Select once, on the first (untrained-teacher) reading, then follow those exact rows.
+        # Re-selecting the bottom decile here would compare different trajectories at init/final
+        # and could claim recovery merely because another correct trace became the new worst one.
+        if self._initially_penalized_indices is None:
+            self._initially_penalized_indices = penalized_correct_indices(ratios, mask, reward)
+        fixed_penalized = cohort_mean_ratio(ratios, mask, self._initially_penalized_indices)
+        if fixed_penalized is not None:
+            # Preserve the existing key, but make its implementation match its documented meaning.
+            metrics["penalized_correct_mean"] = fixed_penalized
             if self._init_penalized is not None:
-                metrics["penalized_correct_delta"] = penalized - self._init_penalized
+                metrics["penalized_correct_delta"] = fixed_penalized - self._init_penalized
+
+        # Also retain the moving tail under an explicit name: it answers the distinct question
+        # "does the teacher still heavily penalize any correct traces?"
+        current_worst = penalized_correct_mean(ratios, mask, reward)
+        if current_worst is not None:
+            metrics["current_worst_correct_mean"] = current_worst
         return metrics
 
     def _maybe_log_save_evaluate(self, *args, **kwargs):

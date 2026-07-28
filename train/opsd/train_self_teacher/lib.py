@@ -614,28 +614,54 @@ def calibration_metrics(
     return out
 
 
-def penalized_correct_mean(
+def penalized_correct_indices(
     ratios: torch.Tensor, mask: torch.Tensor, reward: torch.Tensor, decile: float = 0.1
-) -> float | None:
-    """Mean rho over the WORST-SCORED CORRECT traces -- the headline metric for this arm.
+) -> list[int] | None:
+    """Indices of the bottom-`decile` correct traces under their mean token ratio.
 
-    A correct trace the teacher assigns a very negative mean rho to is, by construction, a
-    solution the student found that the PI-conditioned teacher dislikes: off-PI exploration that
-    worked. The bottom `decile` of correct traces by initial mean rho is the population this arm
-    exists to stop punishing, so the probe reports how their mean rho MOVES from init.
-
-    Separate from calibration on purpose: a teacher can become better calibrated overall while
-    still penalizing exactly these traces, and that outcome would look like success on the Brier
-    scores while failing the actual goal.
+    Selection is deliberately separate from evaluation. Stage 2 calls this once on the untrained
+    teacher and retains the returned row indices, so every later diagnostic follows the SAME
+    initially-penalized trajectories rather than silently selecting a new bottom decile.
 
     Returns None when the batch holds no correct traces.
     """
     mask = mask.float()
     lengths = mask.sum(dim=1)
-    correct = (reward.view(-1) > 0.5) & (lengths > 0)
-    if not correct.any():
+    correct = torch.nonzero(
+        (reward.view(-1) > 0.5) & (lengths > 0), as_tuple=False
+    ).flatten()
+    if correct.numel() == 0:
         return None
     row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
-    scores = row_mean[correct]
-    k = max(1, math.ceil(decile * scores.numel()))
-    return scores.topk(k, largest=False).values.mean().item()
+    k = max(1, math.ceil(decile * correct.numel()))
+    selected_within_correct = row_mean[correct].topk(k, largest=False).indices
+    return correct[selected_within_correct].detach().cpu().tolist()
+
+
+def cohort_mean_ratio(
+    ratios: torch.Tensor, mask: torch.Tensor, row_indices: list[int] | None
+) -> float | None:
+    """Mean per-trace rho for a fixed diagnostic cohort."""
+    if not row_indices:
+        return None
+    mask = mask.float()
+    lengths = mask.sum(dim=1)
+    row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
+    indices = torch.tensor(row_indices, device=ratios.device, dtype=torch.long)
+    return row_mean.index_select(0, indices).mean().item()
+
+
+def penalized_correct_mean(
+    ratios: torch.Tensor, mask: torch.Tensor, reward: torch.Tensor, decile: float = 0.1
+) -> float | None:
+    """Mean rho over the CURRENT worst-scored correct traces.
+
+    A correct trace the teacher assigns a very negative mean rho to is, by construction, a
+    solution the student found that the PI-conditioned teacher dislikes: off-PI exploration that
+    worked. This moving-tail statistic answers whether ANY such correct traces remain badly
+    penalized. `penalized_correct_indices` plus `cohort_mean_ratio` instead follow the fixed cohort
+    that was worst under the initial teacher.
+    """
+    return cohort_mean_ratio(
+        ratios, mask, penalized_correct_indices(ratios, mask, reward, decile)
+    )

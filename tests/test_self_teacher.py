@@ -16,17 +16,20 @@ import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import torch
 
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
 from train.opsd.train_self_teacher.lib import (
     calibration_metrics,
+    cohort_mean_ratio,
     collate_teacher_batch,
     compose_teacher_messages,
     log_ratio,
     objective_endpoint,
     objective_pointwise,
+    penalized_correct_indices,
     penalized_correct_mean,
     privileged_context,
     render_teacher_prompt_ids,
@@ -340,6 +343,37 @@ class EndpointObjectiveTest(unittest.TestCase):
             sequence_logit(torch.zeros(1, 2), torch.ones(1, 2), 1.0, torch.tensor(0.0), "log")
 
 
+class CalibrationBiasOptimizerTest(unittest.TestCase):
+    def test_bias_grad_accumulates_within_step_and_clears_after_optimizer_step(self):
+        """The external bias is not reached by Trainer's `model.zero_grad()`."""
+        from transformers import Trainer
+
+        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+
+        policy_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        base_optimizer = torch.optim.SGD([policy_parameter], lr=0.1)
+
+        # Exercise SelfTeacherTrainer.create_optimizer directly without constructing a full
+        # Accelerator/model stack. Patching only the parent implementation keeps this test focused
+        # on the extra parameter group and its post-step lifecycle.
+        trainer = object.__new__(SelfTeacherTrainer)
+        trainer.calibration_bias = torch.nn.Parameter(torch.tensor(0.0))
+        trainer.bias_learning_rate = 0.1
+        with mock.patch.object(Trainer, "create_optimizer", return_value=base_optimizer):
+            optimizer = SelfTeacherTrainer.create_optimizer(trainer)
+
+        (2.0 * trainer.calibration_bias).backward()
+        (3.0 * trainer.calibration_bias).backward()
+        self.assertAlmostEqual(trainer.calibration_bias.grad.item(), 5.0)
+
+        optimizer.step()
+        self.assertIsNone(trainer.calibration_bias.grad)
+
+        # A new optimizer step starts from a clean gradient rather than inheriting the previous 5.
+        (4.0 * trainer.calibration_bias).backward()
+        self.assertAlmostEqual(trainer.calibration_bias.grad.item(), 4.0)
+
+
 class DiagnosticsTest(unittest.TestCase):
     def test_flat_ratio_has_zero_dispersion(self):
         # A flat critic assigns identical credit everywhere -- no credit assignment at all. This
@@ -404,6 +438,25 @@ class PenalizedCorrectTest(unittest.TestCase):
         mask = torch.ones(5, 2)
         reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
         self.assertAlmostEqual(penalized_correct_mean(ratios, mask, reward), -2.0, places=6)
+
+    def test_fixed_cohort_follows_initial_rows_when_the_ranking_changes(self):
+        reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
+        mask = torch.ones(5, 2)
+        initial = torch.tensor([
+            [-2.0, -2.0], [0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [-9.0, -9.0],
+        ])
+        cohort = penalized_correct_indices(initial, mask, reward, decile=0.25)
+        self.assertEqual(cohort, [0])
+
+        # Row 0 recovers, while row 1 becomes the new worst correct trace. The fixed-cohort metric
+        # must follow row 0; the moving-tail metric intentionally follows row 1.
+        final = torch.tensor([
+            [3.0, 3.0], [-4.0, -4.0], [1.0, 1.0], [2.0, 2.0], [-9.0, -9.0],
+        ])
+        self.assertAlmostEqual(cohort_mean_ratio(final, mask, cohort), 3.0, places=6)
+        self.assertAlmostEqual(
+            penalized_correct_mean(final, mask, reward, decile=0.25), -4.0, places=6
+        )
 
     def test_returns_none_without_any_correct_trace(self):
         self.assertIsNone(
