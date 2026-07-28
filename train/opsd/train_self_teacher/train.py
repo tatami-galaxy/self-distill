@@ -23,23 +23,20 @@ for the full rationale):
 
 READ THE DIAGNOSTICS, THEY ARE THE DELIVERABLE. Stage 3 is only worth a GPU if this stage shows
 the ratio became outcome-predictive. The go/no-go is INIT vs TRAINED, printed at startup and
-written to diagnostics_init.json: an untrained teacher's ratio already carries PI-informativeness,
-so the question is whether regression adds anything on top of what the PI was already doing.
+written to diagnostics_init.json. Diagnostics use COMPLETE HELD-OUT QUESTIONS: no rollout from a
+diagnostic question reaches the optimizer.
 
-  brier_q*                   should fall across prefix quantiles.
-  value_at_start             if brier_q100 barely beats this, the teacher is reading question
-                             difficulty, not the trace. Raise gen_rollouts' --n or use
-                             --mixed-only.
-  ratio_dispersion           the stopping signal for `pointwise`. Stop when it starts collapsing.
-  credit_mass_last_quartile  late-firing detector. `--pi-mode answer` is EXPECTED to trip it (the
-                             gold is in the prompt, so string-matching the final answer is the
-                             easy solution) -- which makes that arm a positive control that the
-                             metric works.
-  penalized_correct_delta    the headline. Mean rho over the worst-scored decile of CORRECT
-                             traces, minus its value at init. Positive means the teacher stopped
-                             punishing exploration that worked. Separate from calibration on
-                             purpose: a teacher can improve every Brier score while still
-                             penalizing exactly these traces.
+  within_question_auc_q*       the shortcut-resistant headline. Macro AUC over held-out questions
+                               with both outcomes; 0.5 means the score only knows difficulty.
+  brier_q* / brier_floor       calibration under the configured beta and bias.
+  brier_q*_fitted              question-grouped out-of-fold Platt Brier; compare with
+                               brier_floor_crossfit, not the in-batch floor.
+  ratio_dispersion             the stopping signal for `pointwise`. Stop when it collapses.
+  credit_mass_last_quartile    late-firing detector. `--pi-mode answer` is expected to trip it.
+  penalized_correct_centered_delta
+                               the exploration headline. The cohort is the initially worst
+                               successful rollouts RELATIVE to other attempts at the same mixed
+                               held-out question, and its identities remain fixed throughout.
 
 # one E-step, hint PI, pointwise objective
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
@@ -56,6 +53,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
 """
 
 import argparse
+import hashlib
 import json
 import os
 from functools import partial
@@ -72,6 +70,7 @@ from train.opsd.train_self_teacher.lib import (
     TEACHER_VERSION,
     build_teacher_dataset,
     calibration_metrics,
+    cohort_mean_centered_ratio,
     cohort_mean_ratio,
     collate_teacher_batch,
     concat_padded,
@@ -93,12 +92,16 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 # eval/teacher_behavior.py and stage 3 can load directly.
 CALIBRATION_FILE = "calibration.pt"
 
+# Resume identity for the data boundary: older checkpoints trained on rows now held out.
+QUESTION_SPLIT_VERSION = "question_hash_v1"
+
 
 class SelfTeacherTrainer(Trainer):
     """HF Trainer whose loss is the outcome regression on the teacher:student log ratio."""
 
     def __init__(self, *args, objective, pointwise_loss, tau, beta, length_norm,
-                 bias_learning_rate, kl_anchor, diag_batch_size=4, **kwargs):
+                 bias_learning_rate, kl_anchor, diag_batch_size=4, diag_crossfit_folds=5,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.objective = objective
         self.pointwise_loss = pointwise_loss
@@ -107,6 +110,7 @@ class SelfTeacherTrainer(Trainer):
         self.length_norm = length_norm
         self.bias_learning_rate = bias_learning_rate
         self.kl_anchor = kl_anchor
+        self.diag_crossfit_folds = diag_crossfit_folds
         self.diag_batch_size = diag_batch_size
         # VPD's delta: one scalar absorbing the outcome base rate so the ratio does not have to
         # encode it, and the "shift every rho by a constant" degenerate solution is unavailable.
@@ -115,8 +119,10 @@ class SelfTeacherTrainer(Trainer):
         )
         self._diag_rows = None
         self._diag_collate = None
+        self._diag_question_ids = None
         self._initially_penalized_indices = None
         self._init_penalized = None
+        self._init_penalized_centered = None
 
     # -- the bias needs its own, much larger learning rate ---------------------
 
@@ -190,10 +196,12 @@ class SelfTeacherTrainer(Trainer):
         unpadded (see self_teacher.per_token_logps)."""
         self._diag_rows = rows
         self._diag_collate = collate
+        self._diag_question_ids = [row["question"] for row in rows]
         # Row positions define the cohort. A new diagnostic set therefore requires a new initial
         # selection rather than reusing indices into the previous set.
         self._initially_penalized_indices = None
         self._init_penalized = None
+        self._init_penalized_centered = None
 
     @torch.no_grad()
     def diagnostics(self) -> dict[str, float]:
@@ -235,19 +243,33 @@ class SelfTeacherTrainer(Trainer):
             ratios, mask, reward,
             beta=self.beta, bias=float(self.calibration_bias.detach()),
             length_norm=self.length_norm,
+            crossfit_folds=self.diag_crossfit_folds,
+            question_ids=self._diag_question_ids,
         )
 
-        # Select once, on the first (untrained-teacher) reading, then follow those exact rows.
-        # Re-selecting the bottom decile here would compare different trajectories at init/final
-        # and could claim recovery merely because another correct trace became the new worst one.
+        # Select once from successful trajectories that the initial teacher dislikes RELATIVE to
+        # other held-out attempts at the same mixed-outcome question, then follow those exact rows.
         if self._initially_penalized_indices is None:
-            self._initially_penalized_indices = penalized_correct_indices(ratios, mask, reward)
+            self._initially_penalized_indices = penalized_correct_indices(
+                ratios, mask, reward,
+                question_ids=self._diag_question_ids,
+                center_within_question=True,
+                mixed_only=True,
+            )
         fixed_penalized = cohort_mean_ratio(ratios, mask, self._initially_penalized_indices)
+        fixed_centered = cohort_mean_centered_ratio(
+            ratios, mask, self._initially_penalized_indices, self._diag_question_ids
+        )
         if fixed_penalized is not None:
-            # Preserve the existing key, but make its implementation match its documented meaning.
             metrics["penalized_correct_mean"] = fixed_penalized
             if self._init_penalized is not None:
                 metrics["penalized_correct_delta"] = fixed_penalized - self._init_penalized
+        if fixed_centered is not None:
+            metrics["penalized_correct_centered_mean"] = fixed_centered
+            if self._init_penalized_centered is not None:
+                metrics["penalized_correct_centered_delta"] = (
+                    fixed_centered - self._init_penalized_centered
+                )
 
         # Also retain the moving tail under an explicit name: it answers the distinct question
         # "does the teacher still heavily penalize any correct traces?"
@@ -318,11 +340,90 @@ def add_init_teacher_logps(dataset, model, collate, batch_size: int, device) -> 
 
 
 # ---------------------------------------------------------------------------
+# Question-grouped held-out diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _question_hash(question: str, seed: int, salt: str = "split") -> bytes:
+    return hashlib.sha256(f"{salt}:{seed}:{question}".encode()).digest()
+
+
+def split_question_groups(dataset, validation_fraction: float, seed: int):
+    """Split an HF dataset without allowing any question to cross the boundary.
+
+    Membership is a hash threshold rather than a shuffle position, so an overlapping question is
+    assigned identically across PI arms even when `full` drops additional overlength prompts.
+    """
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be strictly between 0 and 1")
+    questions = sorted(set(dataset["question"]), key=lambda q: _question_hash(q, seed))
+    if len(questions) < 2:
+        raise ValueError("question-group validation requires at least two distinct questions")
+
+    threshold = int(validation_fraction * (1 << 256))
+    validation_questions = {
+        question
+        for question in questions
+        if int.from_bytes(_question_hash(question, seed), "big") < threshold
+    }
+    # Small smoke datasets can miss a probabilistic threshold entirely. Preserve determinism while
+    # guaranteeing that both the optimizer and the diagnostics receive at least one question.
+    if not validation_questions:
+        validation_questions = {questions[0]}
+    elif len(validation_questions) == len(questions):
+        validation_questions.remove(questions[-1])
+
+    train_indices, validation_indices = [], []
+    for idx, question in enumerate(dataset["question"]):
+        target = validation_indices if question in validation_questions else train_indices
+        target.append(idx)
+    return dataset.select(train_indices), dataset.select(validation_indices), validation_questions
+
+
+def select_complete_diagnostic_questions(dataset, max_rows: int, seed: int):
+    """Cap diagnostic cost while retaining every rollout of each selected question."""
+    if max_rows <= 0:
+        raise ValueError("diag_rows must be positive")
+    rows_by_question: dict[str, list[int]] = {}
+    for idx, question in enumerate(dataset["question"]):
+        rows_by_question.setdefault(question, []).append(idx)
+    ordered = sorted(
+        rows_by_question, key=lambda q: _question_hash(q, seed, salt="diagnostic")
+    )
+    selected: list[int] = []
+    selected_questions: list[str] = []
+    for question in ordered:
+        rows = rows_by_question[question]
+        if selected and len(selected) + len(rows) > max_rows:
+            continue
+        selected.extend(rows)
+        selected_questions.append(question)
+        if len(selected) >= max_rows:
+            break
+    return dataset.select(sorted(selected)), selected_questions
+
+
+def count_mixed_questions(dataset) -> int:
+    outcomes: dict[str, set[float]] = {}
+    for question, reward in zip(dataset["question"], dataset["reward"], strict=True):
+        outcomes.setdefault(question, set()).add(float(reward))
+    return sum(len(values) > 1 for values in outcomes.values())
+
+
+# ---------------------------------------------------------------------------
 # Resume metadata
 # ---------------------------------------------------------------------------
 
 
-def build_run_meta(args, num_train_examples: int) -> dict:
+def build_run_meta(
+    args,
+    num_train_examples: int,
+    num_validation_examples: int = 0,
+    num_diag_examples: int = 0,
+    num_train_questions: int = 0,
+    num_validation_questions: int = 0,
+    num_diag_questions: int = 0,
+) -> dict:
     return {
         "method": "self_teacher_estep",
         # Teacher-state identity. Changing the objective family or the ratio definition changes
@@ -343,7 +444,18 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "teacher_prompt_template": teacher_prompt_template(args.pi_mode),
         "num_train_examples": num_train_examples,
         # The objective and its shape parameters: all of them change what the ratio converges to.
+        "num_validation_examples": num_validation_examples,
+        "num_diag_examples": num_diag_examples,
+        "num_train_questions": num_train_questions,
+        "num_validation_questions": num_validation_questions,
+        "num_diag_questions": num_diag_questions,
+        "question_split_version": QUESTION_SPLIT_VERSION,
+        # Resume-critical: these keys determine exactly which rows reached the optimizer.
+        "validation_fraction": getattr(args, "validation_fraction", None),
+        "validation_seed": getattr(args, "validation_seed", None),
+        "diag_crossfit_folds": getattr(args, "diag_crossfit_folds", None),
         "objective": args.objective,
+        "diag_rows_limit": getattr(args, "diag_rows", None),
         "pointwise_loss": args.pointwise_loss,
         "tau": args.tau,
         "beta": args.beta,
@@ -437,9 +549,17 @@ def main():
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     # diagnostics
+    p.add_argument("--validation-fraction", type=float, default=0.1,
+                   help="Fraction of QUESTIONS held out from teacher updates. Assignment is a "
+                        "stable hash, so no rollout of a validation question can leak into train.")
+    p.add_argument("--validation-seed", type=int, default=42,
+                   help="Independent seed for the stable question split. Keep fixed across PI arms.")
     p.add_argument("--diag-rows", type=int, default=64,
-                   help="Rows in the FIXED diagnostic batch, scored under no_grad at every log "
-                        "step. Fixed so a metric moving means the teacher moved.")
+                   help="Approximate maximum held-out rows scored at every log step. Complete "
+                        "questions are retained, so the actual count may differ slightly. These "
+                        "rows never reach the optimizer.")
+    p.add_argument("--diag-crossfit-folds", type=int, default=5,
+                   help="Question-grouped folds for out-of-fold Platt Brier diagnostics.")
     p.add_argument("--diag-batch-size", type=int, default=1,
                    help="Forward chunk for the diagnostic pass and the --kl-anchor pre-pass. "
                         "Defaults to 1 for CORRECTNESS, not caution: any value above 1 pads the "
@@ -460,6 +580,13 @@ def main():
                         "the original run (verified against its run_meta.json).")
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
+
+    if not 0 < args.validation_fraction < 1:
+        p.error("--validation-fraction must be strictly between 0 and 1")
+    if args.diag_rows <= 0:
+        p.error("--diag-rows must be positive")
+    if args.diag_crossfit_folds < 2:
+        p.error("--diag-crossfit-folds must be at least 2")
 
     if args.objective == "endpoint" and args.length_norm == "none":
         print("  warning: --objective endpoint with --length-norm none. S_T accumulates over "
@@ -514,6 +641,30 @@ def main():
             f"context under --pi-mode {args.pi_mode}. The run would silently be its own control."
         )
 
+    # Hold out COMPLETE questions before constructing Trainer. No validation rollout can therefore
+    # influence the teacher weights, and within-question metrics cannot be explained by a memorized
+    # question-level success rate.
+    train_dataset, validation_dataset, validation_questions = split_question_groups(
+        train_dataset, args.validation_fraction, args.validation_seed
+    )
+    diagnostic_dataset, diagnostic_questions = select_complete_diagnostic_questions(
+        validation_dataset, args.diag_rows, args.validation_seed
+    )
+    train_questions = set(train_dataset["question"])
+    n_mixed_diag = count_mixed_questions(diagnostic_dataset)
+    print(
+        f"Question split: train {len(train_questions)} questions/{len(train_dataset)} rollouts  |  "
+        f"held out {len(validation_questions)} questions/{len(validation_dataset)} rollouts"
+    )
+    print(
+        f"  monitoring {len(diagnostic_questions)} complete held-out questions/"
+        f"{len(diagnostic_dataset)} rollouts ({n_mixed_diag} mixed-outcome questions)"
+    )
+    if n_mixed_diag == 0:
+        print("  warning: the diagnostic subset has no mixed-outcome question; global calibration "
+              "will be reported, but within-question AUC and the centered exploration cohort are "
+              "undefined. Raise --diag-rows or generate more rollouts per question.")
+
     # -- model --------------------------------------------------------------
     set_seed(args.seed)
     teacher = AutoModelForCausalLM.from_pretrained(
@@ -548,13 +699,21 @@ def main():
         seed=args.seed,
     )
 
-    meta = build_run_meta(args, len(train_dataset))
+    meta = build_run_meta(
+        args,
+        len(train_dataset),
+        len(validation_dataset),
+        len(diagnostic_dataset),
+        len(train_questions),
+        len(validation_questions),
+        len(diagnostic_questions),
+    )
     if args.resume_from_checkpoint:
         validate_resume(
             args.resume_from_checkpoint, meta, args.force_resume,
             # Absence is disqualifying: a checkpoint written before this key holds a teacher
             # trained under a different notion of what the ratio means.
-            strict_keys=("teacher_version",),
+            strict_keys=("teacher_version", "question_split_version"),
         )
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -576,6 +735,7 @@ def main():
         bias_learning_rate=args.bias_learning_rate,
         kl_anchor=args.kl_anchor,
         diag_batch_size=args.diag_batch_size,
+        diag_crossfit_folds=args.diag_crossfit_folds,
     )
 
     if args.kl_anchor > 0.0:
@@ -586,10 +746,11 @@ def main():
         trainer.train_dataset = train_dataset
 
     # -- init diagnostics: the baseline every later reading is compared against --
-    n_diag = min(args.diag_rows, len(train_dataset))
-    trainer.set_diagnostic_rows([train_dataset[i] for i in range(n_diag)], collate)
+    n_diag = len(diagnostic_dataset)
+    trainer.set_diagnostic_rows([diagnostic_dataset[i] for i in range(n_diag)], collate)
     init_metrics = trainer.diagnostics()
     trainer._init_penalized = init_metrics.get("penalized_correct_mean")
+    trainer._init_penalized_centered = init_metrics.get("penalized_correct_centered_mean")
     print(f"\nInit diagnostics (untrained teacher, {n_diag} rows) -- the go/no-go baseline:")
     for key, value in init_metrics.items():
         print(f"  {key:28s} {value: .4f}")

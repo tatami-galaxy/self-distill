@@ -24,11 +24,15 @@ import torch
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
 from train.opsd.train_self_teacher.lib import (
     calibration_metrics,
+    cohort_mean_centered_ratio,
     cohort_mean_ratio,
     collate_teacher_batch,
     compose_teacher_messages,
     fit_logistic,
+    group_centered_scores,
     log_ratio,
+    macro_group_margin,
+    macro_group_rank_auc,
     objective_endpoint,
     objective_pointwise,
     penalized_correct_indices,
@@ -410,8 +414,18 @@ class DiagnosticsTest(unittest.TestCase):
             torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
             torch.tensor([1.0]),
         )
-        for key in ("brier_q25", "brier_q50", "brier_q100", "value_at_start"):
+        for key in ("brier_q25", "brier_q50", "brier_q100", "value_first_token_mean"):
             self.assertAlmostEqual(short[key], padded[key], places=6)
+
+    def test_first_token_brier_pairs_each_row_with_its_own_outcome(self):
+        ratios = torch.tensor([[10.0, 0.0], [-10.0, 0.0]])
+        reward = torch.tensor([1.0, 0.0])
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+
+        expected_values = torch.sigmoid(torch.tensor([10.0, -10.0]))
+        expected_brier = ((expected_values - reward) ** 2).mean().item()
+        self.assertAlmostEqual(metrics["brier_first_token"], expected_brier, places=9)
+        self.assertLess(metrics["brier_first_token"], 1e-6)
 
     def test_separates_correct_from_wrong(self):
         ratios = torch.tensor([[0.5, 0.5], [-0.5, -0.5]])
@@ -428,11 +442,7 @@ class DiagnosticsTest(unittest.TestCase):
 
 
 class FittedCalibrationTest(unittest.TestCase):
-    """The raw Brier carries `--beta` and the bias; these pin what the companions remove.
-
-    Numbers quoted in the docstrings come from a 400-trace simulation: two scores with identical
-    information but a 10x scale difference read 0.2262 vs 0.2312 raw, and 0.1917 vs 0.1871 fitted.
-    """
+    """Raw Brier carries beta/bias; fitted Brier must remove them without scoring fit rows."""
 
     def make_batch(self, n=64, seed=0):
         torch.manual_seed(seed)
@@ -448,7 +458,7 @@ class FittedCalibrationTest(unittest.TestCase):
         metrics = calibration_metrics(ratios, mask, reward)
 
         self.assertAlmostEqual(
-            metrics["brier_q100_fitted"], metrics["brier_floor"], places=4,
+            metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"], places=6,
             msg="a flat ratio must fit exactly to the base-rate floor",
         )
         self.assertAlmostEqual(metrics["auc_q100"], 0.5, places=6)
@@ -502,7 +512,7 @@ class FittedCalibrationTest(unittest.TestCase):
         )
         metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
 
-        self.assertLess(metrics["brier_q100_fitted"], metrics["brier_floor"])
+        self.assertLess(metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"])
         self.assertGreater(metrics["auc_q100"], 0.9)
 
     def test_single_class_batch_omits_the_fitted_metrics(self):
@@ -528,6 +538,59 @@ class FittedCalibrationTest(unittest.TestCase):
         self.assertTrue(math.isfinite(metrics["brier_q100_fitted"]))
         self.assertAlmostEqual(metrics["auc_q100"], 1.0, places=6)
 
+    def test_question_difficulty_has_global_but_not_within_question_auc(self):
+        ratios, reward, questions = [], [], []
+        examples = [
+            (2.0, [1, 1, 1, 0]),
+            (-2.0, [1, 0, 0, 0]),
+            (1.0, [1, 1, 0, 0]),
+            (-1.0, [1, 0, 0, 0]),
+        ]
+        for question_idx, (difficulty, outcomes) in enumerate(examples):
+            for outcome in outcomes:
+                ratios.append([difficulty] * 4)
+                reward.append(outcome)
+                questions.append(f"q{question_idx}")
+        ratios = torch.tensor(ratios)
+        reward = torch.tensor(reward, dtype=torch.float32)
+        metrics = calibration_metrics(
+            ratios, torch.ones_like(ratios), reward, question_ids=questions
+        )
+
+        self.assertGreater(metrics["auc_q100"], 0.6)
+        self.assertAlmostEqual(metrics["within_question_auc_q100"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["within_question_margin_q100"], 0.0, places=6)
+        self.assertEqual(metrics["mixed_question_count"], 4.0)
+        for q in (25, 50, 75, 100):
+            self.assertIn(f"within_question_auc_q{q}", metrics)
+
+    def test_reversed_ratio_cannot_be_rescued_by_a_negative_platt_slope(self):
+        reward = torch.cat([torch.zeros(16), torch.ones(16)])
+        # Wrong traces rank above correct ones: exactly the sign that would harm SDFT.
+        ratios = torch.cat([torch.ones(16, 4), -torch.ones(16, 4)])
+        metrics = calibration_metrics(
+            ratios,
+            torch.ones_like(ratios),
+            reward,
+            question_ids=[f"q{i}" for i in range(reward.numel())],
+        )
+
+        self.assertAlmostEqual(metrics["auc_q100"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["platt_slope_q100"], 0.0, places=9)
+        self.assertAlmostEqual(
+            metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"], places=6
+        )
+
+    def test_group_helpers_macro_average_only_mixed_questions(self):
+        scores = torch.tensor([1.0, 1.0, -1.0, -1.0, 3.0, 3.0])
+        reward = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        groups = ["a", "a", "b", "b", "all-correct", "all-correct"]
+        auc, count = macro_group_rank_auc(scores, reward, groups)
+        margin, margin_count = macro_group_margin(scores, reward, groups)
+        self.assertAlmostEqual(auc, 0.5, places=6)
+        self.assertAlmostEqual(margin, 0.0, places=6)
+        self.assertEqual((count, margin_count), (2, 2))
+
     def test_rank_auc_counts_ties_as_half(self):
         scores = torch.tensor([1.0, 1.0, 1.0, 1.0])
         reward = torch.tensor([1.0, 0.0, 1.0, 0.0])
@@ -542,6 +605,43 @@ class FittedCalibrationTest(unittest.TestCase):
         a, b = fit_logistic(scores, reward)
         self.assertAlmostEqual(a, true_a, delta=0.25)
         self.assertAlmostEqual(b, true_b, delta=0.25)
+
+
+class QuestionSplitTest(unittest.TestCase):
+    def make_dataset(self):
+        from datasets import Dataset
+
+        return Dataset.from_list([
+            {"question": f"q{question}", "reward": float(rollout % 2)}
+            for question in range(20)
+            for rollout in range(4)
+        ])
+
+    def test_split_is_deterministic_disjoint_and_keeps_questions_whole(self):
+        from train.opsd.train_self_teacher.train import split_question_groups
+
+        dataset = self.make_dataset()
+        train, validation, held_out = split_question_groups(dataset, 0.2, seed=17)
+        train_questions = set(train["question"])
+        validation_questions = set(validation["question"])
+        self.assertFalse(train_questions & validation_questions)
+        self.assertEqual(validation_questions, held_out)
+        self.assertEqual(len(train) + len(validation), len(dataset))
+        self.assertTrue(all(validation["question"].count(q) == 4 for q in held_out))
+
+        train_again, validation_again, held_out_again = split_question_groups(dataset, 0.2, seed=17)
+        self.assertEqual(held_out, held_out_again)
+        self.assertEqual(train["question"], train_again["question"])
+        self.assertEqual(validation["question"], validation_again["question"])
+
+    def test_diagnostic_cap_never_splits_a_question(self):
+        from train.opsd.train_self_teacher.train import select_complete_diagnostic_questions
+
+        dataset = self.make_dataset()
+        diagnostic, questions = select_complete_diagnostic_questions(dataset, max_rows=10, seed=3)
+        self.assertLessEqual(len(diagnostic), 10)
+        self.assertEqual(set(diagnostic["question"]), set(questions))
+        self.assertTrue(all(diagnostic["question"].count(q) == 4 for q in questions))
 
 
 class PenalizedCorrectTest(unittest.TestCase):
@@ -577,6 +677,31 @@ class PenalizedCorrectTest(unittest.TestCase):
         self.assertAlmostEqual(
             worst_correct_mean(final, mask, reward, decile=0.25), -4.0, places=6
         )
+
+    def test_centered_cohort_selects_relative_penalty_not_question_difficulty(self):
+        # The hard question has much lower absolute ratios, but its correct trace is preferred
+        # relative to its failed sibling. The easy question's correct trace is the one penalized
+        # relative to another attempt at that SAME question.
+        ratios = torch.tensor([
+            [10.0, 10.0],  # q_easy correct; centered -0.5
+            [11.0, 11.0],  # q_easy wrong
+            [-10.0, -10.0],  # q_hard correct; centered +1.0
+            [-12.0, -12.0],  # q_hard wrong
+        ])
+        mask = torch.ones_like(ratios)
+        reward = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        questions = ["easy", "easy", "hard", "hard"]
+        cohort = penalized_correct_indices(
+            ratios, mask, reward, decile=0.5,
+            question_ids=questions, center_within_question=True, mixed_only=True,
+        )
+
+        self.assertEqual(cohort, [0])
+        self.assertAlmostEqual(
+            cohort_mean_centered_ratio(ratios, mask, cohort, questions), -0.5, places=6
+        )
+        centered = group_centered_scores(ratios.mean(dim=1), questions)
+        self.assertTrue(torch.equal(centered, torch.tensor([-0.5, 0.5, 1.0, -1.0])))
 
     def test_returns_none_without_any_correct_trace(self):
         self.assertIsNone(

@@ -39,6 +39,7 @@ and stage 2 hold only the teacher in memory. That shortcut encodes the probe's p
 away if the E- and M-steps are ever alternated.
 """
 
+import hashlib
 import math
 import os
 
@@ -537,6 +538,8 @@ def calibration_metrics(
     beta: float = 1.0,
     bias: float = 0.0,
     length_norm: str = "mean",
+    question_ids: list[str] | None = None,
+    crossfit_folds: int = 5,
 ) -> dict[str, float]:
     """Is the ratio predicting the outcome, and where does its credit land?
 
@@ -551,32 +554,30 @@ def calibration_metrics(
     probability once `beta` and `b` are right, and neither is fitted under `--objective pointwise`
     -- beta is a CLI constant and b never receives a gradient there (only `objective_endpoint`
     trains it). So a raw brier_q* mixes "how much does the prefix reveal" with "are these two
-    constants set well", and the second term can dominate. Hence three companions below:
-    `brier_floor` says where zero information sits, the `_fitted` series absorbs both constants
-    into a per-quantile 2-parameter fit, and `auc_q100` answers the ranking question with no link
-    at all. Demonstration: two scores carrying identical information (AUC 0.746 vs 0.755) but
-    differing 10x in scale read 0.2262 vs 0.2312 raw -- and 0.1917 vs 0.1871 fitted, correctly
-    equivalent.
+    constants set well", and the second term can dominate. The `_fitted` series removes both
+    constants with QUESTION-GROUPED OUT-OF-FOLD Platt scaling: every rollout of a question is
+    scored by a link fit without that question. Its slope is constrained non-negative because a
+    sign flip would conceal a ratio that trains SDFT in the wrong direction.
 
     Returned keys:
       brier_q{25,50,75,100}      squared error vs the realized outcome at prefix quantiles, under
                                  the link as configured. Should FALL across quantiles for a
                                  working critic. Compare against `brier_floor`, not against 0.25.
       brier_floor                p(1-p) of the outcome: the Brier of the best constant predictor.
-                                 A raw or fitted score at or above this carries no usable signal.
-      brier_q*_fitted            the same, after a per-quantile ML fit of the link's slope and
-                                 intercept (Platt). Removes --beta and the bias, so this is a
-                                 discrimination reading and is the one to compare ACROSS PI ARMS,
-                                 whose ratio scales differ by an order of magnitude. Fitted on the
-                                 batch it scores, so it is mildly optimistic (2 parameters).
-      platt_slope_q100           the slope that fit would have chosen. Far from --beta means the
-                                 raw Brier is mostly reporting a mis-set scale.
-      auc_q100                   P(correct trace outranks an incorrect one), ties counted as half.
-                                 Scale- and link-free. 0.5 is chance.
-      value_at_start             V at the first completion token. It can only encode "how often
-                                 does this policy solve this problem", so if brier_q100 is not
-                                 much better than this, the teacher is reading QUESTION DIFFICULTY
-                                 rather than the trace. The shortcut guard.
+                                 Descriptive; fitted scores use `brier_floor_crossfit` instead.
+      brier_q*_fitted            question-grouped out-of-fold Platt Brier. Scale-independent and
+                                 honest against `brier_floor_crossfit`.
+      brier_floor_crossfit       matching out-of-fold constant predictor.
+      auc_q*                     global scale-free ranking, ties counted as half.
+      within_question_auc_q*     macro AUC over mixed-outcome questions. THE DIFFICULTY-SHORTCUT
+                                 GUARD: a question-only score reads 0.5 regardless of global AUC.
+      within_question_margin_q*  macro correct-minus-wrong score within mixed questions.
+      mixed_question_count       number of questions supporting the within-question metrics.
+      platt_slope_q100           mean raw-scale slope across folds. Zero means calibration rejected
+                                 an anti-predictive ratio rather than flipping its sign.
+      brier_first_token          first-action Brier; unlike the removed `value_at_start`, this is
+                                 commensurate with the other Brier readings.
+      value_first_token_mean     mean probability after observing the first sampled action.
       ratio_dispersion           within-trace std of rho_t, averaged over traces. THE STOPPING
                                  SIGNAL for objective (c): a flat critic assigns identical credit
                                  everywhere, i.e. no credit assignment at all.
@@ -610,10 +611,22 @@ def calibration_metrics(
     scores = cumulative / normalizer  # (B, C)
     values = torch.sigmoid(beta * scores + bias)  # (B, C)
 
+    if question_ids is not None and len(question_ids) != ratios.size(0):
+        raise ValueError(
+            f"question_ids has {len(question_ids)} rows but ratios has {ratios.size(0)}"
+        )
+    valid_rows = torch.nonzero(valid, as_tuple=False).flatten().cpu().tolist()
+    # With no natural groups, cross-fit by row. Stage 2 always supplies question ids, so all
+    # rollouts from a held-out question stay in the same calibration fold.
+    fit_groups = (
+        [question_ids[i] for i in valid_rows]
+        if question_ids is not None
+        else list(range(len(valid_rows)))
+    )
+
     base_rate = reward[valid].mean()
-    # The Brier of the best CONSTANT predictor. Without it a raw brier_q* is uninterpretable: in a
-    # measured run brier_q100 read 0.2553 against a floor of 0.2461, i.e. worse than ignoring the
-    # trace entirely, and nothing in the metrics block said so.
+    # Descriptive in-batch floor. `brier_floor_crossfit` below is the honest comparison for the
+    # cross-fitted Platt predictions: its constant is estimated without each scored question.
     out["brier_floor"] = (base_rate * (1 - base_rate)).item()
     both_classes = 0 < float(base_rate) < 1
 
@@ -624,23 +637,41 @@ def calibration_metrics(
 
         if not both_classes:
             continue
-        # Fit the link per quantile, so `brier_q*_fitted` falling across quantiles is a statement
-        # about how much the PREFIX reveals, with no contribution from beta or the intercept. Per
-        # quantile rather than once, because the informative scale genuinely differs between a
-        # quarter-written trace and a finished one.
-        s_q = scores.gather(1, idx.unsqueeze(1))[valid]
-        slope, intercept = fit_logistic(s_q, reward[valid])
-        fitted = torch.sigmoid(slope * s_q + intercept)
-        out[f"brier_q{q}_fitted"] = ((fitted - reward[valid]) ** 2).mean().item()
-        if q == 100:
-            # What beta WOULD have to be for the configured link to match the fitted one. A large
-            # ratio to --beta says the Brier gap is a mis-set scale, not missing signal.
-            out["platt_slope_q100"] = slope
-            auc = rank_auc(s_q, reward[valid])
-            if auc is not None:
-                out["auc_q100"] = auc
+        s_q = scores.gather(1, idx.unsqueeze(1))[valid].flatten()
+        r_valid = reward[valid].flatten()
 
-    out["value_at_start"] = values[valid, 0].mean().item()
+        # Direction matters to SDFT: a negative ratio advantage actively trains the student the
+        # wrong way. Cross-fitting therefore constrains the calibration slope non-negative rather
+        # than letting Platt scaling flip an anti-predictive score into an excellent Brier score.
+        crossfit = cross_fitted_logistic(
+            s_q, r_valid, fit_groups, n_folds=crossfit_folds, nonnegative_slope=True
+        )
+        if crossfit is not None:
+            fitted, constant, slopes = crossfit
+            out[f"brier_q{q}_fitted"] = ((fitted - r_valid) ** 2).mean().item()
+            if "brier_floor_crossfit" not in out:
+                out["brier_floor_crossfit"] = ((constant - r_valid) ** 2).mean().item()
+            if q == 100:
+                out["platt_slope_q100"] = sum(slopes) / len(slopes)
+
+        auc = rank_auc(s_q, r_valid)
+        if auc is not None:
+            out[f"auc_q{q}"] = auc
+        if question_ids is not None:
+            grouped_auc, n_mixed = macro_group_rank_auc(s_q, r_valid, fit_groups)
+            if grouped_auc is not None:
+                out[f"within_question_auc_q{q}"] = grouped_auc
+                out["mixed_question_count"] = float(n_mixed)
+            grouped_margin, _ = macro_group_margin(s_q, r_valid, fit_groups)
+            if grouped_margin is not None:
+                out[f"within_question_margin_q{q}"] = grouped_margin
+
+    # The first-token reading already observes the sampled action; it is neither a question-only
+    # baseline nor commensurate with a Brier score. Report its calibration and mean explicitly.
+    first_values = values[valid, 0].flatten()
+    first_rewards = reward[valid].flatten()
+    out["brier_first_token"] = ((first_values - first_rewards) ** 2).mean().item()
+    out["value_first_token_mean"] = first_values.mean().item()
     out["outcome_mean"] = float(base_rate)
 
     # Within-trace dispersion of the raw ratio. Computed per row over its real tokens only, so a
@@ -668,36 +699,48 @@ def calibration_metrics(
 
 
 def fit_logistic(
-    scores: torch.Tensor, reward: torch.Tensor, iters: int = 25, ridge: float = 1e-4
+    scores: torch.Tensor,
+    reward: torch.Tensor,
+    iters: int = 25,
+    ridge: float = 1e-4,
+    nonnegative_slope: bool = False,
 ) -> tuple[float, float]:
     """Maximum-likelihood fit of `sigmoid(a*s + b)` to binary `reward` -- Platt scaling.
 
-    Newton / IRLS rather than an autograd optimizer, for two reasons: the caller runs under
-    `torch.no_grad()` (so building a graph would need an explicit enable_grad), and with two
-    parameters each step is an exact 2x2 solve, so this converges in a handful of iterations and
-    is deterministic. Run in float64; the whole cost is a few 2x2 systems.
-
-    `ridge` is an L2 penalty on (a, b). It is not just numerical hygiene: when the scores happen
-    to separate the outcomes perfectly -- entirely possible with a 64-row diagnostic batch -- the
-    unpenalised MLE runs off to infinity and the fitted Brier collapses to a meaningless 0.
-
-    Returns (a, b) = (slope, intercept).
+    Scores are standardized before the fit, making the slope penalty invariant to PI arms whose
+    ratios differ only in scale. Ridge applies to the slope only: the intercept must remain free to
+    represent the outcome base rate exactly. The returned parameters are converted back to the raw
+    score scale. If `nonnegative_slope`, an anti-predictive fit is projected to the best constant
+    predictor because a sign flip would hide a ratio that trains SDFT in the wrong direction.
     """
     scores = scores.detach().double().flatten()
     reward = reward.detach().double().flatten()
-    design = torch.stack([scores, torch.ones_like(scores)], dim=1)  # (N, 2)
-    weights = torch.zeros(2, dtype=torch.float64, device=scores.device)
-    eye = torch.eye(2, dtype=torch.float64, device=scores.device)
+    base_rate = reward.mean().clamp(1e-8, 1 - 1e-8)
+    base_intercept = torch.logit(base_rate)
+    score_mean = scores.mean()
+    score_scale = scores.std(unbiased=False)
+    if score_scale < 1e-12:
+        return 0.0, base_intercept.item()
+
+    standardized = (scores - score_mean) / score_scale
+    design = torch.stack([standardized, torch.ones_like(standardized)], dim=1)
+    weights = torch.stack([torch.zeros_like(base_intercept), base_intercept])
+    penalty = torch.diag(torch.tensor([ridge, 0.0], dtype=torch.float64, device=scores.device))
     for _ in range(iters):
         probs = torch.sigmoid(design @ weights)
-        gradient = design.T @ (probs - reward) + ridge * weights
+        gradient = design.T @ (probs - reward) + penalty @ weights
         curvature = (probs * (1 - probs)).clamp(min=1e-9)
-        hessian = (design * curvature.unsqueeze(1)).T @ design + ridge * eye
+        hessian = (design * curvature.unsqueeze(1)).T @ design + penalty
         step = torch.linalg.solve(hessian, gradient)
         weights = weights - step
         if step.abs().max() < 1e-10:
             break
-    return weights[0].item(), weights[1].item()
+
+    raw_slope = weights[0] / score_scale
+    raw_intercept = weights[1] - weights[0] * score_mean / score_scale
+    if nonnegative_slope and raw_slope < 0:
+        return 0.0, base_intercept.item()
+    return raw_slope.item(), raw_intercept.item()
 
 
 def rank_auc(scores: torch.Tensor, reward: torch.Tensor) -> float | None:
@@ -720,27 +763,171 @@ def rank_auc(scores: torch.Tensor, reward: torch.Tensor) -> float | None:
     return ((delta > 0).float() + 0.5 * (delta == 0).float()).mean().item()
 
 
+def _group_rows(group_ids: list[object]) -> dict[object, list[int]]:
+    grouped: dict[object, list[int]] = {}
+    for idx, group_id in enumerate(group_ids):
+        grouped.setdefault(group_id, []).append(idx)
+    return grouped
+
+
+def macro_group_rank_auc(
+    scores: torch.Tensor, reward: torch.Tensor, group_ids: list[object]
+) -> tuple[float | None, int]:
+    """Macro AUC over groups containing both outcomes.
+
+    A question-only score is constant inside a question and therefore reads exactly 0.5 even if
+    its global AUC is high. Questions contribute equally regardless of rollout count.
+    """
+    if len(group_ids) != scores.numel():
+        raise ValueError("group_ids must align one-to-one with scores")
+    scores, reward = scores.flatten(), reward.flatten()
+    aucs = []
+    for rows in _group_rows(group_ids).values():
+        index = torch.tensor(rows, device=scores.device, dtype=torch.long)
+        auc = rank_auc(scores.index_select(0, index), reward.index_select(0, index))
+        if auc is not None:
+            aucs.append(auc)
+    return (sum(aucs) / len(aucs), len(aucs)) if aucs else (None, 0)
+
+
+def macro_group_margin(
+    scores: torch.Tensor, reward: torch.Tensor, group_ids: list[object]
+) -> tuple[float | None, int]:
+    """Macro mean(correct score - wrong score) over groups containing both outcomes."""
+    if len(group_ids) != scores.numel():
+        raise ValueError("group_ids must align one-to-one with scores")
+    scores, reward = scores.flatten(), reward.flatten()
+    margins = []
+    for rows in _group_rows(group_ids).values():
+        index = torch.tensor(rows, device=scores.device, dtype=torch.long)
+        group_scores = scores.index_select(0, index)
+        group_reward = reward.index_select(0, index)
+        correct = group_scores[group_reward > 0.5]
+        wrong = group_scores[group_reward <= 0.5]
+        if correct.numel() and wrong.numel():
+            margins.append((correct.mean() - wrong.mean()).item())
+    return (sum(margins) / len(margins), len(margins)) if margins else (None, 0)
+
+
+def cross_fitted_logistic(
+    scores: torch.Tensor,
+    reward: torch.Tensor,
+    group_ids: list[object],
+    n_folds: int = 5,
+    nonnegative_slope: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, list[float]] | None:
+    """Out-of-fold Platt predictions, keeping every group wholly inside one fold.
+
+    Returns `(fitted, constant, slopes)`. `constant` is the matching out-of-fold intercept-only
+    baseline, so comparing its Brier with `fitted` cannot reward two parameters merely for being
+    fit on the rows they score. None when fewer than two groups or only one outcome exists.
+    """
+    scores = scores.detach().double().flatten()
+    reward = reward.detach().double().flatten()
+    if len(group_ids) != scores.numel():
+        raise ValueError("group_ids must align one-to-one with scores")
+    if reward.numel() == 0 or reward.min() == reward.max():
+        return None
+
+    groups = list(_group_rows(group_ids))
+    if len(groups) < 2:
+        return None
+    n_folds = max(2, min(n_folds, len(groups)))
+    groups.sort(key=lambda group: hashlib.sha256(repr(group).encode()).digest())
+    fold_for_group = {group: idx % n_folds for idx, group in enumerate(groups)}
+    row_folds = torch.tensor(
+        [fold_for_group[group] for group in group_ids], device=scores.device, dtype=torch.long
+    )
+
+    fitted = torch.empty_like(scores)
+    constant = torch.empty_like(scores)
+    slopes: list[float] = []
+    for fold in range(n_folds):
+        test = row_folds == fold
+        train = ~test
+        if not test.any() or not train.any():
+            continue
+        train_reward = reward[train]
+        base_rate = train_reward.mean().clamp(1e-8, 1 - 1e-8)
+        constant[test] = base_rate
+        if train_reward.min() == train_reward.max():
+            slope, intercept = 0.0, torch.logit(base_rate).item()
+        else:
+            slope, intercept = fit_logistic(
+                scores[train], train_reward, nonnegative_slope=nonnegative_slope
+            )
+        fitted[test] = torch.sigmoid(slope * scores[test] + intercept)
+        slopes.append(slope)
+    if not slopes:
+        return None
+    return fitted.float(), constant.float(), slopes
+
+
+def group_centered_scores(
+    scores: torch.Tensor, group_ids: list[object], valid: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Subtract each group's mean score, using only valid rows in that group."""
+    scores = scores.flatten()
+    if len(group_ids) != scores.numel():
+        raise ValueError("group_ids must align one-to-one with scores")
+    valid = torch.ones_like(scores, dtype=torch.bool) if valid is None else valid.bool().flatten()
+    centered = torch.zeros_like(scores)
+    for rows in _group_rows(group_ids).values():
+        index = torch.tensor(rows, device=scores.device, dtype=torch.long)
+        keep = index[valid.index_select(0, index)]
+        if keep.numel():
+            centered[keep] = scores.index_select(0, keep) - scores.index_select(0, keep).mean()
+    return centered
+
+
 def penalized_correct_indices(
-    ratios: torch.Tensor, mask: torch.Tensor, reward: torch.Tensor, decile: float = 0.1
+    ratios: torch.Tensor,
+    mask: torch.Tensor,
+    reward: torch.Tensor,
+    decile: float = 0.1,
+    question_ids: list[str] | None = None,
+    center_within_question: bool = False,
+    mixed_only: bool = False,
 ) -> list[int] | None:
     """Indices of the bottom-`decile` correct traces under their mean token ratio.
 
     Selection is deliberately separate from evaluation. Stage 2 calls this once on the untrained
     teacher and retains the returned row indices, so every later diagnostic follows the SAME
-    initially-penalized trajectories rather than silently selecting a new bottom decile.
+    initially-penalized trajectories rather than silently selecting a new bottom decile. With
+    `center_within_question`, question difficulty is subtracted before ranking; `mixed_only`
+    further restricts selection to questions whose held-out rollouts contain both outcomes.
 
     Returns None when the batch holds no correct traces.
     """
     mask = mask.float()
     lengths = mask.sum(dim=1)
-    correct = torch.nonzero(
-        (reward.view(-1) > 0.5) & (lengths > 0), as_tuple=False
-    ).flatten()
+    valid = lengths > 0
+    reward = reward.view(-1)
+    candidates = (reward > 0.5) & valid
+    row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
+    selection_score = row_mean
+
+    if question_ids is not None:
+        if len(question_ids) != ratios.size(0):
+            raise ValueError("question_ids must align one-to-one with ratio rows")
+        if center_within_question:
+            selection_score = group_centered_scores(row_mean, question_ids, valid)
+        if mixed_only:
+            mixed = torch.zeros_like(candidates)
+            for rows in _group_rows(question_ids).values():
+                index = torch.tensor(rows, device=reward.device, dtype=torch.long)
+                group_reward = reward.index_select(0, index)[valid.index_select(0, index)]
+                if group_reward.numel() and group_reward.min() < 0.5 < group_reward.max():
+                    mixed[index] = True
+            candidates &= mixed
+    elif center_within_question or mixed_only:
+        raise ValueError("question_ids are required for centered or mixed-only selection")
+
+    correct = torch.nonzero(candidates, as_tuple=False).flatten()
     if correct.numel() == 0:
         return None
-    row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
     k = max(1, math.ceil(decile * correct.numel()))
-    selected_within_correct = row_mean[correct].topk(k, largest=False).indices
+    selected_within_correct = selection_score[correct].topk(k, largest=False).indices
     return correct[selected_within_correct].detach().cpu().tolist()
 
 
@@ -755,6 +942,23 @@ def cohort_mean_ratio(
     row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
     indices = torch.tensor(row_indices, device=ratios.device, dtype=torch.long)
     return row_mean.index_select(0, indices).mean().item()
+
+
+def cohort_mean_centered_ratio(
+    ratios: torch.Tensor,
+    mask: torch.Tensor,
+    row_indices: list[int] | None,
+    question_ids: list[str],
+) -> float | None:
+    """Mean question-centered ratio for a fixed cohort."""
+    if not row_indices:
+        return None
+    mask = mask.float()
+    lengths = mask.sum(dim=1)
+    row_mean = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
+    centered = group_centered_scores(row_mean, question_ids, lengths > 0)
+    indices = torch.tensor(row_indices, device=ratios.device, dtype=torch.long)
+    return centered.index_select(0, indices).mean().item()
 
 
 def worst_correct_mean(
