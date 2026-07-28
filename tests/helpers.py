@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import torch
 
-from train.train_ppo import PPOTrainer
+from train.ppo.train_ppo import PPOTrainer
 
 TOKENIZER_ID = "Qwen/Qwen3-1.7B"
 

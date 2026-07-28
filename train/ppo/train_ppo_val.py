@@ -15,12 +15,12 @@ RESUME. This arm's critic state representation is not train_ppo.py's, so their c
 not interchangeable, and neither direction is allowed to happen quietly.
 
 # single GPU, colocate vLLM (<=1.7B)
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo_val \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.ppo.train_ppo_val \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-steps 400
 
 # 4B+: vLLM on its own GPU, policy + critic on another.
 CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-utilization 0.9 &
-CUDA_VISIBLE_DEVICES=6 uv run python -m train.train_ppo_val \
+CUDA_VISIBLE_DEVICES=6 uv run python -m train.ppo.train_ppo_val \
     --model Qwen/Qwen3-4B --dataset deepmath --vllm-mode server --optim adafactor
 """
 
@@ -32,8 +32,8 @@ import torch
 from transformers import AutoModelForSequenceClassification, set_seed
 from trl.rewards import accuracy_reward
 
-from train.train_grpo import build_grpo_dataset
-from train.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
+from train.grpo.train_grpo import build_grpo_dataset
+from train.ppo.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 

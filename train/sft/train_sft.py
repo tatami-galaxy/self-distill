@@ -41,11 +41,11 @@ utils.validate_resume. Both length caps are recorded too, because changing eithe
 rows survive the filter and therefore what the seeded data-skip lands on.
 
 # single GPU, no vLLM
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sft \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.sft.train_sft \
     --model Qwen/Qwen3-1.7B --dataset deepmath
 
 # smoke
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_sft \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.sft.train_sft \
     --model Qwen/Qwen3-1.7B --max-samples 64 --max-steps 2 --save-steps 2
 """
 

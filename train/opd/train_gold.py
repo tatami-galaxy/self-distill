@@ -29,7 +29,7 @@ GPU topology (bf16 30B teacher + colocate vLLM don't share one GPU comfortably):
   Launch with 2 visible GPUs, e.g. CUDA_VISIBLE_DEVICES=6,7.
 
 CUDA_VISIBLE_DEVICES=6,7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    uv run python -m train.train_gold \
+    uv run python -m train.opd.train_gold \
     --model Qwen/Qwen3-1.7B --dataset deepmath --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
     --teacher-device cuda:1 --max-samples 8192
 

@@ -4,8 +4,8 @@ import tempfile
 import types
 import unittest
 
-from train.train_ppo import build_run_meta as ppo_meta
-from train.train_ppo_val import build_run_meta as ppo_val_meta
+from train.ppo.train_ppo import build_run_meta as ppo_meta
+from train.ppo.train_ppo_val import build_run_meta as ppo_val_meta
 from utils import validate_resume
 
 

@@ -14,7 +14,7 @@ two libraries' behavior -- not ours -- that the formatting has to satisfy.
 import unittest
 
 from tests.helpers import TOKENIZER_ID
-from train.train_sft import format_think_completion, to_sft_example
+from train.sft.train_sft import format_think_completion, to_sft_example
 from utils import format_prompt_math
 
 

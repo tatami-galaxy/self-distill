@@ -8,7 +8,7 @@ step) one epoch of full DeepMath is ~51,510 steps, so data exhaustion is not a p
 here.
 
 # single GPU, colocate vLLM
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_grpo \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.grpo.train_grpo \
     --model Qwen/Qwen3-4B --max-samples 8192 --dataset deepmath
 
 # multiple GPUs: data-parallel via accelerate, one process per GPU. In colocate
@@ -16,7 +16,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_grpo \
 # The global batch = num_processes * per-device-train-batch-size * grad-accum,
 # and num_generations must divide it (default 8 divides 4 * 8 * 4 = 128).
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
-    -m train.train_grpo --model Qwen/Qwen3-4B --max-samples 8192
+    -m train.grpo.train_grpo --model Qwen/Qwen3-4B --max-samples 8192
 """
 
 import argparse

@@ -61,7 +61,13 @@ from utils import (
 # traces). If train_sft.py ever grows a second one -- teacher-sampled or rejection-sampled
 # completions -- the corpus becomes the variable under study and `sft` should join
 # VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
-ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft", "sft")
+#
+# `ppo_pi` and `sdft_tt` follow the same reasoning as `ppo_val`: each is a separate trainer file
+# writing its own `method` stamp, so filing them under a neighbour would leave an arm and its own
+# control distinguished only by a --run label. `sdft_tt` is
+# train/opsd/train_self_teacher/sdft_with_teacher.py -- SDFT whose teacher was trained by the
+# E-step in that same package.
+ALGOS = ("base", "grpo", "ppo", "ppo_val", "ppo_pi", "gold", "sdft", "sdft_tt", "sft")
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
 # existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones
@@ -76,6 +82,10 @@ SUMMARY_SCHEMA_VERSION = 2
 VARIANT_REQUIRED = {
     "sdft": "the privileged context, e.g. --variant hint",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
+    "ppo_pi": "the critic's privileged context, e.g. --variant hint",
+    # For sdft_tt the variable is the pair (PI, E-step objective): the same PI trained under the
+    # pointwise and endpoint objectives yields two different teachers and two different students.
+    "sdft_tt": "the teacher's PI and objective, e.g. --variant hint-pointwise",
 }
 
 # What a checkpoint directory is called: `checkpoint-<N>`, TRL's end-of-training `final/`, or
@@ -425,7 +435,7 @@ def main():
                         help="Fraction of the GPU vLLM may reserve. This is measured against "
                              "TOTAL device memory, not free memory, so the 0.9 default requires "
                              "an essentially idle GPU -- lower it to share one with another job. "
-                             "Matches the flag on eval/passk_pi.py and train/gen_hints.py.")
+                             "Matches the flag on eval/passk_pi.py and utils/gen_hints.py.")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
     parser.add_argument("--seed", type=int, default=42,

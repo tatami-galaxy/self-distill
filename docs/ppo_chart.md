@@ -7,7 +7,7 @@ training loop. Traced against the pinned libraries, not from memory:
 |---|---|
 | `transformers` | 5.10.1 (`transformers/trainer.py`, line numbers below refer to it) |
 | `trl` | 1.6.0 (`trl/trainer/grpo_trainer.py`) |
-| ours | `train/train_ppo.py` + `train/train_ppo_val.py` |
+| ours | `train/ppo/train_ppo.py` + `train/ppo/train_ppo_val.py` |
 
 **Legend** — `HF` = `transformers.Trainer`, `TRL` = `GRPOTrainer`, **`★`** = ours
 (`PPOTrainer` in `train_ppo.py`, or `PPOValTrainer` in `train_ppo_val.py` where noted).
@@ -33,7 +33,7 @@ generate_every              = steps_per_generation × num_iterations            
 So one optimizer step consumes **one generation batch of 16 rows**, generated once and reused
 across all 16 micro-batches. At the default `num_generations=1` those 16 rows are 16 **distinct**
 prompts — stock GRPO's config forbids `<2`, but `PPOConfig` overrides that since the critic, not
-a group, is the baseline (see [`train_ppo.py`](../train/train_ppo.py) `PPOConfig.__post_init__`).
+a group, is the baseline (see [`train_ppo.py`](../train/ppo/train_ppo.py) `PPOConfig.__post_init__`).
 The batch *size* is `per_device_bs × num_procs × steps_per_generation` and does **not** depend on
 `num_generations`, so passing 2 instead (the earlier runs' value) fills the same 16 rows with
 8 prompts × 2 rollouts and changes nothing else in this trace — `generation_batch_size`, the step

@@ -9,7 +9,7 @@ prompt (built exactly as SDFTTrainer builds it) and grade against the gold answe
 pass@k(PI) - pass@k(none) is the informativeness of that PI; `answer` is a near-
 trivial ceiling (the value is in the prompt), `hint` is the interesting middle.
 
-Eval set = a random subset of the hint cache (train/gen_hints.py), which carries
+Eval set = a random subset of the hint cache (utils/gen_hints.py), which carries
 question + final_answer + hint; `full` solutions are rejoined from DeepMath. All
 arms are evaluated on the SAME problems (restricted to those whose full-PI prompt
 fits the context) so every pass@k shares a denominator.
@@ -30,7 +30,7 @@ from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
 from eval.run_eval import compute_pass_at_k
-from train.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, TEACHER_PROMPT_TEMPLATE
+from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, TEACHER_PROMPT_TEMPLATE
 from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path
 
 
@@ -67,7 +67,7 @@ def load_eval_problems(
     if not os.path.isdir(path):
         raise FileNotFoundError(
             f"No hint cache for {model} on {dataset} at {path}. Generate it first:\n"
-            f"  python -m train.gen_hints --model {model} --dataset {dataset} --max-samples <N>"
+            f"  python -m utils.gen_hints --model {model} --dataset {dataset} --max-samples <N>"
         )
     hints = load_from_disk(path)
     gen_models = set(hints.unique("gen_model"))

@@ -88,12 +88,12 @@ Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param
 `_assert_policy_finite` (below) now catches this at the step it happens.
 
 # single GPU, colocate vLLM (<=1.7B)
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.ppo.train_ppo \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 8192
 
 # 4B+: vLLM on its own GPU, policy + critic on another.
 CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-utilization 0.9 &
-CUDA_VISIBLE_DEVICES=6 uv run python -m train.train_ppo \
+CUDA_VISIBLE_DEVICES=6 uv run python -m train.ppo.train_ppo \
     --model Qwen/Qwen3-4B --dataset deepmath --vllm-mode server --vllm-server-port 8000
 
 aside :  GRPOTrainer also supports custom rollout logic, in case we want to use that later
@@ -111,7 +111,7 @@ from trl import GRPOConfig, GRPOTrainer
 from trl.rewards import accuracy_reward
 from trl.trainer.utils import pad
 
-from train.train_grpo import build_grpo_dataset
+from train.grpo.train_grpo import build_grpo_dataset
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 

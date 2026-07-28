@@ -3,7 +3,7 @@ PPO with a **PI-conditioned value function**: the critic reads the question *plu
 information* (a self-hint, the gold answer, or the worked solution); the policy reads only the
 question, and rollouts are still drawn from the un-privileged policy.
 
-Everything except the critic's prompt is inherited from train/train_ppo.py -- same GRPOTrainer
+Everything except the critic's prompt is inherited from train/ppo/train_ppo.py -- same GRPOTrainer
 machinery, same accuracy_reward, same GAE, same clipped value loss -- so the arm is structurally
 "train_ppo plus PI".
 
@@ -72,11 +72,11 @@ silent change to what the critic conditions on halfway through a run.
 
 # 4B: vLLM on its own GPU (colocate OOMs from ~4B), policy + critic on another.
 CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-utilization 0.9 &
-CUDA_VISIBLE_DEVICES=6 uv run python -m train.train_ppo_pi \
+CUDA_VISIBLE_DEVICES=6 uv run python -m train.ppo.train_ppo_pi \
     --model Qwen/Qwen3-4B --dataset deepmath --pi-mode hint --vllm-server-port 8000
 
 # smoke (<=1.7B, colocate)
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.train_ppo_pi \
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.ppo.train_ppo_pi \
     --model Qwen/Qwen3-1.7B --pi-mode hint --vllm-mode colocate \
     --max-steps 2 --max-samples 32 --max-completion-length 256 --save-steps 2
 """
@@ -90,8 +90,8 @@ from transformers import AutoModelForSequenceClassification, set_seed
 from trl.rewards import accuracy_reward
 from trl.trainer.utils import pad
 
-from train.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
-from train.train_sdft import PI_ANSWER, PI_FULL, PI_HINT
+from train.ppo.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
+from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT
 from utils import (
     DATASET_REGISTRY_TRAIN,
     compose_pi_messages,
@@ -471,7 +471,7 @@ def main():
     # privileged context
     p.add_argument("--pi-mode", default="hint", choices=list(PI_MODES),
                    help="What the CRITIC sees on top of the question (the policy never sees it): "
-                        "'hint' precomputed self-hints (run train.gen_hints first), 'answer' the "
+                        "'hint' precomputed self-hints (run utils.gen_hints first), 'answer' the "
                         "boxed gold, 'full' the worked solution, 'none' the matched no-PI control.")
     p.add_argument("--max-value-prompt-length", type=int, default=4096,
                    help="Left-truncate the critic's PI prompt to this many tokens. Nothing "

@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from train.train_ppo import PPOConfig, PPOTrainer
+from train.ppo.train_ppo import PPOConfig, PPOTrainer
 
 
 class PPOConfigTest(unittest.TestCase):

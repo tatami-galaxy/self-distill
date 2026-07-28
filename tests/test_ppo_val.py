@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import torch
 
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
-from train.train_ppo_val import (
+from train.ppo.train_ppo_val import (
     PPOValTrainer,
     VALUE_SYSTEM_PROMPT,
     compose_value_messages,

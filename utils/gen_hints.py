@@ -20,7 +20,7 @@ Rows whose hint contains \\boxed or the gold final answer are dropped.
 Output: an on-disk HF dataset at data/pi/hint/<dataset>/<model-slug>/ with columns
 question, final_answer, hint, gen_model, dataset.
 
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.gen_hints \
+CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_hints \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 20000
 """
 
