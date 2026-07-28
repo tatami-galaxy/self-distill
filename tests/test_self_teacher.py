@@ -12,6 +12,7 @@ identical generation header.
 """
 
 import json
+import math
 import os
 import tempfile
 import types
@@ -26,16 +27,18 @@ from train.opsd.train_self_teacher.lib import (
     cohort_mean_ratio,
     collate_teacher_batch,
     compose_teacher_messages,
+    fit_logistic,
     log_ratio,
     objective_endpoint,
     objective_pointwise,
     penalized_correct_indices,
-    penalized_correct_mean,
     privileged_context,
+    rank_auc,
     render_teacher_prompt_ids,
     sequence_logit,
     teacher_inputs,
     teacher_prompt_template,
+    worst_correct_mean,
 )
 from utils import TEACHER_PROMPT_TEMPLATE, format_prompt_math, validate_resume
 
@@ -424,6 +427,123 @@ class DiagnosticsTest(unittest.TestCase):
         )
 
 
+class FittedCalibrationTest(unittest.TestCase):
+    """The raw Brier carries `--beta` and the bias; these pin what the companions remove.
+
+    Numbers quoted in the docstrings come from a 400-trace simulation: two scores with identical
+    information but a 10x scale difference read 0.2262 vs 0.2312 raw, and 0.1917 vs 0.1871 fitted.
+    """
+
+    def make_batch(self, n=64, seed=0):
+        torch.manual_seed(seed)
+        reward = (torch.rand(n) < 0.4).float()
+        return reward
+
+    def test_flat_ratio_fits_to_the_floor(self):
+        # A constant score carries no information, so the fitted link can do no better than the
+        # best constant predictor -- and must do no worse.
+        reward = self.make_batch()
+        ratios = torch.full((reward.numel(), 8), 0.3)
+        mask = torch.ones_like(ratios)
+        metrics = calibration_metrics(ratios, mask, reward)
+
+        self.assertAlmostEqual(
+            metrics["brier_q100_fitted"], metrics["brier_floor"], places=4,
+            msg="a flat ratio must fit exactly to the base-rate floor",
+        )
+        self.assertAlmostEqual(metrics["auc_q100"], 0.5, places=6)
+
+    def test_brier_floor_is_the_best_constant_predictor(self):
+        reward = self.make_batch()
+        ratios = torch.zeros(reward.numel(), 4)
+        mask = torch.ones_like(ratios)
+        metrics = calibration_metrics(ratios, mask, reward)
+
+        p = reward.mean().item()
+        self.assertAlmostEqual(metrics["brier_floor"], p * (1 - p), places=6)
+        # And it really is the minimum over constants.
+        for candidate in (0.0, 0.25, 0.5, 0.75, 1.0):
+            self.assertLessEqual(
+                metrics["brier_floor"], ((candidate - reward) ** 2).mean().item() + 1e-9
+            )
+
+    def test_fitted_brier_and_auc_are_scale_invariant(self):
+        # THE POINT OF THE FITTED SERIES. Rescaling every ratio changes nothing about how the
+        # traces are ordered, so a discrimination metric must not move -- while the raw Brier,
+        # which reads through a fixed --beta, does.
+        reward = self.make_batch()
+        torch.manual_seed(1)
+        base = 0.2 * (reward.unsqueeze(1) - 0.4) + 0.2 * torch.randn(reward.numel(), 6)
+        mask = torch.ones_like(base)
+
+        small = calibration_metrics(base, mask, reward)
+        large = calibration_metrics(10.0 * base, mask, reward)
+
+        self.assertAlmostEqual(small["brier_q100_fitted"], large["brier_q100_fitted"], places=4)
+        self.assertAlmostEqual(small["auc_q100"], large["auc_q100"], places=6)
+        # The slope absorbs the rescaling reciprocally, but only to within the ridge's influence:
+        # an L2 penalty on (a, b) is not scale-equivariant, so the 10x-larger score is fitted with
+        # a slope slightly more than 10x smaller. Measured at ~0.3% here; assert relatively rather
+        # than pretending a regularized estimator is exactly homogeneous.
+        self.assertAlmostEqual(
+            small["platt_slope_q100"] / (10.0 * large["platt_slope_q100"]), 1.0, places=2,
+            msg="the fitted slope must absorb the rescaling",
+        )
+        self.assertNotAlmostEqual(
+            small["brier_q100"], large["brier_q100"], places=3,
+            msg="the RAW brier is expected to move -- that is what motivates the fitted one",
+        )
+
+    def test_informative_ratio_beats_the_floor(self):
+        reward = self.make_batch(n=128)
+        torch.manual_seed(2)
+        ratios = (0.6 * (reward.unsqueeze(1) - 0.4)).expand(-1, 6) + 0.05 * torch.randn(
+            reward.numel(), 6
+        )
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+
+        self.assertLess(metrics["brier_q100_fitted"], metrics["brier_floor"])
+        self.assertGreater(metrics["auc_q100"], 0.9)
+
+    def test_single_class_batch_omits_the_fitted_metrics(self):
+        # With one outcome class the fit is unidentifiable and AUC undefined; the keys must be
+        # absent rather than reporting a degenerate 0.0.
+        reward = torch.ones(8)
+        ratios = torch.randn(8, 5)
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+
+        self.assertIn("brier_q100", metrics)
+        self.assertAlmostEqual(metrics["brier_floor"], 0.0, places=9)
+        for key in ("brier_q100_fitted", "auc_q100", "platt_slope_q100"):
+            self.assertNotIn(key, metrics)
+
+    def test_perfect_separation_stays_finite(self):
+        # A 64-row batch can separate perfectly by chance. The unpenalised MLE would diverge and
+        # report a meaningless Brier of 0; the ridge keeps it finite.
+        reward = torch.cat([torch.zeros(16), torch.ones(16)])
+        ratios = torch.cat([-torch.ones(16, 4), torch.ones(16, 4)])
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+
+        self.assertTrue(math.isfinite(metrics["platt_slope_q100"]))
+        self.assertTrue(math.isfinite(metrics["brier_q100_fitted"]))
+        self.assertAlmostEqual(metrics["auc_q100"], 1.0, places=6)
+
+    def test_rank_auc_counts_ties_as_half(self):
+        scores = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        reward = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        self.assertAlmostEqual(rank_auc(scores, reward), 0.5, places=6)
+        self.assertIsNone(rank_auc(scores, torch.ones(4)))
+
+    def test_fit_logistic_recovers_known_parameters(self):
+        torch.manual_seed(3)
+        scores = torch.randn(4000)
+        true_a, true_b = 2.0, -0.7
+        reward = (torch.rand(4000) < torch.sigmoid(true_a * scores + true_b)).float()
+        a, b = fit_logistic(scores, reward)
+        self.assertAlmostEqual(a, true_a, delta=0.25)
+        self.assertAlmostEqual(b, true_b, delta=0.25)
+
+
 class PenalizedCorrectTest(unittest.TestCase):
     def test_selects_the_worst_scored_correct_traces_only(self):
         # Four correct traces and one wrong one the teacher likes even less. The metric must
@@ -437,7 +557,7 @@ class PenalizedCorrectTest(unittest.TestCase):
         ])
         mask = torch.ones(5, 2)
         reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
-        self.assertAlmostEqual(penalized_correct_mean(ratios, mask, reward), -2.0, places=6)
+        self.assertAlmostEqual(worst_correct_mean(ratios, mask, reward), -2.0, places=6)
 
     def test_fixed_cohort_follows_initial_rows_when_the_ranking_changes(self):
         reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
@@ -455,12 +575,12 @@ class PenalizedCorrectTest(unittest.TestCase):
         ])
         self.assertAlmostEqual(cohort_mean_ratio(final, mask, cohort), 3.0, places=6)
         self.assertAlmostEqual(
-            penalized_correct_mean(final, mask, reward, decile=0.25), -4.0, places=6
+            worst_correct_mean(final, mask, reward, decile=0.25), -4.0, places=6
         )
 
     def test_returns_none_without_any_correct_trace(self):
         self.assertIsNone(
-            penalized_correct_mean(torch.zeros(2, 2), torch.ones(2, 2), torch.tensor([0.0, 0.0]))
+            worst_correct_mean(torch.zeros(2, 2), torch.ones(2, 2), torch.tensor([0.0, 0.0]))
         )
 
 

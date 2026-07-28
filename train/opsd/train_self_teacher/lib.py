@@ -547,9 +547,32 @@ def calibration_metrics(
     N_t the PREFIX length (not the trace length), so V_t reads as a running probability rather
     than shrinking towards the base rate early in long traces.
 
+    THE RAW BRIER CARRIES TWO NUISANCE PARAMETERS. `V_t = sigmoid(beta*S_t/N_t + b)` is only a
+    probability once `beta` and `b` are right, and neither is fitted under `--objective pointwise`
+    -- beta is a CLI constant and b never receives a gradient there (only `objective_endpoint`
+    trains it). So a raw brier_q* mixes "how much does the prefix reveal" with "are these two
+    constants set well", and the second term can dominate. Hence three companions below:
+    `brier_floor` says where zero information sits, the `_fitted` series absorbs both constants
+    into a per-quantile 2-parameter fit, and `auc_q100` answers the ranking question with no link
+    at all. Demonstration: two scores carrying identical information (AUC 0.746 vs 0.755) but
+    differing 10x in scale read 0.2262 vs 0.2312 raw -- and 0.1917 vs 0.1871 fitted, correctly
+    equivalent.
+
     Returned keys:
-      brier_q{25,50,75,100}      squared error vs the realized outcome at prefix quantiles.
-                                 Should FALL across quantiles for a working critic.
+      brier_q{25,50,75,100}      squared error vs the realized outcome at prefix quantiles, under
+                                 the link as configured. Should FALL across quantiles for a
+                                 working critic. Compare against `brier_floor`, not against 0.25.
+      brier_floor                p(1-p) of the outcome: the Brier of the best constant predictor.
+                                 A raw or fitted score at or above this carries no usable signal.
+      brier_q*_fitted            the same, after a per-quantile ML fit of the link's slope and
+                                 intercept (Platt). Removes --beta and the bias, so this is a
+                                 discrimination reading and is the one to compare ACROSS PI ARMS,
+                                 whose ratio scales differ by an order of magnitude. Fitted on the
+                                 batch it scores, so it is mildly optimistic (2 parameters).
+      platt_slope_q100           the slope that fit would have chosen. Far from --beta means the
+                                 raw Brier is mostly reporting a mis-set scale.
+      auc_q100                   P(correct trace outranks an incorrect one), ties counted as half.
+                                 Scale- and link-free. 0.5 is chance.
       value_at_start             V at the first completion token. It can only encode "how often
                                  does this policy solve this problem", so if brier_q100 is not
                                  much better than this, the teacher is reading QUESTION DIFFICULTY
@@ -581,14 +604,44 @@ def calibration_metrics(
         normalizer = positions.sqrt()
     else:
         normalizer = torch.ones_like(positions)
-    values = torch.sigmoid(beta * cumulative / normalizer + bias)  # (B, C)
+    # The prefix score BEFORE the link's two nuisance parameters. `values` applies the configured
+    # beta and the trained bias (what a downstream consumer of V would actually see); the fitted
+    # metrics below re-read the same scores with those two absorbed into a per-quantile fit.
+    scores = cumulative / normalizer  # (B, C)
+    values = torch.sigmoid(beta * scores + bias)  # (B, C)
+
+    base_rate = reward[valid].mean()
+    # The Brier of the best CONSTANT predictor. Without it a raw brier_q* is uninterpretable: in a
+    # measured run brier_q100 read 0.2553 against a floor of 0.2461, i.e. worse than ignoring the
+    # trace entirely, and nothing in the metrics block said so.
+    out["brier_floor"] = (base_rate * (1 - base_rate)).item()
+    both_classes = 0 < float(base_rate) < 1
 
     for q in (25, 50, 75, 100):
         idx = (lengths.float() * q / 100).ceil().long().clamp(min=1) - 1  # (B,)
-        v_q = values.gather(1, idx.unsqueeze(1))  # (B, 1)
-        out[f"brier_q{q}"] = ((v_q - reward) ** 2)[valid].mean().item()
+        v_q = values.gather(1, idx.unsqueeze(1))[valid]  # (n, 1)
+        out[f"brier_q{q}"] = ((v_q - reward[valid]) ** 2).mean().item()
+
+        if not both_classes:
+            continue
+        # Fit the link per quantile, so `brier_q*_fitted` falling across quantiles is a statement
+        # about how much the PREFIX reveals, with no contribution from beta or the intercept. Per
+        # quantile rather than once, because the informative scale genuinely differs between a
+        # quarter-written trace and a finished one.
+        s_q = scores.gather(1, idx.unsqueeze(1))[valid]
+        slope, intercept = fit_logistic(s_q, reward[valid])
+        fitted = torch.sigmoid(slope * s_q + intercept)
+        out[f"brier_q{q}_fitted"] = ((fitted - reward[valid]) ** 2).mean().item()
+        if q == 100:
+            # What beta WOULD have to be for the configured link to match the fitted one. A large
+            # ratio to --beta says the Brier gap is a mis-set scale, not missing signal.
+            out["platt_slope_q100"] = slope
+            auc = rank_auc(s_q, reward[valid])
+            if auc is not None:
+                out["auc_q100"] = auc
+
     out["value_at_start"] = values[valid, 0].mean().item()
-    out["outcome_mean"] = reward[valid].mean().item()
+    out["outcome_mean"] = float(base_rate)
 
     # Within-trace dispersion of the raw ratio. Computed per row over its real tokens only, so a
     # short trace and a long one contribute equally.
@@ -612,6 +665,59 @@ def calibration_metrics(
         if rows.any():
             out[f"mean_ratio_{name}"] = row_mean[rows].mean().item()
     return out
+
+
+def fit_logistic(
+    scores: torch.Tensor, reward: torch.Tensor, iters: int = 25, ridge: float = 1e-4
+) -> tuple[float, float]:
+    """Maximum-likelihood fit of `sigmoid(a*s + b)` to binary `reward` -- Platt scaling.
+
+    Newton / IRLS rather than an autograd optimizer, for two reasons: the caller runs under
+    `torch.no_grad()` (so building a graph would need an explicit enable_grad), and with two
+    parameters each step is an exact 2x2 solve, so this converges in a handful of iterations and
+    is deterministic. Run in float64; the whole cost is a few 2x2 systems.
+
+    `ridge` is an L2 penalty on (a, b). It is not just numerical hygiene: when the scores happen
+    to separate the outcomes perfectly -- entirely possible with a 64-row diagnostic batch -- the
+    unpenalised MLE runs off to infinity and the fitted Brier collapses to a meaningless 0.
+
+    Returns (a, b) = (slope, intercept).
+    """
+    scores = scores.detach().double().flatten()
+    reward = reward.detach().double().flatten()
+    design = torch.stack([scores, torch.ones_like(scores)], dim=1)  # (N, 2)
+    weights = torch.zeros(2, dtype=torch.float64, device=scores.device)
+    eye = torch.eye(2, dtype=torch.float64, device=scores.device)
+    for _ in range(iters):
+        probs = torch.sigmoid(design @ weights)
+        gradient = design.T @ (probs - reward) + ridge * weights
+        curvature = (probs * (1 - probs)).clamp(min=1e-9)
+        hessian = (design * curvature.unsqueeze(1)).T @ design + ridge * eye
+        step = torch.linalg.solve(hessian, gradient)
+        weights = weights - step
+        if step.abs().max() < 1e-10:
+            break
+    return weights[0].item(), weights[1].item()
+
+
+def rank_auc(scores: torch.Tensor, reward: torch.Tensor) -> float | None:
+    """Probability that a correct trace outranks an incorrect one. None if only one class.
+
+    TIES COUNT AS HALF. Without that a flat score -- every trace identical, the degenerate case
+    this metric most needs to identify -- reads 0.0 rather than 0.5, i.e. looks perfectly
+    ANTI-predictive instead of uninformative.
+
+    Scale-free and link-free by construction, so unlike the Brier scores it is unaffected by
+    `--beta`; it is the cheapest honest answer to "does the ratio order traces at all".
+    """
+    scores = scores.detach().flatten()
+    reward = reward.detach().flatten()
+    positive = scores[reward > 0.5]
+    negative = scores[reward <= 0.5]
+    if positive.numel() == 0 or negative.numel() == 0:
+        return None
+    delta = positive.unsqueeze(1) - negative.unsqueeze(0)
+    return ((delta > 0).float() + 0.5 * (delta == 0).float()).mean().item()
 
 
 def penalized_correct_indices(
@@ -651,7 +757,7 @@ def cohort_mean_ratio(
     return row_mean.index_select(0, indices).mean().item()
 
 
-def penalized_correct_mean(
+def worst_correct_mean(
     ratios: torch.Tensor, mask: torch.Tensor, reward: torch.Tensor, decile: float = 0.1
 ) -> float | None:
     """Mean rho over the CURRENT worst-scored correct traces.

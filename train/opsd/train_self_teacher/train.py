@@ -79,10 +79,10 @@ from train.opsd.train_self_teacher.lib import (
     objective_endpoint,
     objective_pointwise,
     penalized_correct_indices,
-    penalized_correct_mean,
     rollout_path,
     teacher_prompt_template,
     teacher_token_logps,
+    worst_correct_mean,
 )
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
@@ -251,7 +251,7 @@ class SelfTeacherTrainer(Trainer):
 
         # Also retain the moving tail under an explicit name: it answers the distinct question
         # "does the teacher still heavily penalize any correct traces?"
-        current_worst = penalized_correct_mean(ratios, mask, reward)
+        current_worst = worst_correct_mean(ratios, mask, reward)
         if current_worst is not None:
             metrics["current_worst_correct_mean"] = current_worst
         return metrics
