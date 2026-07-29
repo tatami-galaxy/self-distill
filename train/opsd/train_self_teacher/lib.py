@@ -425,15 +425,12 @@ def objective_pointwise(
 ) -> torch.Tensor:
     """(c) Regress each token's rho_t towards the outcome.
 
-    The sharpest instrument for "stop penalizing off-PI exploration". With the squared form its
-    gradient w.r.t. the teacher is
+    With the squared form its gradient w.r.t. the teacher is
 
         sum_t 2*(rho_t - target) * grad log pi_phi(y_t | x, c, y_<t)
 
     i.e. WEIGHTED SFT of the teacher on the student's own trace, with per-token weight
-    (target - rho_t). On a correct trace the tokens the teacher currently likes LEAST -- large
-    negative rho_t, which is exactly the off-PI deviation -- carry the largest upward push. That
-    concentration is the whole point of this variant.
+    (target - rho_t).
 
     `squared` regresses the RAW ratio onto a bounded target +/- tau (nats per token). Two
     deliberate choices:
@@ -451,6 +448,8 @@ def objective_pointwise(
     """
     reward = reward.unsqueeze(1)  # (B, 1) -> broadcast over tokens
     if loss == "squared":
+        # 2R - 1 makes the target symmetric around the meaningful baseline \(\rho=0\),
+        # while \(\tau\) limits how far the teacher moves away from the student
         target = tau * (2.0 * reward - 1.0)
         return _masked_mean((ratios - target) ** 2, mask)
     if loss == "logistic":

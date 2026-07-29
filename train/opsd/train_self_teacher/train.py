@@ -503,19 +503,15 @@ def main():
                         "--pi-mode full only.")
     # objective
     p.add_argument("--objective", default="pointwise", choices=["pointwise", "endpoint"],
-                   help="'pointwise' (c) regresses every rho_t towards +/-tau -- sharpest pull on "
-                        "the tokens the teacher penalizes most, but flattens at its fixed point. "
-                        "'endpoint' (a) regresses only the trace total -- gentler, and cannot "
-                        "flatten because per-token allocation stays free.")
+                   help="pointwise regresses every rho_t towards +/-tau; "
+                        "endpoint regresses only the trace total.")
     p.add_argument("--pointwise-loss", default="squared", choices=["squared", "logistic"],
                    help="For --objective pointwise. 'squared' targets a bounded +/-tau on the RAW "
                         "ratio (finite fixed point). 'logistic' is BCE on beta*rho, whose gradient "
                         "saturates at a constant rather than vanishing -- use it if the bounded "
-                        "target is reached before the ratio becomes informative. Squared error on "
-                        "a SIGMOID is deliberately not offered: its sigma' factor vanishes exactly "
-                        "on the most-penalized tokens this arm targets.")
+                        "target is reached before the ratio becomes informative.")
     p.add_argument("--tau", type=float, default=0.1,
-                   help="Target separation in nats per token for --pointwise-loss squared.")
+                   help="Target magnitude in nats per token for --pointwise-loss squared.")
     p.add_argument("--beta", type=float, default=1.0,
                    help="Scale on the ratio inside the sigmoid (endpoint / logistic).")
     p.add_argument("--length-norm", default="mean", choices=list(LENGTH_NORMS),
@@ -541,7 +537,7 @@ def main():
     p.add_argument("--optim", default="adamw_bnb_8bit",
                    help="Nothing here uses vLLM, so train_ppo.py's server-mode 8-bit hazard does "
                         "not apply (same reasoning as train_sft.py).")
-    p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     # diagnostics
@@ -558,7 +554,7 @@ def main():
                    help="Question-grouped folds for out-of-fold Platt Brier diagnostics.")
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=50)
+    p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     # resume
