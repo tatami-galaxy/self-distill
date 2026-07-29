@@ -61,6 +61,11 @@ from utils import (
 # PI_* templates, so "hint" means the same string in every arm of the study.
 PI_MODES = ("hint", "answer", "full", "none")
 
+# Every local bf16 scoring/training forward over ragged sequences is one sequence wide. Changing
+# the padded tensor shape can change finite-precision kernel selection/operation order; the
+# resulting logit shifts were locally large enough to contaminate the teacher/student ratio.
+MODEL_FORWARD_BATCH_SIZE = 1
+
 # Stamped into stage-2 run_meta.json and carried into stage 3 as a strict resume key. Bump it
 # when a change alters what the trained teacher's weights MEAN (the objective family, the ratio
 # definition, the prompt convention) -- not for ordinary hyperparameters, which are recorded
@@ -243,8 +248,10 @@ def collate_teacher_batch(rows: list[dict], pad_token_id: int) -> dict:
     prompt's real tokens flush against the completion, so the logits that score the first
     completion token come off the generation header rather than a pad. (The same invariant
     train_ppo_val.py's tests pin for the critic; here it decides whether rho_1 is meaningful.)
-    Trailing pads on the completion are harmless -- they sit after every real token and are
-    removed by `completion_mask`.
+    Production forwards contain exactly one row, so `pad` adds no tokens. The layout rules remain
+    explicit because this helper is also tested with multiple rows. Trailing completion pads are
+    excluded from downstream objectives by `completion_mask`; they are not assumed to be
+    numerically inert inside a multi-row model forward.
     """
     prompts = [torch.tensor(r["teacher_prompt_ids"], dtype=torch.long) for r in rows]
     completions = [torch.tensor(r["completion_ids"], dtype=torch.long) for r in rows]
@@ -276,7 +283,9 @@ def teacher_inputs(batch: dict) -> tuple[torch.Tensor, torch.Tensor, int]:
     """`[teacher_prompt || completion]` -> (input_ids, attention_mask, logits_to_keep).
 
     Same shape of contract as `PPOTrainer._value_inputs`: a longer teacher prompt shifts nothing,
-    because the completion's logprobs are sliced from the END of the sequence.
+    because the completion's logprobs are sliced from the END of the sequence. The mask remains
+    useful for checking/carrying the collator layout; the strict unpadded batch-one logprob
+    forward does not need to pass it to the model.
     """
     input_ids = torch.cat([batch["teacher_prompt_ids"], batch["completion_ids"]], dim=1)
     attention_mask = torch.cat([batch["teacher_prompt_mask"], batch["completion_mask"]], dim=1)
@@ -305,8 +314,9 @@ def _selective_logps_fp32(
     Qwen3-1.7B: the `--pi-mode none` control, where teacher and student are the same weights on
     the same tokens and rho is therefore ZERO analytically, read a `ratio_dispersion` of 0.041
     through the bf16 path -- a noise floor half the size of the default --tau of 0.1. Returning
-    float32 halved it to 0.023. (The rest was input padding, not the log-softmax; see
-    `per_token_logps`.)
+    float32 halved it to 0.023; the remainder disappeared when the two inputs were evaluated as
+    unpadded batch-one tensors (see `per_token_logps`). These numbers are local measurements, not
+    general error bounds for Qwen or bfloat16.
 
     The gather-minus-logsumexp form (rather than a full log_softmax) avoids materializing a
     second (B, C, V) tensor, and is numerically stable once the inputs are float32 -- which is
@@ -324,49 +334,49 @@ def _selective_logps_fp32(
 
 
 def per_token_logps(
-    model, input_ids: torch.Tensor, attention_mask: torch.Tensor, completion_ids: torch.Tensor
+    model, input_ids: torch.Tensor, completion_ids: torch.Tensor
 ) -> torch.Tensor:
-    """Log-probabilities of `completion_ids` under `model`, aligned to the completion -> (B, C).
-
-    Position i's logits predict token i+1, so the C completion tokens are scored by the C logit
-    positions ending one before the last. `logits_to_keep=C+1` asks the model for exactly those
-    (plus the trailing one we drop), which matters a lot here: a full (B, L, 151669) logit tensor
-    at L~8k is several GB, and this is the tensor the backward pass has to hold.
+    """Log-probabilities of `completion_ids` under `model` -> (1, C).
 
     Temperature is NOT applied. The ratio is between two raw next-token distributions; stage 1
     scores the student the same way, so the two are directly subtractable.
 
-    POSITION IDS ARE PASSED EXPLICITLY. Left unset, transformers derives them as a bare `arange`
-    over the padded sequence (`modeling_qwen3.py:399`: `torch.arange(inputs_embeds.shape[1]) +
-    past_seen_tokens`) with no reference to the attention mask, so a left-padded row's real
-    tokens are evaluated at RoPE positions shifted by that row's own pad count. Inside one GRPO
-    step that cancels, because every forward shares a padding layout; it does NOT cancel across
-    our two stages, which pad differently. `cumsum(-1) - 1` restarts each row at position 0 on
-    its first real token, so the forward means the same thing at any padding.
+    `input_ids` is one unpadded `[prompt || completion]` sequence. Position i predicts token i+1,
+    so asking for C+1 trailing logits and dropping the last aligns the remaining C positions with
+    `completion_ids`. Avoiding a full (1, L, V) logit tensor also saves several GB at L~8k.
 
-    IT IS NOT SUFFICIENT, THOUGH -- DO NOT PAD THESE FORWARDS. Fixing the positions left the
-    `--pi-mode none` control's spurious dispersion essentially unchanged (0.0228 -> 0.0225),
-    because the remaining error is bfloat16 arithmetic, not geometry: attention over pad
-    positions perturbs the real tokens' logits even though the mask removes their contribution
-    exactly. Measured on Qwen3-1.7B, same row, mask-derived positions throughout:
+    The physical batch-one contract is enforced here rather than left to every caller. With a
+    correct mask and position IDs, padded and unpadded forwards are mathematically equivalent.
+    They need not be numerically identical: changing tensor shape can change GEMM/SDPA kernels,
+    tiling, and reduction order, and bfloat16 makes the resulting roundoff easier to see. PyTorch
+    documents this class of behavior under "Numerical accuracy"; this is not evidence that pads
+    semantically leak through the attention mask.
+
+    Locally measured on Qwen3-1.7B:
 
         17 left pads   std 0.031, max |d| 0.12
         64 left pads   std 0.035, max |d| 0.30
         batched B=2 at EQUAL width          std 0.0      (bit-identical)
         17 left pads, fp32 WEIGHTS          std 0.00001
 
-    So the cost is padding, not batching, and it is comparable to the entire scale of rho. Every
-    caller therefore scores UNPADDED by default -- gen_rollouts' --score-batch-size 1, stage 2's
-    --diag-batch-size 1, and per_device_train_batch_size 1 -- which also makes all three agree
-    with the batch-size-1 forward TRL performs in stage 3.
+    No attention mask or explicit position IDs are needed for a single unpadded sequence: the
+    model's ordinary causal mask and arange positions are exactly the intended inputs.
     """
+    if input_ids.ndim != 2 or completion_ids.ndim != 2:
+        raise ValueError("per_token_logps expects rank-2 input_ids and completion_ids")
+    if (
+        input_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
+        or completion_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
+    ):
+        raise ValueError(
+            f"per_token_logps requires physical batch size {MODEL_FORWARD_BATCH_SIZE}; "
+            "accumulate gradients instead of padding model inputs"
+        )
     n_completion = completion_ids.size(1)
-    position_ids = attention_mask.long().cumsum(dim=-1) - 1
-    position_ids = position_ids.clamp(min=0)
+    if input_ids.size(1) <= n_completion:
+        raise ValueError("input_ids must contain a non-empty prompt before completion_ids")
     logits = model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
         logits_to_keep=n_completion + 1,
         use_cache=False,
     ).logits
@@ -379,8 +389,8 @@ def concat_padded(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
 
     Lets a diagnostic pass collate and forward each chunk at its OWN width -- unpadded at chunk
     size 1 -- and only then assemble the results. Padding the resulting rho/mask tensors is free
-    and lossless, because every metric here is mask-weighted; padding the model's INPUT is not
-    (see `per_token_logps`).
+    and lossless, because every metric here is mask-weighted. Padding the model input instead
+    changes its tensor shape and can change finite-precision numerics (see `per_token_logps`).
     """
     width = max(tensor.size(1) for tensor in tensors)
     return torch.cat(
@@ -395,8 +405,8 @@ def teacher_token_logps(model, batch: dict) -> torch.Tensor:
     -- so composing the two here keeps the redundant third element from being splatted into the
     wrong argument at each of the three call sites.
     """
-    input_ids, attention_mask, _ = teacher_inputs(batch)
-    return per_token_logps(model, input_ids, attention_mask, batch["completion_ids"])
+    input_ids, _, _ = teacher_inputs(batch)
+    return per_token_logps(model, input_ids, batch["completion_ids"])
 
 
 def log_ratio(teacher_logps: torch.Tensor, batch: dict) -> torch.Tensor:

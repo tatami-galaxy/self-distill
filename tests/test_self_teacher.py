@@ -172,10 +172,13 @@ class CollationAlignmentTest(unittest.TestCase):
 class NumericalPrecisionTest(unittest.TestCase):
     """rho is a difference of two nearly-equal logprobs, so precision here IS the signal.
 
-    Measured on Qwen3-1.7B with the `--pi-mode none` control, where rho is analytically zero:
-    bf16 logprobs + padded inputs read a spurious `ratio_dispersion` of 0.041; float32 logprobs
-    halved it to 0.023; unpadded inputs took it to exactly 0. These pin the two code-level
-    properties that got it there.
+    Locally measured on Qwen3-1.7B with the `--pi-mode none` control, where rho is analytically
+    zero: bf16 logprobs + padded inputs read a spurious `ratio_dispersion` of 0.041; float32
+    logprobs halved it to 0.023; unpadded inputs took it to exactly 0. The padded and unpadded
+    forwards are mathematically equivalent with correct masks/positions, but shape-dependent
+    finite-precision kernels need not be bitwise identical. These tests pin the two code-level
+    properties that removed the measured noise; they do not identify attention-mask leakage as
+    its cause.
     """
 
     class RecordingModel:
@@ -185,39 +188,36 @@ class NumericalPrecisionTest(unittest.TestCase):
             self.vocab = vocab
             self.calls = []
 
-        def __call__(self, input_ids, attention_mask, position_ids, logits_to_keep, use_cache):
-            self.calls.append({"position_ids": position_ids, "logits_to_keep": logits_to_keep})
+        def __call__(self, input_ids, logits_to_keep, use_cache):
+            self.calls.append({"input_ids": input_ids, "logits_to_keep": logits_to_keep})
             logits = torch.zeros(
                 input_ids.size(0), logits_to_keep, self.vocab, dtype=torch.bfloat16
             )
             return types.SimpleNamespace(logits=logits)
 
-    def test_position_ids_come_from_the_mask_not_a_bare_arange(self):
-        # A bare arange would give the left-padded row [0,1,2,3,4]; deriving from the mask
-        # restarts its real tokens at 0, so the forward means the same thing at any padding.
+    def test_physical_batches_larger_than_one_are_rejected(self):
         from train.opsd.train_self_teacher.lib import per_token_logps
 
         model = self.RecordingModel()
-        input_ids = torch.tensor([[0, 0, 5, 6, 7], [1, 2, 3, 4, 5]])
-        attention_mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
-        per_token_logps(model, input_ids, attention_mask, torch.tensor([[6, 7], [4, 5]]))
-
-        self.assertTrue(torch.equal(
-            model.calls[0]["position_ids"],
-            torch.tensor([[0, 0, 0, 1, 2], [0, 1, 2, 3, 4]]),
-        ))
-        # Only the C+1 trailing logit positions are requested; a full-length logit tensor is
-        # several GB at these sequence lengths.
-        self.assertEqual(model.calls[0]["logits_to_keep"], 3)
+        with self.assertRaisesRegex(ValueError, "physical batch size 1"):
+            per_token_logps(
+                model,
+                torch.tensor([[5, 6, 7], [3, 4, 5]]),
+                torch.tensor([[6, 7], [4, 5]]),
+            )
+        self.assertEqual(model.calls, [])
 
     def test_logps_are_float32_even_from_bfloat16_logits(self):
         from train.opsd.train_self_teacher.lib import per_token_logps
 
         model = self.RecordingModel()
         logps = per_token_logps(
-            model, torch.tensor([[1, 2, 3]]), torch.tensor([[1, 1, 1]]), torch.tensor([[2, 3]])
+            model, torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3]])
         )
         self.assertEqual(logps.dtype, torch.float32)
+        # Only the C+1 trailing logit positions are requested; a full-length logit tensor is
+        # several GB at these sequence lengths.
+        self.assertEqual(model.calls[0]["logits_to_keep"], 3)
 
     def test_fp32_logps_match_a_reference_log_softmax(self):
         from train.opsd.train_self_teacher.lib import _selective_logps_fp32
@@ -717,8 +717,7 @@ class StageThreeResumeTest(unittest.TestCase):
             model="Qwen/Qwen3-4B", dataset="deepmath", max_samples=None, pi_mode=pi_mode,
             teacher_path="/tmp/teacher/final", distillation_mode="sampled_token",
             distillation_alpha=1.0, learning_rate=1e-5, seed=42,
-            per_device_train_batch_size=1, gradient_accumulation_steps=16,
-            num_generations=1, max_prompt_length=8192,
+            gradient_accumulation_steps=16, num_generations=1, max_prompt_length=8192,
         )
 
     def make_checkpoint(self, tmp, prior_meta):
@@ -758,6 +757,14 @@ class StageThreeResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ckpt = self.make_checkpoint(tmp, dict(meta))
             validate_resume(ckpt, meta, strict_keys=("teacher_version",))
+
+    def test_physical_forward_batch_is_fixed_to_one(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
+
+        meta = build_run_meta(
+            self.make_args(), {"teacher_version": "logratio_v1", "objective": "pointwise"}, 100
+        )
+        self.assertEqual(meta["per_device_train_batch_size"], 1)
 
     def test_none_mode_records_the_concatenating_template(self):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta

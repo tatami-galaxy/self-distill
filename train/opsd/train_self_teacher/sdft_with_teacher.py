@@ -17,6 +17,10 @@ USE --distillation-mode sampled_token (the default). The E-step constrains the r
 tokens the student actually sampled; the teacher's off-sample probability mass is unconstrained
 and free to have drifted. Under `topk_logits` / `full_logits` the student would chase that drift.
 
+PHYSICAL MODEL BATCH SIZE IS FIXED TO 1. TRL buffers generated samples and splits them into
+per-device microbatches before the teacher/student forwards, so --num-generations remains an
+independent experiment knob. Use gradient accumulation for a larger effective training batch.
+
 # stage 3 against a hint-PI teacher trained with the pointwise objective
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.sdft_with_teacher \
     --model Qwen/Qwen3-4B --dataset deepmath --pi-mode hint \
@@ -37,7 +41,12 @@ import torch
 from transformers import AutoModelForCausalLM
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
-from train.opsd.train_self_teacher.lib import PI_MODES, TEACHER_VERSION, teacher_prompt_template
+from train.opsd.train_self_teacher.lib import (
+    MODEL_FORWARD_BATCH_SIZE,
+    PI_MODES,
+    TEACHER_VERSION,
+    teacher_prompt_template,
+)
 from train.opsd.train_sdft import build_sdft_dataset
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
@@ -145,7 +154,7 @@ def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
         "learning_rate": args.learning_rate,
         # resume-critical: dataset order + batch chunking.
         "seed": args.seed,
-        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_train_batch_size": MODEL_FORWARD_BATCH_SIZE,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_generations": args.num_generations,
         "max_prompt_length": args.max_prompt_length,
@@ -192,8 +201,8 @@ def main():
     # generation
     p.add_argument("--max-prompt-length", type=int, default=8192)
     p.add_argument("--max-completion-length", type=int, default=8192)
-    p.add_argument("--num-generations", type=int, default=1)
     # optimization
+    p.add_argument("--num-generations", type=int, default=1)
     p.add_argument("--learning-rate", type=float, default=1e-5,
                    help="Matches train_sdft.py so the two arms differ only in the teacher.")
     p.add_argument("--lr-scheduler-type", default="constant",
@@ -202,7 +211,6 @@ def main():
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--optim", default="adamw_bnb_8bit")
     p.add_argument("--max-steps", type=int, default=200)
-    p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     # vLLM
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
@@ -219,8 +227,8 @@ def main():
     p.add_argument("--resume-from-checkpoint", default=None,
                    help="Resume dir ('checkpoint-<step>'). The teacher needs no restoring -- it is "
                         "frozen and re-loaded from --teacher-path. Pass the SAME --model, "
-                        "--dataset, --pi-mode, --teacher-path, --seed and batch config as the "
-                        "original run (verified against its run_meta.json).")
+                        "--dataset, --pi-mode, --teacher-path, --seed and gradient accumulation "
+                        "as the original run (verified against its run_meta.json).")
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
@@ -310,7 +318,7 @@ def main():
         warmup_steps=args.warmup_steps,
         optim=args.optim,
         max_steps=args.max_steps,
-        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_train_batch_size=MODEL_FORWARD_BATCH_SIZE,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
         bf16=True,

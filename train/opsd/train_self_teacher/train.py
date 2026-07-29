@@ -66,6 +66,7 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 from train.opsd.train_self_teacher.lib import (
     LENGTH_NORMS,
+    MODEL_FORWARD_BATCH_SIZE,
     PI_MODES,
     TEACHER_VERSION,
     build_teacher_dataset,
@@ -100,7 +101,7 @@ class SelfTeacherTrainer(Trainer):
     """HF Trainer whose loss is the outcome regression on the teacher:student log ratio."""
 
     def __init__(self, *args, objective, pointwise_loss, tau, beta, length_norm,
-                 bias_learning_rate, kl_anchor, diag_batch_size=4, diag_crossfit_folds=5,
+                 bias_learning_rate, kl_anchor, diag_crossfit_folds=5,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.objective = objective
@@ -111,7 +112,6 @@ class SelfTeacherTrainer(Trainer):
         self.bias_learning_rate = bias_learning_rate
         self.kl_anchor = kl_anchor
         self.diag_crossfit_folds = diag_crossfit_folds
-        self.diag_batch_size = diag_batch_size
         # VPD's delta: one scalar absorbing the outcome base rate so the ratio does not have to
         # encode it, and the "shift every rho by a constant" degenerate solution is unavailable.
         self.calibration_bias = nn.Parameter(
@@ -210,13 +210,14 @@ class SelfTeacherTrainer(Trainer):
         FIXED rows, so every reading is on the same traces and a change in a metric is a change
         in the teacher rather than a change in the sample.
 
-        Each chunk is collated SEPARATELY, at `diag_batch_size` (default 1). Two reasons, and
-        both are load-bearing:
-          * unpadded. Padding the input shifts rho by ~0.03 nats in bf16 -- a third of --tau, on
-            the very metric this stage exists to produce (see self_teacher.per_token_logps).
-          * bounded. One forward over all --diag-rows would be a (rows, C, 151669) logit tensor,
-            79GB at the defaults; no_grad does not help, since it must exist to be reduced.
-        The per-chunk results are padded and assembled AFTERWARDS, which is lossless because
+        Each row is collated and forwarded separately. Two reasons are load-bearing:
+          * unpadded. In our Qwen3-1.7B measurements, changing the padded input shape shifted rho
+            by ~0.03 nats in bf16 -- a third of --tau. This is consistent with shape-dependent
+            finite-precision kernels, not evidence of semantic attention-mask leakage
+            (see self_teacher.per_token_logps).
+          * bounded. One forward over all --diag-rows would materialize a huge (rows, C, vocab)
+            logit tensor; no_grad does not help, since it must exist to be reduced.
+        Per-row results are padded and assembled AFTERWARDS, which is lossless because
         every metric below is mask-weighted.
         """
         if not self._diag_rows:
@@ -226,8 +227,8 @@ class SelfTeacherTrainer(Trainer):
         self.model.eval()
         ratio_chunks, mask_chunks, reward_chunks = [], [], []
         try:
-            for start in range(0, len(self._diag_rows), self.diag_batch_size):
-                chunk = self._diag_rows[start : start + self.diag_batch_size]
+            for start in range(0, len(self._diag_rows), MODEL_FORWARD_BATCH_SIZE):
+                chunk = self._diag_rows[start : start + MODEL_FORWARD_BATCH_SIZE]
                 batch = {k: v.to(device) for k, v in self._diag_collate(chunk).items()}
                 logps = teacher_token_logps(self.model, batch)
                 ratio_chunks.append(log_ratio(logps, batch))
@@ -316,7 +317,7 @@ class SelfTeacherTrainer(Trainer):
 # ---------------------------------------------------------------------------
 
 
-def add_init_teacher_logps(dataset, model, collate, batch_size: int, device) -> "Dataset":
+def add_init_teacher_logps(dataset, model, collate, device) -> "Dataset":
     """Score every row under the UNTRAINED teacher, so the anchor has something to pull towards.
 
     One no-grad pass at startup. Only run when --kl-anchor > 0; otherwise the column is absent
@@ -327,8 +328,8 @@ def add_init_teacher_logps(dataset, model, collate, batch_size: int, device) -> 
     model.eval()
     all_logps: list[list[float]] = []
     try:
-        for start in range(0, len(dataset), batch_size):
-            rows = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
+        for start in range(0, len(dataset), MODEL_FORWARD_BATCH_SIZE):
+            rows = [dataset[start]]
             batch = {k: v.to(device) for k, v in collate(rows).items()}
             with torch.no_grad():
                 logps = teacher_token_logps(model, batch).float().cpu()
@@ -469,7 +470,7 @@ def build_run_meta(
         "bias_learning_rate": args.bias_learning_rate,
         # resume-critical: dataset order + batch chunking.
         "seed": args.seed,
-        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_train_batch_size": MODEL_FORWARD_BATCH_SIZE,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
     }
 
@@ -545,7 +546,6 @@ def main():
                    help="Nothing here uses vLLM, so train_ppo.py's server-mode 8-bit hazard does "
                         "not apply (same reasoning as train_sft.py).")
     p.add_argument("--max-steps", type=int, default=200)
-    p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     # diagnostics
@@ -560,13 +560,6 @@ def main():
                         "rows never reach the optimizer.")
     p.add_argument("--diag-crossfit-folds", type=int, default=5,
                    help="Question-grouped folds for out-of-fold Platt Brier diagnostics.")
-    p.add_argument("--diag-batch-size", type=int, default=1,
-                   help="Forward chunk for the diagnostic pass and the --kl-anchor pre-pass. "
-                        "Defaults to 1 for CORRECTNESS, not caution: any value above 1 pads the "
-                        "shorter rows in the chunk, and bf16 attention over pad positions shifts "
-                        "the real tokens' logprobs by ~0.03 nats -- a third of the default --tau, "
-                        "landing straight on the metric this stage exists to produce. Stage 1 "
-                        "scores the student unpadded for the same reason.")
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=50)
@@ -576,8 +569,8 @@ def main():
     p.add_argument("--resume-from-checkpoint", default=None,
                    help="Resume dir ('checkpoint-<step>'). Restores the teacher, the calibration "
                         "bias, the optimizer/scheduler/RNG, and skips seen rows. Pass the SAME "
-                        "--model, --dataset, --pi-mode, --objective, --seed and batch config as "
-                        "the original run (verified against its run_meta.json).")
+                        "--model, --dataset, --pi-mode, --objective, --seed and gradient "
+                        "accumulation as the original run (verified against its run_meta.json).")
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
@@ -689,7 +682,7 @@ def main():
         warmup_steps=args.warmup_steps,
         optim=args.optim,
         max_steps=args.max_steps,
-        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_train_batch_size=MODEL_FORWARD_BATCH_SIZE,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -735,13 +728,12 @@ def main():
         length_norm=args.length_norm,
         bias_learning_rate=args.bias_learning_rate,
         kl_anchor=args.kl_anchor,
-        diag_batch_size=args.diag_batch_size,
         diag_crossfit_folds=args.diag_crossfit_folds,
     )
 
     if args.kl_anchor > 0.0:
         train_dataset = add_init_teacher_logps(
-            train_dataset, trainer.model, collate, args.diag_batch_size,
+            train_dataset, trainer.model, collate,
             trainer.accelerator.device,
         )
         trainer.train_dataset = train_dataset

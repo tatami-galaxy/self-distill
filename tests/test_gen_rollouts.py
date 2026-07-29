@@ -14,7 +14,11 @@ class RolloutCliTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "stage"))
         self.assertFalse(hasattr(args, "questions_from"))
 
-        for removed_args in (["--stage", "score"], ["--questions-from", "dataset"]):
+        for removed_args in (
+            ["--stage", "score"],
+            ["--questions-from", "dataset"],
+            ["--score-batch-size", "2"],
+        ):
             with self.subTest(args=removed_args):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     parser.parse_args(removed_args)
