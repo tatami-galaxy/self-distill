@@ -496,7 +496,7 @@ def main():
                         "and the rollouts were sampled without it): 'hint' precomputed self-hints, "
                         "'answer' the boxed gold, 'full' the worked solution, 'none' the matched "
                         "control where rho starts at exactly 0 everywhere.")
-    p.add_argument("--max-teacher-prompt-length", type=int, default=4096,
+    p.add_argument("--max-teacher-prompt-length", type=int, default=8192,
                    help="Rows whose teacher prompt exceeds this are DROPPED, not truncated: the "
                         "user turn is '{question}\\n\\n{PI}', so left-truncation would remove the "
                         "question and the chat template header and keep the demo. Binding for "
@@ -597,6 +597,8 @@ def main():
             f"first:\n  python -m train.opsd.train_self_teacher.gen_rollouts --model {args.model} "
             f"--dataset {args.dataset}"
         )
+    # question, final_answer, completion_ids, completion_text, reward, n_tokens,
+    # gen_model, dataset, question_source, student_logps
     rollouts = load_from_disk(cache_dir)
     gen_models = set(rollouts.unique("gen_model"))
     if gen_models != {args.model}:

@@ -112,20 +112,7 @@ def privileged_context(row: dict, pi_mode: str) -> str:
 
 def teacher_prompt_template(pi_mode: str) -> str:
     """The `{prompt}`/`{privileged_context}` template this PI mode stitches with.
-
     Everything except `none` uses SDFTTrainer's default, `"{prompt}\\n\\n{privileged_context}"`.
-
-    `none` uses a bare concatenation instead, and the reason is not cosmetic. TRL applies the
-    template UNCONDITIONALLY, so under the default an empty context still appends "\\n\\n" and the
-    teacher reads a context the student never saw. The whole point of the `none` arm is that at
-    init the teacher is the student under an IDENTICAL context, giving rho_t == 0 at every
-    position -- a hard, checkable null in which every bit of signal provably comes from the
-    E-step, and under which an untrained teacher makes stage 3 an exact no-op. Two trailing
-    newlines would quietly destroy that.
-
-    Stage 2 uses this to build its prompts and stage 3 passes it to SDFTConfig, so the teacher
-    reads the same context when it is trained and when it scores. Both stamp it into
-    run_meta.json and stage 3 verifies the two agree.
     """
     return "{prompt}{privileged_context}" if pi_mode == "none" else TEACHER_PROMPT_TEMPLATE
 
@@ -197,6 +184,7 @@ def build_teacher_dataset(
         # another dataset cannot reach the teacher (the "self-hint purity" invariant).
         hints = load_hint_cache(rollouts.unique("gen_model")[0], dataset)
         pi_by_question = {r["question"]: r for r in hints}
+
     elif pi_mode == "full":
         pi_by_question = {r["question"]: r for r in load_train_dataset(dataset)}
 
