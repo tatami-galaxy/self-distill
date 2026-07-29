@@ -1,8 +1,8 @@
 r"""
 Stage 2 of the trained-self-teacher arm: regress the teacher:student log ratio onto the verified
-outcome. THE OFFLINE E-STEP.
+outcome.
 
-This never touches a student optimizer. It reads the frozen-student rollouts cached by
+It reads the frozen-student rollouts cached by
 train/opsd/train_self_teacher/gen_rollouts.py, attaches a privileged context, and trains a copy of the student -- the
 teacher -- so that
 
@@ -11,20 +11,16 @@ teacher -- so that
 predicts whether the rollout it came from was correct. Two objectives (see train/opsd/train_self_teacher/lib.py
 for the full rationale):
 
-  --objective pointwise   (c) regress each rho_t towards +/- tau. Sharpest corrective: its
-                          gradient is weighted SFT on the student's trace with per-token weight
-                          (target - rho_t), so the tokens the teacher currently penalizes MOST --
-                          off-PI exploration that nonetheless worked -- get the largest push.
+  --objective pointwise : regress each rho_t towards +/- tau.
                           Its fixed point is a flat advantage, so it is meant to be run as a
                           bounded nudge, not to convergence. Watch `ratio_dispersion`.
-  --objective endpoint    (a) regress only the trace total sigmoid(beta*S_T/N + b). One
-                          constraint per trace instead of one per token, so per-token allocation
+  --objective endpoint  : regress only the trace total sigmoid(beta*S_T/N + b).
+                          One constraint per trace instead of one per token, so per-token allocation
                           stays free and credit can be sparse. Gentler, cannot flatten.
 
-READ THE DIAGNOSTICS, THEY ARE THE DELIVERABLE. Stage 3 is only worth a GPU if this stage shows
-the ratio became outcome-predictive. The go/no-go is INIT vs TRAINED, printed at startup and
-written to diagnostics_init.json. Diagnostics use COMPLETE HELD-OUT QUESTIONS: no rollout from a
-diagnostic question reaches the optimizer.
+Stage 3 is only worth if this stage shows the ratio became outcome-predictive :
+INIT vs TRAINED, printed at startup and written to diagnostics_init.json.
+Diagnostics use COMPLETE HELD-OUT QUESTIONS: no rollout from a diagnostic question reaches the optimizer.
 
   within_question_auc_q*       the shortcut-resistant headline. Macro AUC over held-out questions
                                with both outcomes; 0.5 means the score only knows difficulty.
