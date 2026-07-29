@@ -4,50 +4,40 @@ and record the student's own log-probabilities for the sampled tokens.
 
 Run ONCE per (model, dataset). The rollouts are drawn from the student's UN-PRIVILEGED prompt --
 the PI only enters when the teacher scores them in stage 2 -- so a single cache serves every
-`--pi-mode`. Generation is paid once for the whole PI ladder.
+`--pi-mode`.
 
 Why the student's logprobs are cached here rather than recomputed in stage 2: the student is
 frozen for the entire E-step, so `log pi_theta(y_t | x, y_<t)` is a constant of the problem.
-Caching it means stage 2 holds only the teacher in memory and a sweep over objectives / beta /
-tau costs one forward per step instead of two. The cached values come from a TRAINING forward
-(HF, bf16), not from vLLM's sampler, because that is the quantity stage 2's ratio is defined
-against -- vLLM and HF disagree slightly on logprobs, which is the same train/infer mismatch
-GRPO corrects for with `importance_sampling_ratio`.
+Caching it means stage 2 holds only the teacher in memory.
 
 MULTIPLE ROLLOUTS PER PROMPT MATTER. With one rollout per question the teacher can drive the
-E-step loss down by reading the QUESTION's difficulty and ignoring the trace entirely -- a
-shortcut that looks like success on every calibration metric. Sampling `--n` rollouts means the
-same question appears with different outcomes, so difficulty alone cannot explain the label.
-The mixed-outcome fraction is reported below, and `--mixed-only` keeps just those questions.
-(`value_at_start` in stage 2's diagnostics is the corresponding guard at read time.)
+E-step loss down by reading the QUESTION's difficulty and ignoring the trace entirely. Sampling
+`--n` rollouts means the same question appears with different outcomes, so stage 2 can measure
+within-question discrimination. The mixed-outcome fraction is reported below, and `--mixed-only`
+keeps just those questions.
 
 Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns
 question, final_answer, completion_ids, completion_text, reward, student_logps, n_tokens,
 gen_model, dataset.
 
-SCORING RUNS IN A SUBPROCESS, and that is a correctness requirement rather than hygiene.
+SCORING ALWAYS RUNS IN A SPAWNED PROCESS, and that is a correctness requirement rather than
+hygiene.
 Initialising vLLM leaves global torch state altered, and freeing the engine does not restore it,
 so an HF forward that follows vLLM in the same process gives measurably different logprobs from
 the same forward in a clean one (Qwen3-1.7B, identical inputs: 1741/3072 tokens differing, std
 0.045, max 0.39). Stage 2 runs without vLLM, so that whole difference would land on rho -- the
 `--pi-mode none` control, where rho is analytically zero, reads 0.043 off a same-process cache
-and exactly 0.000 off a subprocess-scored one. `--stage all` therefore re-invokes this module
-with `--stage score`.
+and exactly 0.000 off a subprocess-scored one.
 
-# generate + score (the subprocess split is automatic)
+# Generate/reuse rollouts and score them; the clean-process boundary is automatic.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 1024 --n 4
-
-# or drive the halves by hand, e.g. to put them on different GPUs
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts --stage generate ...
-CUDA_VISIBLE_DEVICES=1 uv run python -m train.opsd.train_self_teacher.gen_rollouts --stage score ...
 """
 
 import argparse
 import gc
+import multiprocessing
 import os
-import subprocess
-import sys
 from collections import defaultdict
 
 import torch
@@ -136,7 +126,7 @@ def generate(args, out_dir: str) -> None:
     if mixed_rate < 0.2:
         print("  warning: few questions carry both outcomes, so the teacher can fit the label "
               "from question difficulty alone. Raise --n, or pick a dataset slice nearer this "
-              "model's ability. Watch `value_at_start` in stage 2.")
+              "model's ability. Watch `within_question_auc_q*` in stage 2.")
     if args.mixed_only:
         by_question = defaultdict(list)
         for row in rows:
@@ -227,24 +217,32 @@ def score(args, out_dir: str) -> None:
     print(f"Added student_logps -> {out_dir}")
 
 
-def main():
+def score_in_clean_process(args, out_dir: str) -> None:
+    """Score in a fresh interpreter so vLLM's Torch mutations cannot contaminate logprobs."""
+    print("Scoring in a clean subprocess (vLLM has perturbed this process's torch state)")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=score, args=(args, out_dir))
+    process.start()
+    process.join()
+    exitcode = process.exitcode
+    process.close()
+    if exitcode != 0:
+        raise RuntimeError(f"Rollout scoring subprocess failed with exit code {exitcode}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--model", default="Qwen/Qwen3-4B",
-                   help="The frozen student. MUST be the model trained in stage 3 -- the rollouts "
-                        "are only on-policy for the weights that produced them.")
+                   help="The frozen student. MUST be the model trained in stage 3.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()))
     p.add_argument("--output-root", default="data/rollouts")
     p.add_argument("--max-samples", type=int, default=1024,
                    help="Questions to roll out. Total rollouts = this x --n.")
     p.add_argument("--questions-from", default="hints", choices=["hints", "dataset"],
                    help="Where the questions come from. 'hints' (default) uses this model's hint "
-                        "cache, which is the INTERSECTION every --pi-mode can serve: the hint arm "
-                        "can only use questions that have a hint, and the cache keeps ~1/5 of the "
-                        "dataset. That both avoids wasting most of the generation pass and gives "
-                        "all four PI arms an identical question set. Use 'dataset' only when no "
-                        "hint arm is planned; run utils.gen_hints first otherwise.")
+                        "cache, which is the INTERSECTION every --pi-mode can serve.")
     p.add_argument("--n", type=int, default=4,
                    help="Rollouts per question. >1 is what stops the teacher fitting the outcome "
                         "from question difficulty alone; see the module docstring.")
@@ -252,16 +250,8 @@ def main():
                    help="Keep only questions that produced BOTH a correct and an incorrect "
                         "rollout. Strongest form of the difficulty-shortcut guard, at the cost of "
                         "dropping the easiest and hardest questions entirely.")
-    p.add_argument("--max-completion-length", type=int, default=4096,
-                   help="Completion budget. Half the RL arms' 8192 by default: the teacher's "
-                        "forward in stage 2 is over [teacher_prompt || completion], and `full` PI "
-                        "adds a long prompt on top.")
-    p.add_argument("--stage", default="all", choices=["all", "generate", "score"],
-                   help="'all' generates here and then runs the scoring half in a FRESH "
-                        "SUBPROCESS -- required for correctness, not tidiness: vLLM leaves global "
-                        "torch state altered, which changes the HF forward's numerics and would "
-                        "bake a ~0.04-nat offset into every cached student logprob. Split the two "
-                        "manually if you want them on different GPUs.")
+    p.add_argument("--max-completion-length", type=int, default=8192,
+                   help="Completion budget.")
     p.add_argument("--score-batch-size", type=int, default=1,
                    help="Rows per scoring forward. LEAVE AT 1 UNLESS YOU HAVE MEASURED THE COST: "
                         "batching pads the shorter rows, and in bfloat16 attention over pad "
@@ -272,57 +262,35 @@ def main():
                         "are ragged. Stage 2's default forwards are unpadded too, so 1 keeps the "
                         "two stages exactly comparable.")
     p.add_argument("--force", action="store_true",
-                   help="Regenerate / rescore even if a compatible cache exists.")
+                   help="Regenerate and rescore even if a compatible cache exists.")
     p.add_argument("--seed", type=int, default=42)
     # vLLM
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
 
     out_dir = rollout_path(args.model, args.dataset, args.output_root)
     print(f"model: {args.model}  dataset: {args.dataset}  ->  {out_dir}")
 
-    if args.stage in ("all", "generate"):
-        # Reuse guard, matching utils/gen_hints.py: same model, at least as many rollouts.
-        wanted = args.max_samples * args.n
-        if not args.force and os.path.isdir(out_dir):
-            cached = load_from_disk(out_dir)
-            if set(cached.unique("gen_model")) == {args.model} and len(cached) >= wanted:
-                print(f"Reusing {len(cached)} cached rollouts at {out_dir} (>= {wanted}, model "
-                      f"matches). Use --force to regenerate.")
-            else:
-                generate(args, out_dir)
+    # Reuse guard, matching utils/gen_hints.py: same model, at least as many rollouts.
+    wanted = args.max_samples * args.n
+    if not args.force and os.path.isdir(out_dir):
+        cached = load_from_disk(out_dir)
+        if set(cached.unique("gen_model")) == {args.model} and len(cached) >= wanted:
+            print(f"Reusing {len(cached)} cached rollouts at {out_dir} (>= {wanted}, model "
+                  f"matches). Use --force to regenerate.")
         else:
             generate(args, out_dir)
+    else:
+        generate(args, out_dir)
 
-    if args.stage in ("all", "score"):
-        if not os.path.isdir(out_dir):
-            raise FileNotFoundError(
-                f"No rollout cache at {out_dir} to score. Run with --stage generate first."
-            )
-        if args.stage == "all":
-            # SCORE IN A FRESH PROCESS. Importing and initialising vLLM mutates global torch
-            # state (matmul precision / kernel selection), and it does not undo that when the
-            # engine is freed -- so an HF forward that follows a vLLM engine in the same process
-            # is numerically DIFFERENT from the same forward in a clean one. Measured on
-            # Qwen3-1.7B: identical inputs, same weights, 1741/3072 tokens disagreeing, std 0.045,
-            # max 0.39. Those logprobs become the student half of rho, and stage 2 runs without
-            # vLLM, so the whole difference lands on the signal: the `--pi-mode none` control,
-            # where rho is analytically zero, read 0.043 dispersion off a same-process cache and
-            # exactly 0.000 off a subprocess-scored one.
-            forwarded = [
-                sys.executable, "-m", "train.opsd.train_self_teacher.gen_rollouts", "--stage", "score",
-                "--model", args.model, "--dataset", args.dataset,
-                "--output-root", args.output_root,
-                "--score-batch-size", str(args.score_batch_size),
-            ]
-            if args.force:
-                forwarded.append("--force")
-            print(f"Scoring in a clean subprocess (vLLM has perturbed this one's torch state)")
-            subprocess.run(forwarded, check=True)
-        else:
-            score(args, out_dir)
+    # A spawned interpreter preserves clean HF numerics without exposing separate modes.
+    score_in_clean_process(args, out_dir)
 
 
 if __name__ == "__main__":

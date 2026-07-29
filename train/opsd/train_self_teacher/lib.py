@@ -77,15 +77,6 @@ LENGTH_NORMS = ("mean", "sqrt", "none")
 
 def rollout_path(model: str, dataset: str, root: str = "data/rollouts") -> str:
     """On-disk cache of frozen-student rollouts, keyed by dataset then model slug.
-
-    Mirrors `utils.hint_path` exactly, and for the same reason: a rollout is only "on-policy"
-    for the model that produced it, so crossing caches between models would silently break the
-    self-distillation premise. Written by train/opsd/train_self_teacher/gen_rollouts.py; read by
-    train/opsd/train_self_teacher/train.py.
-
-    Note this cache is PI-INDEPENDENT -- rollouts are sampled from the student's un-privileged
-    prompt, and the PI only enters at teacher-training time -- so ONE cache serves every
-    --pi-mode. Generation is paid once for the whole ladder.
     """
     return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
 

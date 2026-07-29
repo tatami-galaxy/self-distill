@@ -619,7 +619,8 @@ def main():
     if "student_logps" not in rollouts.column_names:
         raise ValueError(
             f"Rollout cache at {cache_dir} has no `student_logps` column. Run "
-            f"`python -m train.opsd.train_self_teacher.gen_rollouts --stage score --model {args.model}` to add it."
+            f"`python -m train.opsd.train_self_teacher.gen_rollouts --model {args.model} "
+            f"--dataset {args.dataset}` to complete the cache."
         )
     if args.max_samples is not None:
         rollouts = rollouts.select(range(min(args.max_samples, len(rollouts))))
