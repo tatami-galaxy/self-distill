@@ -4,13 +4,14 @@ and record the student's own log-probabilities for the sampled tokens.
 
 Run ONCE per (model, dataset). The rollouts are drawn from the student's UN-PRIVILEGED prompt --
 the PI only enters when the teacher scores them in stage 2 -- so a single cache serves every
-`--pi-mode`.
+`--pi-mode`. Questions always come from that model's hint cache, fixing the generated data to the
+common subset for which every PI arm is available.
 
 Why the student's logprobs are cached here rather than recomputed in stage 2: the student is
 frozen for the entire E-step, so `log pi_theta(y_t | x, y_<t)` is a constant of the problem.
 Caching it means stage 2 holds only the teacher in memory.
 
-MULTIPLE ROLLOUTS PER PROMPT MATTER. With one rollout per question the teacher can drive the
+Multiple rollouts per prompt : With one rollout per question the teacher can possibly drive the
 E-step loss down by reading the QUESTION's difficulty and ignoring the trace entirely. Sampling
 `--n` rollouts means the same question appears with different outcomes, so stage 2 can measure
 within-question discrimination. The mixed-outcome fraction is reported below, and `--mixed-only`
@@ -18,16 +19,12 @@ keeps just those questions.
 
 Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns
 question, final_answer, completion_ids, completion_text, reward, student_logps, n_tokens,
-gen_model, dataset.
+gen_model, dataset, question_source.
 
-SCORING ALWAYS RUNS IN A SPAWNED PROCESS, and that is a correctness requirement rather than
-hygiene.
+SCORING ALWAYS RUNS IN A SPAWNED PROCESS, and that is a correctness requirement :
 Initialising vLLM leaves global torch state altered, and freeing the engine does not restore it,
 so an HF forward that follows vLLM in the same process gives measurably different logprobs from
-the same forward in a clean one (Qwen3-1.7B, identical inputs: 1741/3072 tokens differing, std
-0.045, max 0.39). Stage 2 runs without vLLM, so that whole difference would land on rho -- the
-`--pi-mode none` control, where rho is analytically zero, reads 0.043 off a same-process cache
-and exactly 0.000 off a subprocess-scored one.
+the same forward in a clean one.
 
 # Generate/reuse rollouts and score them; the clean-process boundary is automatic.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
@@ -49,7 +46,6 @@ from utils import (
     format_prompt_math,
     grade,
     load_hint_cache,
-    load_train_dataset,
 )
 
 
@@ -67,19 +63,9 @@ def generate(args, out_dir: str) -> None:
     """Sample `--n` completions per question from the frozen student and grade each."""
     from vllm import LLM, SamplingParams
 
-    if args.questions_from == "hints":
-        # The hint cache is a heavily filtered subset -- gen_hints drops answer leaks, empty
-        # hints and unclosed think traces, keeping roughly a fifth of the rows. Drawing questions
-        # from the DATASET prefix instead would (a) waste ~80% of this generation pass, since the
-        # hint arm can only use rollouts whose question has a hint to join, and (b) hand each
-        # --pi-mode a different question set, so the arms would no longer be comparable. Drawing
-        # from the cache fixes ONE question set that all four arms can use, which is the same
-        # reason eval/passk_pi.py restricts its arms to a common full-PI-feasible subset.
-        ds = load_hint_cache(args.model, args.dataset, max_samples=args.max_samples)
-        print(f"Loaded {len(ds)} questions from the {args.model} hint cache")
-    else:
-        ds = load_train_dataset(args.dataset, max_samples=args.max_samples)
-        print(f"Loaded {len(ds)} {args.dataset} questions")
+    # Use the common question set for which every PI arm is available and comparisons stay paired.
+    ds = load_hint_cache(args.model, args.dataset, max_samples=args.max_samples)
+    print(f"Loaded {len(ds)} questions from the {args.model} hint cache")
     print(f"  rolling out with {args.model}")
 
     llm = LLM(
@@ -118,6 +104,7 @@ def generate(args, out_dir: str) -> None:
                 "n_tokens": len(completion.token_ids),
                 "gen_model": args.model,
                 "dataset": args.dataset,
+                "question_source": "hints",
             })
 
     pass_rate, mixed_rate = summarize_outcomes(rows)
@@ -240,9 +227,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-root", default="data/rollouts")
     p.add_argument("--max-samples", type=int, default=1024,
                    help="Questions to roll out. Total rollouts = this x --n.")
-    p.add_argument("--questions-from", default="hints", choices=["hints", "dataset"],
-                   help="Where the questions come from. 'hints' (default) uses this model's hint "
-                        "cache, which is the INTERSECTION every --pi-mode can serve.")
     p.add_argument("--n", type=int, default=4,
                    help="Rollouts per question. >1 is what stops the teacher fitting the outcome "
                         "from question difficulty alone; see the module docstring.")
@@ -281,15 +265,21 @@ def main():
     wanted = args.max_samples * args.n
     if not args.force and os.path.isdir(out_dir):
         cached = load_from_disk(out_dir)
-        if set(cached.unique("gen_model")) == {args.model} and len(cached) >= wanted:
+        reusable = (
+            "question_source" in cached.column_names
+            and set(cached.unique("question_source")) == {"hints"}
+            and set(cached.unique("gen_model")) == {args.model}
+            and len(cached) >= wanted
+        )
+        if reusable:
             print(f"Reusing {len(cached)} cached rollouts at {out_dir} (>= {wanted}, model "
-                  f"matches). Use --force to regenerate.")
+                  f"and hint source match). Use --force to regenerate.")
         else:
             generate(args, out_dir)
     else:
         generate(args, out_dir)
 
-    # A spawned interpreter preserves clean HF numerics without exposing separate modes.
+    # A spawned interpreter preserves clean HF numerics without exposing separate modes
     score_in_clean_process(args, out_dir)
 
 
