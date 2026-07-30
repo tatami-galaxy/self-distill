@@ -24,25 +24,19 @@ import torch
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
 from train.opsd.train_self_teacher.lib import (
     calibration_metrics,
-    cohort_mean_centered_ratio,
-    cohort_mean_ratio,
     collate_teacher_batch,
     compose_teacher_messages,
     fit_logistic,
-    group_centered_scores,
     log_ratio,
-    macro_group_margin,
     macro_group_rank_auc,
     objective_endpoint,
     objective_pointwise,
-    penalized_correct_indices,
     privileged_context,
     rank_auc,
     render_teacher_prompt_ids,
     sequence_logit,
     teacher_inputs,
     teacher_prompt_template,
-    worst_correct_mean,
 )
 from utils import TEACHER_PROMPT_TEMPLATE, format_prompt_math, validate_resume
 
@@ -382,58 +376,70 @@ class CalibrationBiasOptimizerTest(unittest.TestCase):
 
 
 class DiagnosticsTest(unittest.TestCase):
-    def test_flat_ratio_has_zero_dispersion(self):
-        # A flat critic assigns identical credit everywhere -- no credit assignment at all. This
-        # is the reading that tells you objective (c) has been run too long.
-        ratios = torch.full((2, 6), 0.3)
-        mask = torch.ones(2, 6)
-        metrics = calibration_metrics(ratios, mask, torch.tensor([1.0, 0.0]))
-        self.assertAlmostEqual(metrics["ratio_dispersion"], 0.0, places=6)
+    def test_flattening_reduces_retained_dispersion_to_zero(self):
+        initial = torch.tensor([[-1.0, 1.0], [1.0, -1.0]])
+        current = torch.full_like(initial, 0.3)
+        metrics = calibration_metrics(
+            current, torch.ones_like(current), torch.tensor([1.0, 0.0]),
+            initial_ratios=initial,
+        )
+        self.assertLess(metrics["ratio_dispersion_retained"], 1e-6)
+
+    def test_unchanged_teacher_starts_at_unit_retention_and_zero_drift(self):
+        ratios = torch.tensor([[-1.0, 1.0], [1.0, -1.0]])
+        metrics = calibration_metrics(
+            ratios, torch.ones_like(ratios), torch.tensor([1.0, 0.0]),
+            initial_ratios=ratios,
+        )
+        self.assertAlmostEqual(metrics["ratio_dispersion_retained"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_delta"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_rms_drift"], 0.0, places=6)
 
     def test_late_firing_ratio_concentrates_credit_in_the_last_quartile(self):
-        # What an answer-string-matching teacher looks like: it only moves at the end.
         ratios = torch.zeros(1, 8)
         ratios[0, 6:] = 1.0
-        mask = torch.ones(1, 8)
-        metrics = calibration_metrics(ratios, mask, torch.tensor([1.0]))
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), torch.tensor([1.0]))
         self.assertAlmostEqual(metrics["credit_mass_last_quartile"], 1.0, places=6)
 
     def test_evenly_spread_credit_scores_a_quarter(self):
         ratios = torch.full((1, 8), 0.25)
-        mask = torch.ones(1, 8)
-        metrics = calibration_metrics(ratios, mask, torch.tensor([1.0]))
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), torch.tensor([1.0]))
         self.assertAlmostEqual(metrics["credit_mass_last_quartile"], 0.25, places=6)
 
-    def test_padding_does_not_shift_the_quantiles(self):
-        # A row's quantiles are taken over its REAL length, so appending padding must not move
-        # them -- otherwise short rows in a long batch would be scored at the wrong prefix.
-        ratios = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-        short = calibration_metrics(ratios[:, :2], torch.ones(1, 2), torch.tensor([1.0]))
-        padded = calibration_metrics(
-            torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
-            torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
-            torch.tensor([1.0]),
+    def test_failure_dashboard_reports_signed_and_rms_drift(self):
+        initial = torch.zeros(3, 2)
+        current = torch.tensor([
+            [9.0, 9.0],  # correct: excluded
+            [1.0, -1.0],  # wrong: mean delta 0, RMS 1
+            [2.0, 2.0],  # wrong: mean delta 2, RMS 2
+        ])
+        metrics = calibration_metrics(
+            current, torch.ones_like(current), torch.tensor([1.0, 0.0, 0.0]),
+            initial_ratios=initial,
         )
-        for key in ("brier_q25", "brier_q50", "brier_q100", "value_first_token_mean"):
-            self.assertAlmostEqual(short[key], padded[key], places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_delta"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_rms_drift"], 1.5, places=6)
 
-    def test_first_token_brier_pairs_each_row_with_its_own_outcome(self):
-        ratios = torch.tensor([[10.0, 0.0], [-10.0, 0.0]])
-        reward = torch.tensor([1.0, 0.0])
-        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
-
-        expected_values = torch.sigmoid(torch.tensor([10.0, -10.0]))
-        expected_brier = ((expected_values - reward) ** 2).mean().item()
-        self.assertAlmostEqual(metrics["brier_first_token"], expected_brier, places=9)
-        self.assertLess(metrics["brier_first_token"], 1e-6)
-
-    def test_separates_correct_from_wrong(self):
-        ratios = torch.tensor([[0.5, 0.5], [-0.5, -0.5]])
-        mask = torch.ones(2, 2)
-        metrics = calibration_metrics(ratios, mask, torch.tensor([1.0, 0.0]))
-        self.assertAlmostEqual(metrics["mean_ratio_correct"], 0.5, places=6)
-        self.assertAlmostEqual(metrics["mean_ratio_wrong"], -0.5, places=6)
-        self.assertAlmostEqual(metrics["outcome_mean"], 0.5, places=6)
+    def test_correct_relief_uses_all_initially_penalized_successes(self):
+        initial = torch.tensor([
+            [-2.0, -2.0], [0.0, 0.0],  # q1: correct centered at -1
+            [-4.0, -4.0], [0.0, 0.0],  # q2: correct centered at -2
+        ])
+        current = torch.tensor([
+            [-1.0, -1.0], [0.0, 0.0],  # centered relief +0.5
+            [-2.0, -2.0], [0.0, 0.0],  # centered relief +1.0
+        ])
+        metrics = calibration_metrics(
+            current,
+            torch.ones_like(current),
+            torch.tensor([1.0, 0.0, 1.0, 0.0]),
+            question_ids=["q1", "q1", "q2", "q2"],
+            initial_ratios=initial,
+        )
+        self.assertEqual(metrics["correct_penalized_count"], 2.0)
+        self.assertAlmostEqual(metrics["correct_penalty_relief"], 5.0 / 6.0, places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_delta"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["wrong_ratio_rms_drift"], 0.0, places=6)
 
     def test_empty_batch_returns_nothing_rather_than_dividing_by_zero(self):
         self.assertEqual(
@@ -442,66 +448,38 @@ class DiagnosticsTest(unittest.TestCase):
 
 
 class FittedCalibrationTest(unittest.TestCase):
-    """Raw Brier carries beta/bias; fitted Brier must remove them without scoring fit rows."""
+    """Fitted Brier and within-question AUC are the compact outcome dashboard."""
 
     def make_batch(self, n=64, seed=0):
         torch.manual_seed(seed)
-        reward = (torch.rand(n) < 0.4).float()
-        return reward
+        return (torch.rand(n) < 0.4).float()
+
+    def question_ids(self, n):
+        return [f"q{i // 4}" for i in range(n)]
 
     def test_flat_ratio_fits_to_the_floor(self):
-        # A constant score carries no information, so the fitted link can do no better than the
-        # best constant predictor -- and must do no worse.
         reward = self.make_batch()
         ratios = torch.full((reward.numel(), 8), 0.3)
-        mask = torch.ones_like(ratios)
-        metrics = calibration_metrics(ratios, mask, reward)
+        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
 
         self.assertAlmostEqual(
             metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"], places=6,
             msg="a flat ratio must fit exactly to the base-rate floor",
         )
-        self.assertAlmostEqual(metrics["auc_q100"], 0.5, places=6)
 
-    def test_brier_floor_is_the_best_constant_predictor(self):
-        reward = self.make_batch()
-        ratios = torch.zeros(reward.numel(), 4)
-        mask = torch.ones_like(ratios)
-        metrics = calibration_metrics(ratios, mask, reward)
-
-        p = reward.mean().item()
-        self.assertAlmostEqual(metrics["brier_floor"], p * (1 - p), places=6)
-        # And it really is the minimum over constants.
-        for candidate in (0.0, 0.25, 0.5, 0.75, 1.0):
-            self.assertLessEqual(
-                metrics["brier_floor"], ((candidate - reward) ** 2).mean().item() + 1e-9
-            )
-
-    def test_fitted_brier_and_auc_are_scale_invariant(self):
-        # THE POINT OF THE FITTED SERIES. Rescaling every ratio changes nothing about how the
-        # traces are ordered, so a discrimination metric must not move -- while the raw Brier,
-        # which reads through a fixed --beta, does.
+    def test_fitted_brier_and_within_auc_are_scale_invariant(self):
         reward = self.make_batch()
         torch.manual_seed(1)
         base = 0.2 * (reward.unsqueeze(1) - 0.4) + 0.2 * torch.randn(reward.numel(), 6)
         mask = torch.ones_like(base)
+        questions = self.question_ids(reward.numel())
 
-        small = calibration_metrics(base, mask, reward)
-        large = calibration_metrics(10.0 * base, mask, reward)
+        small = calibration_metrics(base, mask, reward, question_ids=questions)
+        large = calibration_metrics(10.0 * base, mask, reward, question_ids=questions)
 
         self.assertAlmostEqual(small["brier_q100_fitted"], large["brier_q100_fitted"], places=4)
-        self.assertAlmostEqual(small["auc_q100"], large["auc_q100"], places=6)
-        # The slope absorbs the rescaling reciprocally, but only to within the ridge's influence:
-        # an L2 penalty on (a, b) is not scale-equivariant, so the 10x-larger score is fitted with
-        # a slope slightly more than 10x smaller. Measured at ~0.3% here; assert relatively rather
-        # than pretending a regularized estimator is exactly homogeneous.
         self.assertAlmostEqual(
-            small["platt_slope_q100"] / (10.0 * large["platt_slope_q100"]), 1.0, places=2,
-            msg="the fitted slope must absorb the rescaling",
-        )
-        self.assertNotAlmostEqual(
-            small["brier_q100"], large["brier_q100"], places=3,
-            msg="the RAW brier is expected to move -- that is what motivates the fitted one",
+            small["within_question_auc_q100"], large["within_question_auc_q100"], places=6
         )
 
     def test_informative_ratio_beats_the_floor(self):
@@ -510,35 +488,40 @@ class FittedCalibrationTest(unittest.TestCase):
         ratios = (0.6 * (reward.unsqueeze(1) - 0.4)).expand(-1, 6) + 0.05 * torch.randn(
             reward.numel(), 6
         )
-        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+        metrics = calibration_metrics(
+            ratios, torch.ones_like(ratios), reward,
+            question_ids=self.question_ids(reward.numel()),
+        )
 
         self.assertLess(metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"])
-        self.assertGreater(metrics["auc_q100"], 0.9)
+        self.assertGreater(metrics["within_question_auc_q100"], 0.9)
 
-    def test_single_class_batch_omits_the_fitted_metrics(self):
-        # With one outcome class the fit is unidentifiable and AUC undefined; the keys must be
-        # absent rather than reporting a degenerate 0.0.
+    def test_single_class_batch_omits_outcome_metrics(self):
         reward = torch.ones(8)
         ratios = torch.randn(8, 5)
-        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+        metrics = calibration_metrics(
+            ratios, torch.ones_like(ratios), reward,
+            question_ids=self.question_ids(reward.numel()),
+        )
 
-        self.assertIn("brier_q100", metrics)
-        self.assertAlmostEqual(metrics["brier_floor"], 0.0, places=9)
-        for key in ("brier_q100_fitted", "auc_q100", "platt_slope_q100"):
+        self.assertEqual(metrics["mixed_question_count"], 0.0)
+        for key in (
+            "brier_floor_crossfit", "brier_q100_fitted", "within_question_auc_q100"
+        ):
             self.assertNotIn(key, metrics)
 
     def test_perfect_separation_stays_finite(self):
-        # A 64-row batch can separate perfectly by chance. The unpenalised MLE would diverge and
-        # report a meaningless Brier of 0; the ridge keeps it finite.
         reward = torch.cat([torch.zeros(16), torch.ones(16)])
         ratios = torch.cat([-torch.ones(16, 4), torch.ones(16, 4)])
-        metrics = calibration_metrics(ratios, torch.ones_like(ratios), reward)
+        questions = [f"q{i % 16}" for i in range(reward.numel())]
+        metrics = calibration_metrics(
+            ratios, torch.ones_like(ratios), reward, question_ids=questions
+        )
 
-        self.assertTrue(math.isfinite(metrics["platt_slope_q100"]))
         self.assertTrue(math.isfinite(metrics["brier_q100_fitted"]))
-        self.assertAlmostEqual(metrics["auc_q100"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["within_question_auc_q100"], 1.0, places=6)
 
-    def test_question_difficulty_has_global_but_not_within_question_auc(self):
+    def test_question_difficulty_is_neutral_within_question(self):
         ratios, reward, questions = [], [], []
         examples = [
             (2.0, [1, 1, 1, 0]),
@@ -557,39 +540,58 @@ class FittedCalibrationTest(unittest.TestCase):
             ratios, torch.ones_like(ratios), reward, question_ids=questions
         )
 
-        self.assertGreater(metrics["auc_q100"], 0.6)
         self.assertAlmostEqual(metrics["within_question_auc_q100"], 0.5, places=6)
-        self.assertAlmostEqual(metrics["within_question_margin_q100"], 0.0, places=6)
         self.assertEqual(metrics["mixed_question_count"], 4.0)
         for q in (25, 50, 75, 100):
             self.assertIn(f"within_question_auc_q{q}", metrics)
 
-    def test_reversed_ratio_cannot_be_rescued_by_a_negative_platt_slope(self):
+    def test_reversed_ratio_cannot_be_rescued_by_platt_scaling(self):
         reward = torch.cat([torch.zeros(16), torch.ones(16)])
-        # Wrong traces rank above correct ones: exactly the sign that would harm SDFT.
         ratios = torch.cat([torch.ones(16, 4), -torch.ones(16, 4)])
+        questions = [f"q{i % 16}" for i in range(reward.numel())]
         metrics = calibration_metrics(
-            ratios,
-            torch.ones_like(ratios),
-            reward,
-            question_ids=[f"q{i}" for i in range(reward.numel())],
+            ratios, torch.ones_like(ratios), reward, question_ids=questions
         )
 
-        self.assertAlmostEqual(metrics["auc_q100"], 0.0, places=6)
-        self.assertAlmostEqual(metrics["platt_slope_q100"], 0.0, places=9)
+        self.assertAlmostEqual(metrics["within_question_auc_q100"], 0.0, places=6)
         self.assertAlmostEqual(
             metrics["brier_q100_fitted"], metrics["brier_floor_crossfit"], places=6
         )
 
-    def test_group_helpers_macro_average_only_mixed_questions(self):
+    def test_padding_does_not_shift_prefix_quantiles(self):
+        reward = torch.tensor([float(i % 2) for i in range(32)])
+        signal = 2.0 * reward - 1.0
+        short = signal.unsqueeze(1).expand(-1, 2).clone()
+        padded = torch.cat([short, torch.zeros(32, 2)], dim=1)
+        short_mask = torch.ones_like(short)
+        padded_mask = torch.cat([short_mask, torch.zeros(32, 2)], dim=1)
+        questions = [f"q{i // 2}" for i in range(32)]
+
+        short_metrics = calibration_metrics(
+            short, short_mask, reward, question_ids=questions
+        )
+        padded_metrics = calibration_metrics(
+            padded, padded_mask, reward, question_ids=questions
+        )
+        for q in (25, 50, 75, 100):
+            self.assertAlmostEqual(
+                short_metrics[f"brier_q{q}_fitted"],
+                padded_metrics[f"brier_q{q}_fitted"],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                short_metrics[f"within_question_auc_q{q}"],
+                padded_metrics[f"within_question_auc_q{q}"],
+                places=6,
+            )
+
+    def test_group_auc_macro_averages_only_mixed_questions(self):
         scores = torch.tensor([1.0, 1.0, -1.0, -1.0, 3.0, 3.0])
         reward = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
         groups = ["a", "a", "b", "b", "all-correct", "all-correct"]
         auc, count = macro_group_rank_auc(scores, reward, groups)
-        margin, margin_count = macro_group_margin(scores, reward, groups)
         self.assertAlmostEqual(auc, 0.5, places=6)
-        self.assertAlmostEqual(margin, 0.0, places=6)
-        self.assertEqual((count, margin_count), (2, 2))
+        self.assertEqual(count, 2)
 
     def test_rank_auc_counts_ties_as_half(self):
         scores = torch.tensor([1.0, 1.0, 1.0, 1.0])
@@ -642,71 +644,6 @@ class QuestionSplitTest(unittest.TestCase):
         self.assertLessEqual(len(diagnostic), 10)
         self.assertEqual(set(diagnostic["question"]), set(questions))
         self.assertTrue(all(diagnostic["question"].count(q) == 4 for q in questions))
-
-
-class PenalizedCorrectTest(unittest.TestCase):
-    def test_selects_the_worst_scored_correct_traces_only(self):
-        # Four correct traces and one wrong one the teacher likes even less. The metric must
-        # ignore the wrong trace entirely -- the population of interest is exploration that WORKED.
-        ratios = torch.tensor([
-            [-2.0, -2.0],  # correct, most penalized
-            [0.0, 0.0],    # correct
-            [1.0, 1.0],    # correct
-            [2.0, 2.0],    # correct
-            [-9.0, -9.0],  # wrong, and penalized hardest of all
-        ])
-        mask = torch.ones(5, 2)
-        reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
-        self.assertAlmostEqual(worst_correct_mean(ratios, mask, reward), -2.0, places=6)
-
-    def test_fixed_cohort_follows_initial_rows_when_the_ranking_changes(self):
-        reward = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
-        mask = torch.ones(5, 2)
-        initial = torch.tensor([
-            [-2.0, -2.0], [0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [-9.0, -9.0],
-        ])
-        cohort = penalized_correct_indices(initial, mask, reward, decile=0.25)
-        self.assertEqual(cohort, [0])
-
-        # Row 0 recovers, while row 1 becomes the new worst correct trace. The fixed-cohort metric
-        # must follow row 0; the moving-tail metric intentionally follows row 1.
-        final = torch.tensor([
-            [3.0, 3.0], [-4.0, -4.0], [1.0, 1.0], [2.0, 2.0], [-9.0, -9.0],
-        ])
-        self.assertAlmostEqual(cohort_mean_ratio(final, mask, cohort), 3.0, places=6)
-        self.assertAlmostEqual(
-            worst_correct_mean(final, mask, reward, decile=0.25), -4.0, places=6
-        )
-
-    def test_centered_cohort_selects_relative_penalty_not_question_difficulty(self):
-        # The hard question has much lower absolute ratios, but its correct trace is preferred
-        # relative to its failed sibling. The easy question's correct trace is the one penalized
-        # relative to another attempt at that SAME question.
-        ratios = torch.tensor([
-            [10.0, 10.0],  # q_easy correct; centered -0.5
-            [11.0, 11.0],  # q_easy wrong
-            [-10.0, -10.0],  # q_hard correct; centered +1.0
-            [-12.0, -12.0],  # q_hard wrong
-        ])
-        mask = torch.ones_like(ratios)
-        reward = torch.tensor([1.0, 0.0, 1.0, 0.0])
-        questions = ["easy", "easy", "hard", "hard"]
-        cohort = penalized_correct_indices(
-            ratios, mask, reward, decile=0.5,
-            question_ids=questions, center_within_question=True, mixed_only=True,
-        )
-
-        self.assertEqual(cohort, [0])
-        self.assertAlmostEqual(
-            cohort_mean_centered_ratio(ratios, mask, cohort, questions), -0.5, places=6
-        )
-        centered = group_centered_scores(ratios.mean(dim=1), questions)
-        self.assertTrue(torch.equal(centered, torch.tensor([-0.5, 0.5, 1.0, -1.0])))
-
-    def test_returns_none_without_any_correct_trace(self):
-        self.assertIsNone(
-            worst_correct_mean(torch.zeros(2, 2), torch.ones(2, 2), torch.tensor([0.0, 0.0]))
-        )
 
 
 class StageThreeResumeTest(unittest.TestCase):

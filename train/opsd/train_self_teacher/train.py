@@ -13,7 +13,7 @@ for the full rationale):
 
   --objective pointwise : regress each rho_t towards +/- tau.
                           Its fixed point is a flat advantage, so it is meant to be run as a
-                          bounded nudge, not to convergence. Watch `ratio_dispersion`.
+                          bounded nudge, not to convergence. Watch `ratio_dispersion_retained`.
   --objective endpoint  : regress only the trace total sigmoid(beta*S_T/N + b).
                           One constraint per trace instead of one per token, so per-token allocation
                           stays free and credit can be sparse. Gentler, cannot flatten.
@@ -22,17 +22,15 @@ Stage 3 is only worth if this stage shows the ratio became outcome-predictive :
 INIT vs TRAINED, printed at startup and written to diagnostics_init.json.
 Diagnostics use COMPLETE HELD-OUT QUESTIONS: no rollout from a diagnostic question reaches the optimizer.
 
-  within_question_auc_q*       the shortcut-resistant headline. Macro AUC over held-out questions
-                               with both outcomes; 0.5 means the score only knows difficulty.
-  brier_q* / brier_floor       calibration under the configured beta and bias.
-  brier_q*_fitted              question-grouped out-of-fold Platt Brier; compare with
-                               brier_floor_crossfit, not the in-batch floor.
-  ratio_dispersion             the stopping signal for `pointwise`. Stop when it collapses.
-  credit_mass_last_quartile    late-firing detector. `--pi-mode answer` is expected to trip it.
-  penalized_correct_centered_delta
-                               the exploration headline. The cohort is the initially worst
-                               successful rollouts RELATIVE to other attempts at the same mixed
-                               held-out question, and its identities remain fixed throughout.
+  brier_q*_fitted              question-grouped out-of-fold outcome Brier; compare with
+                               brier_floor_crossfit.
+  within_question_auc_q*       shortcut-resistant ranking within mixed-outcome questions.
+  correct_penalty_relief       weighted question-centered relief on every initially penalized
+                               successful rollout; correct_penalized_count is its support.
+  wrong_ratio_delta / wrong_ratio_rms_drift
+                               signed and magnitude drift from initialization on failures.
+  ratio_dispersion_retained    fraction of the initial within-trace credit structure retained.
+  credit_mass_last_quartile    late-firing detector; `--pi-mode answer` is expected to trip it.
 
 # one E-step, hint PI, pointwise objective
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
@@ -67,18 +65,14 @@ from train.opsd.train_self_teacher.lib import (
     TEACHER_VERSION,
     build_teacher_dataset,
     calibration_metrics,
-    cohort_mean_centered_ratio,
-    cohort_mean_ratio,
     collate_teacher_batch,
     concat_padded,
     log_ratio,
     objective_endpoint,
     objective_pointwise,
-    penalized_correct_indices,
     rollout_path,
     teacher_prompt_template,
     teacher_token_logps,
-    worst_correct_mean,
 )
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
@@ -116,9 +110,7 @@ class SelfTeacherTrainer(Trainer):
         self._diag_rows = None
         self._diag_collate = None
         self._diag_question_ids = None
-        self._initially_penalized_indices = None
-        self._init_penalized = None
-        self._init_penalized_centered = None
+        self._diag_initial_ratios = None
 
     # -- the bias needs its own, much larger learning rate ---------------------
 
@@ -193,11 +185,8 @@ class SelfTeacherTrainer(Trainer):
         self._diag_rows = rows
         self._diag_collate = collate
         self._diag_question_ids = [row["question"] for row in rows]
-        # Row positions define the cohort. A new diagnostic set therefore requires a new initial
-        # selection rather than reusing indices into the previous set.
-        self._initially_penalized_indices = None
-        self._init_penalized = None
-        self._init_penalized_centered = None
+        # The first reading on these fixed rows becomes every later drift metric's reference.
+        self._diag_initial_ratios = None
 
     @torch.no_grad()
     def diagnostics(self) -> dict[str, float]:
@@ -236,44 +225,16 @@ class SelfTeacherTrainer(Trainer):
         mask = concat_padded(mask_chunks)
         reward = torch.cat(reward_chunks)
 
-        metrics = calibration_metrics(
+        if self._diag_initial_ratios is None:
+            # CPU storage avoids permanently consuming accelerator memory between log steps.
+            self._diag_initial_ratios = ratios.detach().cpu().clone()
+        return calibration_metrics(
             ratios, mask, reward,
-            beta=self.beta, bias=float(self.calibration_bias.detach()),
             length_norm=self.length_norm,
             crossfit_folds=self.diag_crossfit_folds,
             question_ids=self._diag_question_ids,
+            initial_ratios=self._diag_initial_ratios,
         )
-
-        # Select once from successful trajectories that the initial teacher dislikes RELATIVE to
-        # other held-out attempts at the same mixed-outcome question, then follow those exact rows.
-        if self._initially_penalized_indices is None:
-            self._initially_penalized_indices = penalized_correct_indices(
-                ratios, mask, reward,
-                question_ids=self._diag_question_ids,
-                center_within_question=True,
-                mixed_only=True,
-            )
-        fixed_penalized = cohort_mean_ratio(ratios, mask, self._initially_penalized_indices)
-        fixed_centered = cohort_mean_centered_ratio(
-            ratios, mask, self._initially_penalized_indices, self._diag_question_ids
-        )
-        if fixed_penalized is not None:
-            metrics["penalized_correct_mean"] = fixed_penalized
-            if self._init_penalized is not None:
-                metrics["penalized_correct_delta"] = fixed_penalized - self._init_penalized
-        if fixed_centered is not None:
-            metrics["penalized_correct_centered_mean"] = fixed_centered
-            if self._init_penalized_centered is not None:
-                metrics["penalized_correct_centered_delta"] = (
-                    fixed_centered - self._init_penalized_centered
-                )
-
-        # Also retain the moving tail under an explicit name: it answers the distinct question
-        # "does the teacher still heavily penalize any correct traces?"
-        current_worst = worst_correct_mean(ratios, mask, reward)
-        if current_worst is not None:
-            metrics["current_worst_correct_mean"] = current_worst
-        return metrics
 
     def _maybe_log_save_evaluate(self, *args, **kwargs):
         if self.control.should_log:
@@ -546,7 +507,7 @@ def main():
                         "stable hash, so no rollout of a validation question can leak into train.")
     p.add_argument("--validation-seed", type=int, default=42,
                    help="Independent seed for the stable question split. Keep fixed across PI arms.")
-    p.add_argument("--diag-rows", type=int, default=64,
+    p.add_argument("--diag-rows", type=int, default=256,
                    help="Approximate maximum held-out rows scored at every log step. Complete "
                         "questions are retained, so the actual count may differ slightly. These "
                         "rows never reach the optimizer.")
@@ -649,9 +610,9 @@ def main():
         f"{len(diagnostic_dataset)} rollouts ({n_mixed_diag} mixed-outcome questions)"
     )
     if n_mixed_diag == 0:
-        print("  warning: the diagnostic subset has no mixed-outcome question; global calibration "
-              "will be reported, but within-question AUC and the centered exploration cohort are "
-              "undefined. Raise --diag-rows or generate more rollouts per question.")
+        print("  warning: the diagnostic subset has no mixed-outcome question; "
+              "within-question AUC and correct-penalty relief are undefined. Raise --diag-rows "
+              "or generate more rollouts per question.")
 
     # -- model --------------------------------------------------------------
     set_seed(args.seed)
@@ -736,8 +697,6 @@ def main():
     n_diag = len(diagnostic_dataset)
     trainer.set_diagnostic_rows([diagnostic_dataset[i] for i in range(n_diag)], collate)
     init_metrics = trainer.diagnostics()
-    trainer._init_penalized = init_metrics.get("penalized_correct_mean")
-    trainer._init_penalized_centered = init_metrics.get("penalized_correct_centered_mean")
     print(f"\nInit diagnostics (untrained teacher, {n_diag} rows) -- the go/no-go baseline:")
     for key, value in init_metrics.items():
         print(f"  {key:28s} {value: .4f}")
