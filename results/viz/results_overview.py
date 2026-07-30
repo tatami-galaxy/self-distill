@@ -13,22 +13,24 @@
 #     name: python3
 # ---
 
-# %% [markdown]
+# %% -------------------- OVERVIEW -------------------- [markdown]
 # # Training and evaluation results
 #
-# This notebook is the first, deliberately descriptive view of the repository's results. It scans the JSON summaries each time it runs, so new models, checkpoints, variants, and runs appear without manually copying numbers into the notebook.
+# This notebook scans the JSON summaries each time it runs,
+# so new models, checkpoints, variants, and runs appear
+# without manually copying numbers into the notebook.
 #
 # Data conventions:
 #
 # - Data source : JSON files under `results/`
-# - Tables below are tidy views derived from those files; no result is re-entered by hand.
-# - AIME24 baselines are matched by exact model name. Training curves retain algorithm, variant, run, and checkpoint.
-# - The summary table uses the **latest available checkpoint per arm**, not the best checkpoint, to avoid implicit checkpoint selection.
-# - Older AIME24 summaries do not contain `arm` or `eval_config`; their identities are recovered from the directory layout and are marked as schema 0.
+# - The summary table uses the **latest available checkpoint per arm**,
+#   not the best checkpoint, to avoid implicit checkpoint selection.
+# - Older AIME24 summaries do not contain `arm` or `eval_config`;
+#   their identities are recovered from the directory layout and are marked as schema 0.
 # - Scores are shown on a 0–1 scale in tables and as percentages in plots.
 #
 
-# %%
+# %% -------------------- SETUP AND IMPORTS --------------------
 """Interactive results overview for Zed's Python REPL.
 
 After editing this file, synchronize it with the shareable notebook:
@@ -69,15 +71,16 @@ print(f"Repository: {ROOT}")
 print(f"Results:    {RESULTS}")
 
 
-# %% [markdown]
-# ## AIME24
+# %% -------------------- AIME24 --------------------
 #
-# For the initial overview, checkpoint curves are more informative than a single bar per method: they show training dynamics and make clear which checkpoint is being compared. Each panel uses the exact base-model evaluation as a horizontal reference. Variants and repeated runs remain separate series.
+# For the initial overview, checkpoint curves are more informative than a single bar
+# per method: they show training dynamics and make clear
+# which checkpoint is being compared. Each panel uses the exact base-model
+# evaluation as a horizontal reference. Variants and repeated runs remain separate series.
 #
 
-# %%
+# %% -------------------- LOAD AIME24 RESULTS --------------------
 AIME_DIR = RESULTS / "aime24"
-
 
 def read_json(path: Path) -> dict:
     with path.open() as handle:
@@ -171,47 +174,71 @@ display(
 )
 
 
-# %%
+# %% -------------------- BEST AIME24 CHECKPOINTS BY MODEL --------------------
+AIME_BEST_K = 1  # Choose 1, 8, or 16.
+AIME_BEST_METRIC = f"pass@{AIME_BEST_K}"
+if AIME_BEST_K not in {1, 8, 16}:
+    raise ValueError(f"AIME_BEST_K must be one of 1, 8, or 16; got {AIME_BEST_K}")
+
+
 def method_label(row: pd.Series, include_run: bool = True) -> str:
     if row["algo"] == "base":
         return "Base"
     label = str(row["algo"]).upper()
     if row.get("variant"):
-        label += f" [{row['variant']}]"
+        label += " [" + str(row["variant"]) + "]"
     if include_run and row.get("run"):
-        label += f" · {row['run']}"
+        label += " · " + str(row["run"])
     return label
 
 
-def latest_aime_arms(frame: pd.DataFrame) -> pd.DataFrame:
-    base = frame[frame["is_base"]].copy()
-    trained = frame[~frame["is_base"]].copy()
-    trained["variant_key"] = trained["variant"].fillna("")
-    trained["run_key"] = trained["run"].fillna("")
-    group_columns = ["model", "train_dataset", "algo", "variant_key", "run_key"]
-    trained = (
-        trained.sort_values("checkpoint")
-        .groupby(group_columns, as_index=False, dropna=False)
-        .tail(1)
+def best_aime_by_algo(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Select one best checkpoint per model and algorithm across all runs and variants.
+
+    If scores tie, prefer the earlier checkpoint, then variant and run name for a
+    deterministic result. The base evaluation is treated as the `base` algorithm.
+    """
+    candidates = frame.dropna(subset=[metric]).copy()
+    candidates["_checkpoint_sort"] = candidates["checkpoint"].fillna(-1)
+    candidates["_variant_sort"] = candidates["variant"].fillna("")
+    candidates["_run_sort"] = candidates["run"].fillna("")
+    candidates = candidates.sort_values(
+        ["model", "algo", metric, "_checkpoint_sort", "_variant_sort", "_run_sort"],
+        ascending=[True, True, False, True, True, True],
     )
-    latest = pd.concat([base, trained], ignore_index=True)
-    latest["arm"] = latest.apply(method_label, axis=1)
-    return latest.sort_values(["model", "is_base", "algo", "variant", "run"])
+    best = candidates.groupby(["model", "algo"], as_index=False, sort=False).head(1)
+    return best.drop(
+        columns=["_checkpoint_sort", "_variant_sort", "_run_sort"]
+    ).reset_index(drop=True)
 
 
-aime_latest = latest_aime_arms(aime)
-latest_columns = [
-    "model", "arm", "train_dataset", "step", "pass@1", "pass@8", "pass@16",
-    "dataset_size", "n_samples", "max_tokens", "schema_version",
-]
-display(
-    aime_latest[latest_columns]
-    .style.format({"pass@1": "{:.3f}", "pass@8": "{:.3f}", "pass@16": "{:.3f}"})
-    .background_gradient(subset=["pass@1", "pass@8", "pass@16"], cmap="Blues", vmin=0, vmax=1)
-)
+aime_best = best_aime_by_algo(aime, AIME_BEST_METRIC)
+for model, model_results in aime_best.groupby("model", sort=True):
+    table = model_results[
+        [
+            "algo", "variant", "run", "step", "train_dataset",
+            "pass@1", "pass@8", "pass@16", "schema_version",
+        ]
+    ].copy()
+    table["algorithm"] = table.pop("algo").str.upper()
+    for column in ("variant", "run", "train_dataset"):
+        table[column] = table[column].fillna("—")
+    table = table[
+        [
+            "algorithm", "variant", "run", "step", "train_dataset",
+            "pass@1", "pass@8", "pass@16", "schema_version",
+        ]
+    ]
+    display(
+        table.style
+        .set_caption(f"{model} — best {AIME_BEST_METRIC} checkpoint per algorithm")
+        .format({"pass@1": "{:.3f}", "pass@8": "{:.3f}", "pass@16": "{:.3f}"})
+        .background_gradient(
+            subset=[AIME_BEST_METRIC], cmap="Blues", vmin=0, vmax=1
+        )
+    )
 
-
-# %%
+# %% -------------------- PLOT AIME24 LEARNING CURVES --------------------
 ALGO_COLORS = {
     "sft": "#4c78a8",
     "grpo": "#f58518",
@@ -269,26 +296,26 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 plot_aime_curves(aime, "pass@1");
 
 
-# %% [markdown]
-# The table below is a compact model × arm view of the same latest-checkpoint data. Blank cells mean that arm has not yet been evaluated for that model. Runs remain separate columns; no averaging across seeds or runs is done at this stage.
+# %% -------------------- AIME24 COMPARISON MATRIX -------------------- [markdown]
+# The table below is a compact model × algorithm view of the same best-checkpoint selection. `AIME_BEST_K` controls both the per-model tables and this matrix; blanks mean an algorithm has not yet been evaluated for that model.
 #
 
-# %%
-latest_matrix = aime_latest.pivot(index="model", columns="arm", values="pass@1")
+# %% -------------------- DISPLAY AIME24 MATRIX --------------------
+best_matrix = aime_best.pivot(index="model", columns="algo", values=AIME_BEST_METRIC)
 display(
-    latest_matrix.style
+    best_matrix.style
     .format("{:.3f}", na_rep="—")
     .background_gradient(cmap="Blues", vmin=0, vmax=1)
 )
 
 
-# %% [markdown]
+# %% -------------------- PRIVILEGED-INFORMATION PASS@K -------------------- [markdown]
 # ## Privileged-information pass@k
 #
 # These results measure how the same problem-solving model behaves when generation itself is conditioned on no PI, a hint, the answer, or the full solution. The raw pass@k values are shown directly; improvements relative to `none` can be added when deeper comparative analysis begins.
 #
 
-# %%
+# %% -------------------- LOAD PASSK_PI RESULTS --------------------
 PASSK_PI_DIR = RESULTS / "passk_pi"
 PI_ORDER = ["none", "hint", "answer", "full"]
 PI_COLORS = {
@@ -332,7 +359,7 @@ display(
 )
 
 
-# %%
+# %% -------------------- PLOT PASSK_PI RESULTS --------------------
 def grouped_bar(ax, frame: pd.DataFrame, value: str, title: str, percent: bool = False):
     models = sorted(frame["model"].unique())
     modes = [mode for mode in PI_ORDER if mode in set(frame["pi_mode"].astype(str))]
@@ -363,13 +390,13 @@ grouped_bar(axes[1], passk_pi, "pass@8", "PI-conditioned generation: pass@8", pe
 fig.tight_layout()
 
 
-# %% [markdown]
+# %% -------------------- TEACHER BEHAVIOR -------------------- [markdown]
 # ## Teacher behavior
 #
 # Teacher-behavior summaries describe more than answer accuracy. The first dashboard keeps differently scaled quantities on separate axes: correctness, response length, truncation, and epistemic-marker density. This makes the behavioral shift under richer PI visible without combining incompatible units.
 #
 
-# %%
+# %% -------------------- LOAD TEACHER BEHAVIOR RESULTS --------------------
 TEACHER_DIR = RESULTS / "teacher_behavior"
 
 
@@ -423,7 +450,7 @@ display(
 )
 
 
-# %%
+# %% -------------------- PLOT TEACHER BEHAVIOR --------------------
 teacher_plot = teacher_behavior.rename(columns={"teacher_model": "model"})
 fig, axes = plt.subplots(2, 2, figsize=(15, 9))
 grouped_bar(axes[0, 0], teacher_plot, "pass@1", "Teacher correctness", percent=True)
@@ -434,7 +461,7 @@ fig.suptitle("Teacher behavior by privileged context", fontsize=16, y=1.01)
 fig.tight_layout()
 
 
-# %% [markdown]
+# %% -------------------- INVENTORY AND NEXT STEPS -------------------- [markdown]
 # ## Result inventory and next additions
 #
 # The inventory below makes missing result families explicit and provides a quick check after adding files. Natural next analysis layers are:
@@ -447,7 +474,7 @@ fig.tight_layout()
 # 6. additional benchmark sections using the same tidy-table pattern.
 #
 
-# %%
+# %% -------------------- DISPLAY RESULT INVENTORY --------------------
 inventory = pd.DataFrame([
     {
         "section": "aime24",
