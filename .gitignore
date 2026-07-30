@@ -3,6 +3,7 @@ results/*
 !results/viz/
 results/viz/*
 !results/viz/*.ipynb
+!results/viz/*.py
 outputs/
 
 # Virtual environments
