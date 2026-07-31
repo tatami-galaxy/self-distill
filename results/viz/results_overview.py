@@ -225,14 +225,18 @@ for model, model_results in aime_best.groupby("model", sort=True):
         table[column] = table[column].fillna("—")
     table = table[
         [
-            "algorithm", "variant", "run", "step", "train_dataset",
-            "pass@1", "pass@8", "pass@16", "schema_version",
+            "algorithm", "variant", "train_dataset",
+            f"pass@{AIME_BEST_K}",
         ]
     ]
     display(
         table.style
-        .set_caption(f"{model} — best {AIME_BEST_METRIC} checkpoint per algorithm")
+        .set_caption(f"{model} — best {AIME_BEST_METRIC}")
         .format({"pass@1": "{:.3f}", "pass@8": "{:.3f}", "pass@16": "{:.3f}"})
+        .set_properties(**{"text-align": "center"})
+        .set_table_styles([
+            {"selector": "th", "props": [("text-align", "center")]},
+        ])
         .background_gradient(
             subset=[AIME_BEST_METRIC], cmap="Blues", vmin=0, vmax=1
         )
