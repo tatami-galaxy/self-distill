@@ -3,6 +3,8 @@
 - [ ] train on deepscaleR
 - [x] base models
 - [x] sft on base models 
+- [ ] sdft on sft-ed models
+- [ ] sdft with all PI
 - [ ] instruct models
 - [ ] all aime sets
 - [ ] beyondaime

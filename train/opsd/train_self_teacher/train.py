@@ -111,6 +111,8 @@ class SelfTeacherTrainer(Trainer):
         self._diag_collate = None
         self._diag_question_ids = None
         self._diag_initial_ratios = None
+        self._train_ratio_sum = None
+        self._train_ratio_count = None
 
     # -- the bias needs its own, much larger learning rate ---------------------
 
@@ -168,13 +170,55 @@ class SelfTeacherTrainer(Trainer):
             drift = (logps - inputs["teacher_logps_init"]) ** 2
             loss = loss + self.kl_anchor * (drift * mask).sum() / mask.sum().clamp(min=1.0)
 
-        if self.control.should_log:
-            with torch.no_grad():
-                self.log({
-                    "st/ratio_mean": (ratios * mask).sum().item() / mask.sum().clamp(min=1.0).item(),
-                    "st/calibration_bias": self.calibration_bias.item(),
-                })
+        if model.training:
+            self._accumulate_train_ratio(ratios, mask)
         return loss
+
+    @torch.no_grad()
+    def _accumulate_train_ratio(self, ratios: torch.Tensor, mask: torch.Tensor) -> None:
+        """Accumulate `st/ratio_mean` over the logging interval: the mean over TRAJECTORIES of
+        each trace's own token mean.
+
+        Equal per trajectory, not per token. Completions here span ~2.5k-8.2k tokens, so a
+        token-weighted mean would report mostly what the longest traces are doing -- and length
+        is not incidental in this cache: failures are overwhelmingly budget truncations, so
+        token-weighting would tilt the reading towards the R=0 rows. This weighting is also the
+        one `calibration_metrics` uses for its `row_mean`, so the training-interval reading and
+        the held-out dashboard are the SAME quantity and their drift is comparable.
+
+        Accumulated here rather than logged inline because `self.control.should_log` is always
+        False by the time compute_loss runs: the flag is set at on_step_end and cleared by the
+        first `self.log()` of the step that follows it, so an `if should_log` guard in this
+        method never fires (it silently logged nothing for the whole of the first 4B sweep).
+        Summing into a tensor also keeps the per-microbatch cost to one small reduction and
+        defers the cross-process sync to `_pop_train_ratio_metrics`, once per log."""
+        lengths = mask.sum(dim=1)
+        valid = lengths > 0
+        if not valid.any():
+            return
+        row_means = (ratios * mask).sum(dim=1) / lengths.clamp(min=1.0)
+        ratio_sum = row_means[valid].sum().detach()
+        ratio_count = valid.sum().to(dtype=ratio_sum.dtype).detach()
+        if self._train_ratio_sum is None:
+            self._train_ratio_sum = ratio_sum.clone()
+            self._train_ratio_count = ratio_count.clone()
+        else:
+            self._train_ratio_sum.add_(ratio_sum)
+            self._train_ratio_count.add_(ratio_count)
+
+    @torch.no_grad()
+    def _pop_train_ratio_metrics(self) -> dict[str, float]:
+        """Reduce and reset interval training-ratio accumulators."""
+        if self._train_ratio_sum is None:
+            return {}
+        ratio_sum = self.accelerator.reduce(self._train_ratio_sum, reduction="sum")
+        ratio_count = self.accelerator.reduce(self._train_ratio_count, reduction="sum")
+        self._train_ratio_sum = None
+        self._train_ratio_count = None
+        return {
+            "st/ratio_mean": (ratio_sum / ratio_count.clamp(min=1.0)).item(),
+            "st/calibration_bias": self.calibration_bias.item(),
+        }
 
     # -- diagnostics -----------------------------------------------------------
 
@@ -195,11 +239,9 @@ class SelfTeacherTrainer(Trainer):
         FIXED rows, so every reading is on the same traces and a change in a metric is a change
         in the teacher rather than a change in the sample.
 
-        Each row is collated and forwarded separately. Two reasons are load-bearing:
+        Each row is collated and forwarded separately :
           * unpadded. In our Qwen3-1.7B measurements, changing the padded input shape shifted rho
-            by ~0.03 nats in bf16 -- a third of --tau. This is consistent with shape-dependent
-            finite-precision kernels, not evidence of semantic attention-mask leakage
-            (see self_teacher.per_token_logps).
+            by ~0.03 nats in bf16 -- a third of --tau. (see self_teacher.per_token_logps).
           * bounded. One forward over all --diag-rows would materialize a huge (rows, C, vocab)
             logit tensor; no_grad does not help, since it must exist to be reduced.
         Per-row results are padded and assembled AFTERWARDS, which is lossless because
@@ -216,6 +258,7 @@ class SelfTeacherTrainer(Trainer):
                 chunk = self._diag_rows[start : start + MODEL_FORWARD_BATCH_SIZE]
                 batch = {k: v.to(device) for k, v in self._diag_collate(chunk).items()}
                 logps = teacher_token_logps(self.model, batch)
+                # teacher-student log ratio
                 ratio_chunks.append(log_ratio(logps, batch))
                 mask_chunks.append(batch["completion_mask"].float())
                 reward_chunks.append(batch["reward"])
@@ -237,8 +280,14 @@ class SelfTeacherTrainer(Trainer):
         )
 
     def _maybe_log_save_evaluate(self, *args, **kwargs):
-        if self.control.should_log:
-            self.log({f"st/{k}": v for k, v in self.diagnostics().items()})
+        should_log = self.control.should_log
+        if should_log:
+            logs = {f"st/{k}": v for k, v in self.diagnostics().items()}
+            logs.update(self._pop_train_ratio_metrics())
+            self.log(logs)
+            # CallbackHandler.on_log consumes this trigger. Restore it so Trainer logs and resets
+            # its interval loss, grad norm, learning rate, FLOPs, and global-step bookkeeping.
+            self.control.should_log = True
         return super()._maybe_log_save_evaluate(*args, **kwargs)
 
     # -- checkpoint the bias alongside the teacher -----------------------------

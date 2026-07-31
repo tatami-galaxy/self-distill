@@ -375,6 +375,67 @@ class CalibrationBiasOptimizerTest(unittest.TestCase):
         self.assertAlmostEqual(trainer.calibration_bias.grad.item(), 4.0)
 
 
+class TrainerLoggingTest(unittest.TestCase):
+    def make_trainer(self):
+        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+
+        trainer = object.__new__(SelfTeacherTrainer)
+        trainer._train_ratio_sum = None
+        trainer._train_ratio_count = None
+        trainer.accelerator = types.SimpleNamespace(reduce=lambda value, reduction: value)
+        trainer.calibration_bias = torch.nn.Parameter(torch.tensor(0.7))
+        return trainer
+
+    def test_ratio_mean_accumulates_by_trajectory_and_resets_at_log(self):
+        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+
+        trainer = self.make_trainer()
+        SelfTeacherTrainer._accumulate_train_ratio(
+            trainer,
+            torch.tensor([[1.0, 1.0, 0.0], [3.0, 3.0, 3.0]]),
+            torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]]),
+        )
+        SelfTeacherTrainer._accumulate_train_ratio(
+            trainer, torch.tensor([[5.0]]), torch.tensor([[1.0]])
+        )
+
+        metrics = SelfTeacherTrainer._pop_train_ratio_metrics(trainer)
+        self.assertAlmostEqual(metrics["st/ratio_mean"], 3.0, places=6)
+        self.assertAlmostEqual(metrics["st/calibration_bias"], 0.7, places=6)
+        self.assertIsNone(trainer._train_ratio_sum)
+        self.assertIsNone(trainer._train_ratio_count)
+        self.assertEqual(SelfTeacherTrainer._pop_train_ratio_metrics(trainer), {})
+
+    def test_diagnostic_log_does_not_consume_parent_logging_trigger(self):
+        from transformers import Trainer
+
+        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+
+        trainer = self.make_trainer()
+        trainer.control = types.SimpleNamespace(should_log=True)
+        trainer.diagnostics = lambda: {"dashboard": 1.0}
+        trainer._pop_train_ratio_metrics = lambda: {"st/ratio_mean": 2.0}
+        logged = []
+
+        def consume_trigger(logs):
+            logged.append(logs)
+            trainer.control.should_log = False
+
+        trainer.log = consume_trigger
+        parent_saw_should_log = []
+
+        def parent(*args, **kwargs):
+            parent_saw_should_log.append(trainer.control.should_log)
+            return "parent-result"
+
+        with mock.patch.object(Trainer, "_maybe_log_save_evaluate", side_effect=parent):
+            result = SelfTeacherTrainer._maybe_log_save_evaluate(trainer)
+
+        self.assertEqual(result, "parent-result")
+        self.assertEqual(parent_saw_should_log, [True])
+        self.assertEqual(logged, [{"st/dashboard": 1.0, "st/ratio_mean": 2.0}])
+
+
 class DiagnosticsTest(unittest.TestCase):
     def test_flattening_reduces_retained_dispersion_to_zero(self):
         initial = torch.tensor([[-1.0, 1.0], [1.0, -1.0]])

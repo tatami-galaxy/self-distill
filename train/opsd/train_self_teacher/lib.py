@@ -526,7 +526,7 @@ def calibration_metrics(
     crossfit_folds: int = 5,
     initial_ratios: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    """Compact decision dashboard for a trained self-teacher.
+    """Decision dashboard for a trained self-teacher.
 
     At prefix t the score is `S_t / N_t`, where S_t is the running sum of rho and N_t is the
     configured prefix normalizer. Outcome Briers use QUESTION-GROUPED OUT-OF-FOLD Platt scaling,
@@ -537,8 +537,7 @@ def calibration_metrics(
     the reference for all mechanism and drift metrics. Stage 2 always supplies it.
 
     Returned keys:
-      brier_q*_fitted            question-grouped out-of-fold Platt Brier. Scale-independent and
-                                 honest against `brier_floor_crossfit`.
+      brier_q*_fitted            question-grouped out-of-fold Platt Brier.
       brier_floor_crossfit       matching out-of-fold constant predictor.
       within_question_auc_q*     macro AUC over mixed-outcome questions. THE DIFFICULTY-SHORTCUT
                                  GUARD: a question-only score reads 0.5 regardless of global AUC.
