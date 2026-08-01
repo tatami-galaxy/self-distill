@@ -3,7 +3,8 @@
 - [x] base models
 - [x] sft on base models 
 - [ ] sdft on sft-ed models
-- [ ] sdft with all PI
+- [x] qwen 4b sdft answer, full
+- [ ] qwen 1.7b grpo
 - [ ] instruct models
 - [ ] all aime sets
 - [ ] beyondaime
