@@ -639,12 +639,16 @@ def main():
             f"context under --pi-mode {args.pi_mode}. The run would silently be its own control."
         )
 
-    # Hold out COMPLETE questions before constructing Trainer. No validation rollout can therefore
-    # influence the teacher weights, and within-question metrics cannot be explained by a memorized
-    # question-level success rate.
+    # Collect rollouts per question, hash questions
+    # question A → hash → train      → all A rollouts train
+    # question B → hash → validation → all B rollouts held out
+    # question C → hash → train      → all C rollouts train
     train_dataset, validation_dataset, validation_questions = split_question_groups(
         train_dataset, args.validation_fraction, args.validation_seed
     )
+    # Dont want to use full validation set for diagnostics
+    # question A → rows [0, 1, 2, 3]
+    # question B → rows [4, 5, 6, 7]
     diagnostic_dataset, diagnostic_questions = select_complete_diagnostic_questions(
         validation_dataset, args.diag_rows, args.validation_seed
     )

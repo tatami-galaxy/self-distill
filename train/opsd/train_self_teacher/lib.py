@@ -537,22 +537,72 @@ def calibration_metrics(
     the reference for all mechanism and drift metrics. Stage 2 always supplies it.
 
     Returned keys:
-      brier_q*_fitted            question-grouped out-of-fold Platt Brier.
-      brier_floor_crossfit       matching out-of-fold constant predictor.
-      within_question_auc_q*     macro AUC over mixed-outcome questions. THE DIFFICULTY-SHORTCUT
-                                 GUARD: a question-only score reads 0.5 regardless of global AUC.
+      brier_q*_fitted            At this point in the trajectory, does the accumulated
+                                 teacher–student ratio contain a positively oriented,
+                                 out-of-question signal about eventual success?
+
+      brier_floor_crossfit       How well could we predict using only the rollout success
+                                 base rate, without looking at the ratio?
+
+                                 want : brier_q*_fitted < brier_floor_crossfit
+
+      within_question_auc_q*     Difficulty shortcut : For the same question,
+                                 does the ratio assign a higher prefix score to
+                                 correct rollouts than to incorrect rollouts?
+
+                                 1.0 -> every correct rollout outranks every incorrect rollout
+                                 0.5 -> no within-question discrimination
+                                 0.0 -> every incorrect rollout outranks every correct rollout
+
       mixed_question_count       number of questions supporting the within-question metrics.
+
       correct_penalty_relief     question-centered improvement on every initially penalized
                                  successful rollout, weighted by its initial penalty magnitude.
+                                 Delta > 0 → the correct rollout was relieved
+                                 Delta = 0 → its relative treatment did not change
+                                 Delta < 0 → it became even more penalized
       correct_penalized_count    number of successful rollouts supporting that statistic.
-      wrong_ratio_delta          signed mean trace-ratio drift on incorrect rollouts.
+
+      wrong_ratio_delta          How training changes the teacher on incorrect held-out
+                                 trajectories relative to the initial PI-conditioned
+                                 teacher : signed mean trace-ratio drift on incorrect rollouts.
+                                 negative → failed rollouts became less preferred by the teacher
+                                 zero     → no average signed change
+                                 positive → failed rollouts became more preferred on average
       wrong_ratio_rms_drift      mean per-trace token-level RMS drift on incorrect rollouts.
-      ratio_dispersion_retained  current within-trace dispersion divided by its initial value.
-                                 One means preserved structure; zero means complete flattening.
-      credit_mass_last_quartile  share of sum|rho_t| falling in the last 25% of the trace. A
-                                 teacher that has learned to string-match the final answer only
-                                 moves at the end. `--pi-mode answer` is expected to trip this,
+
+                                 Signed delta | RMS drift | Interpretation |
+                                 |---:|---:|---|
+                                 | Near 0 | Near 0 | Failures were preserved |
+                                 | Negative | Similar magnitude | Mostly uniform suppression |
+                                 | Positive | Similar magnitude | Mostly uniform lifting |
+                                 | Near 0 | Large | Strong redistribution that cancels in the mean |
+                                 | Small negative | Much larger | Large mixed changes with a slight downward net effect
+
+                                 Desirable for asymmetric objective :
+                                 correct_penalty_relief > 0
+                                 wrong_ratio_delta     ≈ 0
+                                 wrong_ratio_rms_drift ≈ 0
+
+      ratio_dispersion_retained  Measures how much token-to-token variation remains
+                                 inside each trajectory relative to the initial
+                                 PI-conditioned teacher.
+                                 1.0       → same average amount of within-trajectory variation
+                                 0.5       → half the initial variation remains
+                                 near 0    → ratios have become nearly constant within trajectories
+                                 greater 1 → ratios have become more variable or spiky
+
+      credit_mass_last_quartile  Measures where the magnitude of the token-level
+                                 teacher–student ratio is concentrated.
+                                 It is designed to detect a teacher that only becomes
+                                 informative near the final answer.
+                                 `--pi-mode answer` is expected to trip this,
                                  which doubles as a positive control that the metric works.
+
+                                 approximately 0.25 → ratio magnitude distributed uniformly
+                                 greater than 0.25  → disproportionately late-firing
+                                 near 1.0           → almost all signal occurs near the end
+                                 less than 0.25     → more signal occurs in earlier portions
     """
     mask = mask.float()
     lengths = mask.sum(dim=1)
