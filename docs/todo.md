@@ -1,5 +1,4 @@
 ### Baselines
-- [x] eval with temp 1.0 (default TRL configs)
 - [ ] train on deepscaleR
 - [x] base models
 - [x] sft on base models 

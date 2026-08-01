@@ -193,22 +193,31 @@ def method_label(row: pd.Series, include_run: bool = True) -> str:
 
 
 def best_aime_by_algo(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """Select one best checkpoint per model and algorithm across all runs and variants.
+    """Select the best checkpoint per model, dataset, algorithm, and variant.
 
-    If scores tie, prefer the earlier checkpoint, then variant and run name for a
-    deterministic result. The base evaluation is treated as the `base` algorithm.
+    Checkpoints compete across runs, but variants remain separate. If scores tie,
+    prefer the earlier checkpoint, then the run name for a deterministic result.
+    The base evaluation is treated as the `base` algorithm with no variant.
     """
     candidates = frame.dropna(subset=[metric]).copy()
     candidates["_checkpoint_sort"] = candidates["checkpoint"].fillna(-1)
-    candidates["_variant_sort"] = candidates["variant"].fillna("")
+    candidates["_dataset_key"] = candidates["train_dataset"].fillna("")
+    candidates["_variant_key"] = candidates["variant"].fillna("")
     candidates["_run_sort"] = candidates["run"].fillna("")
     candidates = candidates.sort_values(
-        ["model", "algo", metric, "_checkpoint_sort", "_variant_sort", "_run_sort"],
-        ascending=[True, True, False, True, True, True],
+        [
+            "model", "_dataset_key", "algo", "_variant_key", metric,
+            "_checkpoint_sort", "_run_sort",
+        ],
+        ascending=[True, True, True, True, False, True, True],
     )
-    best = candidates.groupby(["model", "algo"], as_index=False, sort=False).head(1)
+    best = candidates.groupby(
+        ["model", "_dataset_key", "algo", "_variant_key"],
+        as_index=False,
+        sort=False,
+    ).head(1)
     return best.drop(
-        columns=["_checkpoint_sort", "_variant_sort", "_run_sort"]
+        columns=["_checkpoint_sort", "_dataset_key", "_variant_key", "_run_sort"]
     ).reset_index(drop=True)
 
 
@@ -301,11 +310,16 @@ plot_aime_curves(aime, "pass@1");
 
 
 # %% -------------------- AIME24 COMPARISON MATRIX -------------------- [markdown]
-# The table below is a compact model × algorithm view of the same best-checkpoint selection. `AIME_BEST_K` controls both the per-model tables and this matrix; blanks mean an algorithm has not yet been evaluated for that model.
+# The table below is a compact model × algorithm/variant view of the same best-checkpoint selection. `AIME_BEST_K` controls both the per-model tables and this matrix; blanks mean an arm has not yet been evaluated for that model.
 #
 
 # %% -------------------- DISPLAY AIME24 MATRIX --------------------
-best_matrix = aime_best.pivot(index="model", columns="algo", values=AIME_BEST_METRIC)
+aime_best["algorithm_variant"] = aime_best.apply(
+    lambda row: method_label(row, include_run=False), axis=1
+)
+best_matrix = aime_best.pivot(
+    index="model", columns="algorithm_variant", values=AIME_BEST_METRIC
+)
 display(
     best_matrix.style
     .format("{:.3f}", na_rep="—")
