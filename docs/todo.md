@@ -17,7 +17,7 @@
   - [x] value function prompt
   - [ ] value pretraining
   - [ ] decoupled gae (VC-PPO)
-  - [ ] sweep, anneal lambda with modified value functions
+  - [ ] sweep, anneal lambda (currently 1) with modified value functions
   - [ ] `value(h_t) = ⟨h_t, e_Yes − e_No⟩ = logit(Yes) − logit(No)`
   - [ ] Model value = σ(margin) with a 0/1 target -> make the output a calibrated probability
   - [ ] sweep, anneal lambda with modified value functions
