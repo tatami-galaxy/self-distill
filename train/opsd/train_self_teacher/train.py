@@ -8,7 +8,7 @@ teacher -- so that
 
     rho_t = log pi_phi(y_t | x, c, y_<t) - log pi_theta(y_t | x, y_<t)
 
-predicts whether the rollout it came from was correct. Two objectives (see train/opsd/train_self_teacher/lib.py
+predicts whether the rollout it came from was correct. Three objectives (see train/opsd/train_self_teacher/lib.py
 for the full rationale):
 
   --objective pointwise : regress each rho_t towards +/- tau.
@@ -17,6 +17,9 @@ for the full rationale):
   --objective endpoint  : regress only the trace total sigmoid(beta*S_T/N + b).
                           One constraint per trace instead of one per token, so per-token allocation
                           stays free and credit can be sparse. Gentler, cannot flatten.
+  --objective asymmetric: preserve rho_t^0 except on successful tokens it initially penalized.
+                          Those tokens are lifted towards a finite margin; failed trajectories and
+                          all non-targeted tokens are anchored to initialization.
 
 Stage 3 is only worth if this stage shows the ratio became outcome-predictive :
 INIT vs TRAINED, printed at startup and written to diagnostics_init.json.
@@ -37,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
     --model Qwen/Qwen3-4B --dataset deepmath --pi-mode hint --objective pointwise
 
 # the full ladder off the one rollout cache
-for pi in hint answer full none; do for obj in pointwise endpoint; do
+for pi in hint answer full none; do for obj in pointwise endpoint asymmetric; do
   CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
       --model Qwen/Qwen3-4B --pi-mode $pi --objective $obj; done; done
 
@@ -68,6 +71,7 @@ from train.opsd.train_self_teacher.lib import (
     collate_teacher_batch,
     concat_padded,
     log_ratio,
+    objective_asymmetric,
     objective_endpoint,
     objective_pointwise,
     rollout_path,
@@ -86,12 +90,17 @@ CALIBRATION_FILE = "calibration.pt"
 # Resume identity for the data boundary: older checkpoints trained on rows now held out.
 QUESTION_SPLIT_VERSION = "question_hash_v1"
 
+# The exact dataset-level weighting encoded in `asym_lift_weight`; part of run provenance because
+# changing it changes the objective even when every scalar hyperparameter stays fixed.
+ASYMMETRIC_WEIGHTING_VERSION = "eligible_success_question_equal_v1"
+
 
 class SelfTeacherTrainer(Trainer):
     """HF Trainer whose loss is the outcome regression on the teacher:student log ratio."""
 
     def __init__(self, *args, objective, pointwise_loss, tau, beta, length_norm,
-                 bias_learning_rate, kl_anchor, diag_crossfit_folds=5,
+                 bias_learning_rate, kl_anchor, asym_margin, asym_lift_alpha,
+                 asym_anchor_weight, diag_crossfit_folds=5,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.objective = objective
@@ -101,6 +110,9 @@ class SelfTeacherTrainer(Trainer):
         self.length_norm = length_norm
         self.bias_learning_rate = bias_learning_rate
         self.kl_anchor = kl_anchor
+        self.asym_margin = asym_margin
+        self.asym_lift_alpha = asym_lift_alpha
+        self.asym_anchor_weight = asym_anchor_weight
         self.diag_crossfit_folds = diag_crossfit_folds
         # VPD's delta: one scalar absorbing the outcome base rate so the ratio does not have to
         # encode it, and the "shift every rho by a constant" degenerate solution is unavailable.
@@ -157,14 +169,28 @@ class SelfTeacherTrainer(Trainer):
             loss = objective_pointwise(
                 ratios, mask, reward, tau=self.tau, loss=self.pointwise_loss, beta=self.beta
             )
-        else:
+        elif self.objective == "endpoint":
             loss = objective_endpoint(
                 ratios, mask, reward, self.beta, self.calibration_bias, self.length_norm
             )
+        elif self.objective == "asymmetric":
+            initial_ratios = log_ratio(inputs["teacher_logps_init"], inputs)
+            loss = objective_asymmetric(
+                ratios,
+                initial_ratios,
+                mask,
+                reward,
+                inputs["asym_lift_weight"],
+                margin=self.asym_margin,
+                lift_alpha=self.asym_lift_alpha,
+                anchor_weight=self.asym_anchor_weight,
+            )
+        else:
+            raise ValueError(f"unknown self-teacher objective {self.objective!r}")
 
         if self.kl_anchor > 0.0:
             # Proximal term against the teacher AT INIT, keeping it usable as an imitation target
-            # in stage 3. Needed because the R=0 branch of either objective is unlikelihood
+            # in stage 3. Needed because the R=0 branch of pointwise/endpoint is unlikelihood
             # training on PI-conformant tokens, which can improve the ratio while degrading the
             # text the teacher would generate.
             drift = (logps - inputs["teacher_logps_init"]) ** 2
@@ -319,17 +345,17 @@ class SelfTeacherTrainer(Trainer):
 
 
 # ---------------------------------------------------------------------------
-# Init-teacher pre-pass for --kl-anchor
+# Init-teacher pre-pass for initialization-anchored objectives
 # ---------------------------------------------------------------------------
 
 
 def add_init_teacher_logps(dataset, model, collate, device) -> "Dataset":
-    """Score every row under the UNTRAINED teacher, so the anchor has something to pull towards.
+    """Score every row under the UNTRAINED teacher to freeze its token-level reference.
 
-    One no-grad pass at startup. Only run when --kl-anchor > 0; otherwise the column is absent
-    and the collator omits it.
+    One no-grad pass at startup, used by either --kl-anchor or --objective asymmetric. The
+    collator omits the column for objectives that do not need it.
     """
-    print(f"  --kl-anchor: scoring {len(dataset)} rows under the initial teacher")
+    print(f"  scoring {len(dataset)} rows under the initial teacher")
     was_training = model.training
     model.eval()
     all_logps: list[list[float]] = []
@@ -344,6 +370,62 @@ def add_init_teacher_logps(dataset, model, collate, device) -> "Dataset":
     finally:
         model.train(was_training)
     return dataset.add_column("teacher_logps_init", all_logps)
+
+
+def add_asymmetric_lift_weights(dataset, margin: float = 0.0) -> "Dataset":
+    """Attach static row weights that make the lift loss equal across eligible questions.
+
+    Under uniform row sampling, `N / (Q_E * |E_q|)` on each eligible successful rollout gives
+    each eligible question total expected lift mass `1 / Q_E`. The weight stays unnormalized in
+    each training batch; normalizing it there would erase the correction at physical batch one.
+    """
+    required = {"question", "reward", "student_logps", "teacher_logps_init"}
+    missing = required.difference(dataset.column_names)
+    if missing:
+        raise ValueError(f"cannot build asymmetric lift weights; missing columns {sorted(missing)}")
+
+    eligible: list[bool] = []
+    targeted_counts: list[int] = []
+    eligible_per_question: dict[str, int] = {}
+    for question, reward, student_logps, initial_teacher_logps in zip(
+        dataset["question"], dataset["reward"], dataset["student_logps"],
+        dataset["teacher_logps_init"], strict=True,
+    ):
+        if len(student_logps) != len(initial_teacher_logps):
+            raise ValueError("student_logps and teacher_logps_init must align token for token")
+        initial_ratios = (
+            torch.tensor(initial_teacher_logps, dtype=torch.float32)
+            - torch.tensor(student_logps, dtype=torch.float32)
+        )
+        n_targeted = int((initial_ratios < margin).sum().item())
+        is_eligible = float(reward) > 0.5 and n_targeted > 0
+        eligible.append(is_eligible)
+        targeted_counts.append(n_targeted)
+        if is_eligible:
+            eligible_per_question[question] = eligible_per_question.get(question, 0) + 1
+
+    n_rows = len(dataset)
+    n_questions = len(eligible_per_question)
+    if n_questions == 0:
+        print("  asymmetric: no successful rollout has a token below the lift margin")
+        weights = [0.0] * n_rows
+    else:
+        weights = [
+            n_rows / (n_questions * eligible_per_question[question]) if is_eligible else 0.0
+            for question, is_eligible in zip(dataset["question"], eligible, strict=True)
+        ]
+        n_lift_tokens = sum(
+            count for count, is_eligible in zip(targeted_counts, eligible, strict=True)
+            if is_eligible
+        )
+        print(
+            f"  asymmetric: {sum(eligible)}/{n_rows} eligible successful rollouts across "
+            f"{n_questions} questions ({n_lift_tokens} fixed lift tokens)"
+        )
+
+    if "asym_lift_weight" in dataset.column_names:
+        dataset = dataset.remove_columns("asym_lift_weight")
+    return dataset.add_column("asym_lift_weight", weights)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +550,14 @@ def build_run_meta(
         "beta": args.beta,
         "length_norm": args.length_norm,
         "kl_anchor": args.kl_anchor,
+        "asym_margin": getattr(args, "asym_margin", None) if args.objective == "asymmetric" else None,
+        "asym_lift_alpha": (
+            getattr(args, "asym_lift_alpha", None) if args.objective == "asymmetric" else None
+        ),
+        "asym_anchor_weight": (
+            getattr(args, "asym_anchor_weight", None) if args.objective == "asymmetric" else None
+        ),
+        "asym_weighting": ASYMMETRIC_WEIGHTING_VERSION if args.objective == "asymmetric" else None,
         "max_teacher_prompt_length": args.max_teacher_prompt_length,
         # resume-critical, learning rates: on resume these come from the CHECKPOINT, not the CLI
         # (optimizer.load_state_dict restores each group's lr AFTER create_scheduler), so
@@ -512,9 +602,11 @@ def main():
                         "question and the chat template header and keep the demo. Binding for "
                         "--pi-mode full only.")
     # objective
-    p.add_argument("--objective", default="pointwise", choices=["pointwise", "endpoint"],
+    p.add_argument("--objective", default="pointwise",
+                   choices=["pointwise", "endpoint", "asymmetric"],
                    help="pointwise regresses every rho_t towards +/-tau; "
-                        "endpoint regresses only the trace total.")
+                        "endpoint regresses only the trace total; asymmetric lifts successful, "
+                        "initially penalized tokens and anchors the complement.")
     p.add_argument("--pointwise-loss", default="squared", choices=["squared", "logistic"],
                    help="For --objective pointwise. 'squared' targets a bounded +/-tau on the RAW "
                         "ratio (finite fixed point). 'logistic' is BCE on beta*rho, whose gradient "
@@ -524,6 +616,15 @@ def main():
                    help="Target magnitude in nats per token for --pointwise-loss squared.")
     p.add_argument("--beta", type=float, default=1.0,
                    help="Scale on the ratio inside the sigmoid (endpoint / logistic).")
+    p.add_argument("--asym-margin", type=float, default=0.0,
+                   help="For --objective asymmetric: only successful tokens with rho^0 below this "
+                        "margin enter the fixed lift set.")
+    p.add_argument("--asym-lift-alpha", type=float, default=1.0,
+                   help="For --objective asymmetric: fraction of the rho^0-to-margin gap used as "
+                        "the finite lift target. Must be in [0, 1].")
+    p.add_argument("--asym-anchor-weight", type=float, default=1.0,
+                   help="For --objective asymmetric: coefficient on initialization drift over the "
+                        "complement of the fixed lift set.")
     p.add_argument("--length-norm", default="mean", choices=list(LENGTH_NORMS),
                    help="Divisor on S_T for --objective endpoint. 'mean' (per token) removes the "
                         "length dependence; with 'none' a fixed beta saturates the sigmoid on long "
@@ -576,6 +677,12 @@ def main():
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
+    if not 0.0 <= args.asym_lift_alpha <= 1.0:
+        p.error("--asym-lift-alpha must be between 0 and 1")
+    if args.asym_anchor_weight < 0.0:
+        p.error("--asym-anchor-weight must be non-negative")
+    if args.objective == "asymmetric" and args.kl_anchor > 0.0:
+        p.error("--kl-anchor cannot be combined with --objective asymmetric; its anchor overlaps the lift set")
     if not 0 < args.validation_fraction < 1:
         p.error("--validation-fraction must be strictly between 0 and 1")
     if args.diag_rows <= 0:
@@ -736,14 +843,19 @@ def main():
         length_norm=args.length_norm,
         bias_learning_rate=args.bias_learning_rate,
         kl_anchor=args.kl_anchor,
+        asym_margin=args.asym_margin,
+        asym_lift_alpha=args.asym_lift_alpha,
+        asym_anchor_weight=args.asym_anchor_weight,
         diag_crossfit_folds=args.diag_crossfit_folds,
     )
 
-    if args.kl_anchor > 0.0:
+    if args.kl_anchor > 0.0 or args.objective == "asymmetric":
         train_dataset = add_init_teacher_logps(
             train_dataset, trainer.model, collate,
             trainer.accelerator.device,
         )
+        if args.objective == "asymmetric":
+            train_dataset = add_asymmetric_lift_weights(train_dataset, args.asym_margin)
         trainer.train_dataset = train_dataset
 
     # -- init diagnostics: the baseline every later reading is compared against --

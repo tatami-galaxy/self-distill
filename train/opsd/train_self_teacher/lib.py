@@ -29,8 +29,8 @@ un-informed student, so `sigmoid(S_t)` reads as "how teacher-like is this prefix
 onto the outcome is the direct statement of the goal: TEACHER-LIKENESS SHOULD MEAN
 SUCCESS-LIKENESS, NOT PI-CONFORMITY.
 
-Two objectives, differing in how hard they constrain the teacher (see `objective_pointwise` and
-`objective_endpoint`). A third -- regressing every prefix `S_t`, the full process-reward variant
+Three objectives, differing in how hard they constrain the teacher (see `objective_pointwise`,
+`objective_endpoint`, and `objective_asymmetric`). A fourth -- regressing every prefix `S_t`, the full process-reward variant
 -- is deliberately not implemented yet; it is one extra target in `objective_endpoint`.
 
 THE STUDENT IS FROZEN throughout stages 1-2, which is what lets stage 1 cache `student_logps`
@@ -255,12 +255,16 @@ def collate_teacher_batch(rows: list[dict], pad_token_id: int) -> dict:
         "student_logps": pad(student_logps, padding_value=0.0, padding_side="right"),
         "reward": torch.tensor([float(r["reward"]) for r in rows], dtype=torch.float32),
     }
-    # Present only under --kl-anchor, which adds it in a pre-pass; carried the same way as
-    # student_logps so the anchor term lines up token for token.
+    # Present when an initialization-anchored loss needs it; carried the same way as student_logps
+    # so the reference ratio and anchor term line up token for token.
     if "teacher_logps_init" in rows[0]:
         batch["teacher_logps_init"] = pad(
             [torch.tensor(r["teacher_logps_init"], dtype=torch.float32) for r in rows],
             padding_value=0.0, padding_side="right",
+        )
+    if "asym_lift_weight" in rows[0]:
+        batch["asym_lift_weight"] = torch.tensor(
+            [float(r["asym_lift_weight"]) for r in rows], dtype=torch.float32
         )
     return batch
 
@@ -510,6 +514,79 @@ def objective_endpoint(
     return F.binary_cross_entropy_with_logits(
         sequence_logit(ratios, mask, beta, bias, length_norm), reward
     )
+
+
+def asymmetric_lift_mask(
+    initial_ratios: torch.Tensor,
+    mask: torch.Tensor,
+    reward: torch.Tensor,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """The FIXED set of successful, initially penalized completion tokens to lift.
+
+    The decision is made from `rho^0`, not the current ratio, so a token remains in the lift set
+    after it crosses the margin and trains towards a finite target instead of switching losses.
+    """
+    # This is intentionally the simplest lift policy. A later version may replace it with a
+    # semantically targeted mask -- for example, lifting only penalized uncertainty-verbalization
+    # tokens -- without changing the loss or the question-balancing machinery below.
+    return (
+        mask.bool()
+        & (reward.view(-1, 1) > 0.5)
+        & (initial_ratios.detach() < margin)
+    )
+
+
+def _masked_row_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Masked mean within each row; empty rows contribute zero."""
+    mask = mask.to(dtype=x.dtype)
+    return (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+
+def objective_asymmetric(
+    ratios: torch.Tensor,
+    initial_ratios: torch.Tensor,
+    mask: torch.Tensor,
+    reward: torch.Tensor,
+    lift_weight: torch.Tensor,
+    margin: float = 0.0,
+    lift_alpha: float = 1.0,
+    anchor_weight: float = 1.0,
+) -> torch.Tensor:
+    """Lift only successful tokens the initial PI teacher penalized; preserve everything else.
+
+    For a targeted token, the finite target is
+
+        rho^target = rho^0 + alpha * (margin - rho^0).
+
+    `lift_weight` is computed once for the whole training set so the expected lift contribution is
+    equal across eligible questions. It must NOT be normalized inside the physical batch: model
+    forwards are one row wide, where such normalization would cancel the balancing entirely.
+
+    The anchor is the exact complement of the fixed lift mask over real completion tokens. Thus a
+    token is never simultaneously pulled toward the lift target and back toward initialization.
+    """
+    if not 0.0 <= lift_alpha <= 1.0:
+        raise ValueError("lift_alpha must be between 0 and 1")
+    if anchor_weight < 0.0:
+        raise ValueError("anchor_weight must be non-negative")
+    if ratios.shape != initial_ratios.shape or ratios.shape != mask.shape:
+        raise ValueError("ratios, initial_ratios, and mask must have identical shapes")
+    if lift_weight.numel() != ratios.size(0):
+        raise ValueError("lift_weight must contain one scalar per rollout")
+
+    initial_ratios = initial_ratios.detach()
+    completion_mask = mask.bool()
+    lift_mask = asymmetric_lift_mask(initial_ratios, completion_mask, reward, margin)
+    anchor_mask = completion_mask & ~lift_mask
+
+    lift_target = initial_ratios + lift_alpha * (margin - initial_ratios)
+    lift_per_row = _masked_row_mean((ratios - lift_target) ** 2, lift_mask)
+    lift_loss = (lift_weight.view(-1).to(lift_per_row) * lift_per_row).mean()
+
+    anchor_per_row = _masked_row_mean((ratios - initial_ratios) ** 2, anchor_mask)
+    anchor_loss = anchor_per_row.mean()
+    return lift_loss + anchor_weight * anchor_loss
 
 
 # ---------------------------------------------------------------------------

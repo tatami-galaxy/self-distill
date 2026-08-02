@@ -35,7 +35,7 @@
     - [x] Endpoint: apply
       `BCEWithLogits(beta * mean_t(rho_t) + b, R)` once per trajectory, with a learned
       base-rate bias `b`, leaving the allocation of credit across tokens unconstrained.
-    - [ ] Asymmetric initialization-anchored objective: preserve the initial PI-conditioned
+    - [x] Asymmetric initialization-anchored objective: preserve the initial PI-conditioned
       ratio `rho_t^0` except where a successful rollout contradicts it. Use
       `rho_t^target = rho_t^0 + alpha * R * max(m - rho_t^0, 0)`, so successful,
       PI-disfavored tokens are lifted toward a zero or small positive margin `m`, while failed

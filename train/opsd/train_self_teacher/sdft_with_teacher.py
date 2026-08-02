@@ -140,6 +140,10 @@ def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
         "teacher_pi_mode": teacher_meta.get("pi_mode"),
         "teacher_tau": teacher_meta.get("tau"),
         "teacher_beta": teacher_meta.get("beta"),
+        "teacher_asym_margin": teacher_meta.get("asym_margin"),
+        "teacher_asym_lift_alpha": teacher_meta.get("asym_lift_alpha"),
+        "teacher_asym_anchor_weight": teacher_meta.get("asym_anchor_weight"),
+        "teacher_asym_weighting": teacher_meta.get("asym_weighting"),
         "teacher_prompt_template": teacher_prompt_template(args.pi_mode),
         "model": args.model,
         "pi_mode": args.pi_mode,
@@ -180,7 +184,7 @@ def main():
                    help="Distinct from outputs/sdft: run_meta.json lives at the run root, so "
                         "sharing a root would have the two arms overwrite each other's provenance.")
     p.add_argument("--output-dir", default=None,
-                   help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>")
+                   help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>_<teacher-objective>")
     p.add_argument("--max-samples", type=int, default=None)
     # privileged context -- must match the teacher's
     p.add_argument("--pi-mode", default="hint", choices=list(PI_MODES),
@@ -260,8 +264,9 @@ def main():
         )
 
     model_slug = args.model.rstrip("/").split("/")[-1]
+    teacher_objective = teacher_meta.get("objective") or "unknown"
     output_dir = args.output_dir or os.path.join(
-        args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}"
+        args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}_{teacher_objective}"
     )
     print(f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  ->  {output_dir}")
     print(f"  teacher: {args.teacher_path}")

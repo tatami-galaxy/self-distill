@@ -23,12 +23,14 @@ import torch
 
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
 from train.opsd.train_self_teacher.lib import (
+    asymmetric_lift_mask,
     calibration_metrics,
     collate_teacher_batch,
     compose_teacher_messages,
     fit_logistic,
     log_ratio,
     macro_group_rank_auc,
+    objective_asymmetric,
     objective_endpoint,
     objective_pointwise,
     privileged_context,
@@ -139,8 +141,8 @@ class CollationAlignmentTest(unittest.TestCase):
         )
 
     def test_init_logps_ride_along_only_when_present(self):
-        # --kl-anchor adds `teacher_logps_init` in a pre-pass. The collator has to carry it, and
-        # must not require it: every run without the anchor has no such column.
+        # Initialization-anchored losses add this in a pre-pass. The collator has to carry it, and
+        # must not require it: objectives without an initialization reference have no such column.
         rows = self.make_rows()
         self.assertNotIn("teacher_logps_init", collate_teacher_batch(rows, pad_token_id=0))
 
@@ -153,6 +155,13 @@ class CollationAlignmentTest(unittest.TestCase):
             "would compare different tokens",
         )
         self.assertEqual(batch["teacher_logps_init"][1].tolist(), [-2.0, 0.0, 0.0])
+
+    def test_asymmetric_row_weight_rides_along_when_present(self):
+        rows = self.make_rows()
+        rows[0]["asym_lift_weight"] = 1.25
+        rows[1]["asym_lift_weight"] = 2.5
+        batch = collate_teacher_batch(rows, pad_token_id=0)
+        self.assertTrue(torch.equal(batch["asym_lift_weight"], torch.tensor([1.25, 2.5])))
 
     def test_student_logps_pad_to_zero_and_the_ratio_masks_them(self):
         batch = collate_teacher_batch(self.make_rows(), pad_token_id=0)
@@ -343,6 +352,77 @@ class EndpointObjectiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown length_norm"):
             sequence_logit(torch.zeros(1, 2), torch.ones(1, 2), 1.0, torch.tensor(0.0), "log")
 
+
+class AsymmetricObjectiveTest(unittest.TestCase):
+    """Only successful, initially penalized tokens move; the complement stays anchored."""
+
+    def test_lift_mask_is_fixed_and_target_is_finite(self):
+        initial = torch.tensor([[-0.4, -0.1, 0.0, 0.2]])
+        mask = torch.ones(1, 4)
+        reward = torch.tensor([1.0])
+
+        lift_mask = asymmetric_lift_mask(initial, mask, reward, margin=0.0)
+        self.assertEqual(lift_mask.tolist(), [[True, True, False, False]])
+
+        ratios = initial.clone().requires_grad_(True)
+        loss = objective_asymmetric(
+            ratios,
+            initial,
+            mask,
+            reward,
+            torch.ones(1),
+            margin=0.0,
+            lift_alpha=0.5,
+        )
+        (grad,) = torch.autograd.grad(loss, ratios)
+        self.assertLess(grad[0, 0].item(), 0.0)
+        self.assertLess(grad[0, 1].item(), 0.0)
+        self.assertEqual(grad[0, 2].item(), 0.0)
+        self.assertEqual(grad[0, 3].item(), 0.0)
+
+        target = torch.tensor([[-0.2, -0.05, 0.0, 0.2]])
+        zero_loss = objective_asymmetric(
+            target,
+            initial,
+            mask,
+            reward,
+            torch.ones(1),
+            margin=0.0,
+            lift_alpha=0.5,
+        )
+        self.assertAlmostEqual(zero_loss.item(), 0.0, places=7)
+
+    def test_failed_rollout_is_anchor_only(self):
+        initial = torch.tensor([[-0.4, 0.2]])
+        ratios = torch.tensor([[-0.1, 0.5]], requires_grad=True)
+        loss = objective_asymmetric(
+            ratios, initial, torch.ones(1, 2), torch.tensor([0.0]), torch.zeros(1)
+        )
+        (grad,) = torch.autograd.grad(loss, ratios)
+        self.assertAlmostEqual(loss.item(), 0.09, places=6)
+        self.assertGreater(grad[0, 0].item(), 0.0)
+        self.assertGreater(grad[0, 1].item(), 0.0)
+
+    def test_successful_token_above_margin_is_anchored(self):
+        initial = torch.tensor([[0.2]])
+        ratios = torch.tensor([[0.4]])
+        loss = objective_asymmetric(
+            ratios, initial, torch.ones(1, 1), torch.ones(1), torch.zeros(1)
+        )
+        self.assertAlmostEqual(loss.item(), 0.04, places=6)
+
+    def test_padding_is_excluded_from_both_disjoint_masks(self):
+        full_initial = torch.tensor([[-0.4, 100.0]])
+        full_ratios = torch.tensor([[-0.2, -999.0]])
+        full_mask = torch.tensor([[1.0, 0.0]])
+        full_loss = objective_asymmetric(
+            full_ratios, full_initial, full_mask, torch.ones(1), torch.ones(1)
+        )
+        short_loss = objective_asymmetric(
+            full_ratios[:, :1], full_initial[:, :1], torch.ones(1, 1),
+            torch.ones(1), torch.ones(1),
+        )
+        self.assertAlmostEqual(full_loss.item(), short_loss.item(), places=7)
 
 class CalibrationBiasOptimizerTest(unittest.TestCase):
     def test_bias_grad_accumulates_within_step_and_clears_after_optimizer_step(self):
@@ -705,6 +785,47 @@ class QuestionSplitTest(unittest.TestCase):
         self.assertLessEqual(len(diagnostic), 10)
         self.assertEqual(set(diagnostic["question"]), set(questions))
         self.assertTrue(all(diagnostic["question"].count(q) == 4 for q in questions))
+
+
+class AsymmetricQuestionWeightTest(unittest.TestCase):
+    """Static row weights must recover a macro-average over eligible questions."""
+
+    @staticmethod
+    def make_dataset(rows):
+        from datasets import Dataset
+
+        return Dataset.from_list(rows)
+
+    def test_each_eligible_question_gets_equal_total_weight(self):
+        from train.opsd.train_self_teacher.train import (
+            add_asymmetric_lift_weights,
+        )
+
+        dataset = self.make_dataset(
+            [
+                {"question": "q1", "reward": 1.0, "student_logps": [0.0], "teacher_logps_init": [-0.4]},
+                {"question": "q1", "reward": 1.0, "student_logps": [0.0], "teacher_logps_init": [-0.1]},
+                {"question": "q2", "reward": 1.0, "student_logps": [0.0], "teacher_logps_init": [-0.2]},
+                {"question": "q3", "reward": 0.0, "student_logps": [0.0], "teacher_logps_init": [-0.5]},
+            ]
+        )
+        weighted = add_asymmetric_lift_weights(dataset, margin=0.0)
+        weights = weighted["asym_lift_weight"]
+        self.assertEqual(weights, [1.0, 1.0, 2.0, 0.0])
+        self.assertAlmostEqual(sum(weights[:2]), weights[2])
+        self.assertAlmostEqual(sum(weights), len(dataset))
+
+    def test_no_eligible_question_produces_zero_lift_weights(self):
+        from train.opsd.train_self_teacher.train import add_asymmetric_lift_weights
+
+        dataset = self.make_dataset(
+            [
+                {"question": "q1", "reward": 1.0, "student_logps": [0.0], "teacher_logps_init": [0.0]},
+                {"question": "q2", "reward": 0.0, "student_logps": [0.0], "teacher_logps_init": [-0.5]},
+            ]
+        )
+        weighted = add_asymmetric_lift_weights(dataset, margin=0.0)
+        self.assertEqual(weighted["asym_lift_weight"], [0.0, 0.0])
 
 
 class StageThreeResumeTest(unittest.TestCase):
