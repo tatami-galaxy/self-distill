@@ -31,5 +31,6 @@
     - [x] Pointwise
     - [x] Endpoint
     - [x] Asymmetric
+    - [x] Asymmetric cumulative
     - [ ] Hyperparameter sweep
 - [ ] Analyze PI conditioned self-teacher behavior (rollouts, log ratios)

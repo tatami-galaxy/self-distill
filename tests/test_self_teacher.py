@@ -424,6 +424,54 @@ class AsymmetricObjectiveTest(unittest.TestCase):
         )
         self.assertAlmostEqual(full_loss.item(), short_loss.item(), places=7)
 
+    def test_cumulative_lift_allows_token_residuals_to_compensate(self):
+        initial = torch.tensor([[-0.4, -0.2]])
+        ratios = torch.tensor([[-0.1, 0.1]])
+        args = (initial, torch.ones(1, 2), torch.ones(1), torch.ones(1))
+
+        pointwise = objective_asymmetric(ratios, *args, lift_reduction="pointwise")
+        cumulative = objective_asymmetric(ratios, *args, lift_reduction="cumulative")
+
+        self.assertGreater(pointwise.item(), 0.0)
+        self.assertAlmostEqual(cumulative.item(), 0.0, places=7)
+
+    def test_cumulative_lift_has_equal_gradient_on_every_lift_token(self):
+        initial = torch.tensor([[-0.4, -0.2]])
+        ratios = initial.clone().requires_grad_(True)
+        loss = objective_asymmetric(
+            ratios,
+            initial,
+            torch.ones(1, 2),
+            torch.ones(1),
+            torch.ones(1),
+            lift_reduction="cumulative",
+        )
+        (grad,) = torch.autograd.grad(loss, ratios)
+
+        self.assertLess(grad[0, 0].item(), 0.0)
+        self.assertAlmostEqual(grad[0, 0].item(), grad[0, 1].item(), places=7)
+
+    def test_cumulative_matches_pointwise_for_one_lift_token(self):
+        initial = torch.tensor([[-0.4]])
+        ratios = torch.tensor([[-0.1]])
+        args = (initial, torch.ones(1, 1), torch.ones(1), torch.ones(1))
+
+        pointwise = objective_asymmetric(ratios, *args, lift_reduction="pointwise")
+        cumulative = objective_asymmetric(ratios, *args, lift_reduction="cumulative")
+
+        self.assertAlmostEqual(pointwise.item(), cumulative.item(), places=7)
+
+    def test_rejects_unknown_lift_reduction(self):
+        with self.assertRaisesRegex(ValueError, "unknown asymmetric lift reduction"):
+            objective_asymmetric(
+                torch.zeros(1, 1),
+                -torch.ones(1, 1),
+                torch.ones(1, 1),
+                torch.ones(1),
+                torch.ones(1),
+                lift_reduction="prefix",
+            )
+
 class CalibrationBiasOptimizerTest(unittest.TestCase):
     def test_bias_grad_accumulates_within_step_and_clears_after_optimizer_step(self):
         """The external bias is not reached by Trainer's `model.zero_grad()`."""

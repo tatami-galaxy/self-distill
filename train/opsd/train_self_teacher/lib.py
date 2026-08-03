@@ -29,9 +29,11 @@ un-informed student, so `sigmoid(S_t)` reads as "how teacher-like is this prefix
 onto the outcome is the direct statement of the goal: TEACHER-LIKENESS SHOULD MEAN
 SUCCESS-LIKENESS, NOT PI-CONFORMITY.
 
-Three objectives, differing in how hard they constrain the teacher (see `objective_pointwise`,
-`objective_endpoint`, and `objective_asymmetric`). A fourth -- regressing every prefix `S_t`, the full process-reward variant
--- is deliberately not implemented yet; it is one extra target in `objective_endpoint`.
+Four CLI objectives, differing in how hard they constrain the teacher (see
+`objective_pointwise`, `objective_endpoint`, and `objective_asymmetric`). The asymmetric family
+has pointwise and cumulative lift reductions. Regressing every prefix `S_t` -- the full
+process-reward variant -- is deliberately not implemented yet; it is one extra target in
+`objective_endpoint`.
 
 THE STUDENT IS FROZEN throughout stages 1-2, which is what lets stage 1 cache `student_logps`
 and stage 2 hold only the teacher in memory. That shortcut encodes the probe's premise and goes
@@ -71,6 +73,7 @@ MODEL_FORWARD_BATCH_SIZE = 1
 TEACHER_VERSION = "logratio_v1"
 
 LENGTH_NORMS = ("mean", "sqrt", "none")
+ASYMMETRIC_LIFT_REDUCTIONS = ("pointwise", "cumulative")
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +555,7 @@ def objective_asymmetric(
     margin: float = 0.0,
     lift_alpha: float = 1.0,
     anchor_weight: float = 1.0,
+    lift_reduction: str = "pointwise",
 ) -> torch.Tensor:
     """Lift only successful tokens the initial PI teacher penalized; preserve everything else.
 
@@ -563,6 +567,12 @@ def objective_asymmetric(
     equal across eligible questions. It must NOT be normalized inside the physical batch: model
     forwards are one row wide, where such normalization would cancel the balancing entirely.
 
+    With `lift_reduction="pointwise"`, every targeted token is regressed separately. With
+    `lift_reduction="cumulative"`, only the terminal masked aggregate is constrained: opposing
+    residuals may cancel, leaving the model free to allocate the required lift sparsely. The
+    aggregate is normalized by the number of lift tokens before squaring so rows with large masks
+    do not dominate merely because their residual sum has a larger scale.
+
     The anchor is the exact complement of the fixed lift mask over real completion tokens. Thus a
     token is never simultaneously pulled toward the lift target and back toward initialization.
     """
@@ -570,6 +580,11 @@ def objective_asymmetric(
         raise ValueError("lift_alpha must be between 0 and 1")
     if anchor_weight < 0.0:
         raise ValueError("anchor_weight must be non-negative")
+    if lift_reduction not in ASYMMETRIC_LIFT_REDUCTIONS:
+        raise ValueError(
+            f"unknown asymmetric lift reduction {lift_reduction!r}; "
+            f"expected one of {ASYMMETRIC_LIFT_REDUCTIONS}"
+        )
     if ratios.shape != initial_ratios.shape or ratios.shape != mask.shape:
         raise ValueError("ratios, initial_ratios, and mask must have identical shapes")
     if lift_weight.numel() != ratios.size(0):
@@ -581,7 +596,13 @@ def objective_asymmetric(
     anchor_mask = completion_mask & ~lift_mask
 
     lift_target = initial_ratios + lift_alpha * (margin - initial_ratios)
-    lift_per_row = _masked_row_mean((ratios - lift_target) ** 2, lift_mask)
+    lift_residual = ratios - lift_target
+    if lift_reduction == "pointwise":
+        lift_per_row = _masked_row_mean(lift_residual ** 2, lift_mask)
+    else:
+        # Constraining every masked prefix would identify each increment separately and collapse
+        # back towards the pointwise objective; this constrains only the terminal aggregate.
+        lift_per_row = _masked_row_mean(lift_residual, lift_mask) ** 2
     lift_loss = (lift_weight.view(-1).to(lift_per_row) * lift_per_row).mean()
 
     anchor_per_row = _masked_row_mean((ratios - initial_ratios) ** 2, anchor_mask)

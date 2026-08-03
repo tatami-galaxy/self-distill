@@ -144,6 +144,7 @@ def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
         "teacher_asym_lift_alpha": teacher_meta.get("asym_lift_alpha"),
         "teacher_asym_anchor_weight": teacher_meta.get("asym_anchor_weight"),
         "teacher_asym_weighting": teacher_meta.get("asym_weighting"),
+        "teacher_asym_lift_reduction": teacher_meta.get("asym_lift_reduction"),
         "teacher_prompt_template": teacher_prompt_template(args.pi_mode),
         "model": args.model,
         "pi_mode": args.pi_mode,
