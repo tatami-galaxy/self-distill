@@ -17,9 +17,10 @@ E-step loss down by reading the QUESTION's difficulty and ignoring the trace ent
 within-question discrimination. The mixed-outcome fraction is reported below, and `--mixed-only`
 keeps just those questions.
 
-Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns
-question, final_answer, completion_ids, completion_text, reward, student_logps, n_tokens,
-gen_model, dataset, question_source.
+Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns rollout_id,
+question_id, question, final_answer, completion_ids, completion_text, reward, student_logps,
+n_tokens, finish_reason, truncated, question_idx, sample_idx, generation_seed,
+max_completion_length, gen_model, dataset, question_source.
 
 Scoring always runs in a spawned process. It is a correctness requirement :
 Initialising vLLM leaves global torch state altered, and freeing the engine does not restore it,
@@ -33,6 +34,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollou
 
 import argparse
 import gc
+import hashlib
+import json
 import multiprocessing
 import os
 from collections import defaultdict
@@ -57,6 +60,30 @@ def summarize_outcomes(rows: list[dict]) -> tuple[float, float]:
     mixed = sum(1 for rewards in by_question.values() if 0 < sum(rewards) < len(rewards))
     pass_rate = sum(r["reward"] for r in rows) / max(len(rows), 1)
     return pass_rate, mixed / max(len(by_question), 1)
+
+
+def rollout_id(
+    model: str,
+    dataset: str,
+    question: str,
+    sample_idx: int,
+    completion_ids: list[int],
+    seed: int,
+) -> str:
+    """Stable identity for one generated sample, independent of later score conditions."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "dataset": dataset,
+            "question": question,
+            "sample_idx": sample_idx,
+            "completion_ids": completion_ids,
+            "seed": seed,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
 def generate(args, out_dir: str) -> None:
@@ -89,16 +116,30 @@ def generate(args, out_dir: str) -> None:
     sampling = SamplingParams(n=args.n, max_tokens=args.max_completion_length, seed=args.seed)
     outputs = llm.generate(prompts, sampling)
     rows = []
-    for row, output in zip(ds, outputs, strict=True):
-        for completion in output.outputs:
+    for question_idx, (row, output) in enumerate(zip(ds, outputs, strict=True)):
+        question_id = hashlib.sha256(row["question"].encode()).hexdigest()[:20]
+        for sample_idx, completion in enumerate(output.outputs):
             _, correct = grade(completion.text, row["final_answer"])
+            completion_ids = list(completion.token_ids)
+            finish_reason = str(completion.finish_reason or "unknown")
             rows.append({
+                "rollout_id": rollout_id(
+                    args.model, args.dataset, row["question"], sample_idx,
+                    completion_ids, args.seed,
+                ),
+                "question_id": question_id,
                 "question": row["question"],
                 "final_answer": str(row["final_answer"]),
-                "completion_ids": list(completion.token_ids),
+                "completion_ids": completion_ids,
                 "completion_text": completion.text,
                 "reward": float(correct),
-                "n_tokens": len(completion.token_ids),
+                "n_tokens": len(completion_ids),
+                "finish_reason": finish_reason,
+                "truncated": finish_reason == "length",
+                "question_idx": question_idx,
+                "sample_idx": sample_idx,
+                "generation_seed": args.seed,
+                "max_completion_length": args.max_completion_length,
                 "gen_model": args.model,
                 "dataset": args.dataset,
                 "question_source": "hints",

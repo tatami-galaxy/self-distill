@@ -1,5 +1,5 @@
 """
-Characterize the *generation behavior* of an SDFT teacher under each privileged
+Characterize the GENERATION BEHAVIOR of an SDFT teacher under each privileged
 context (PI), and contrast the self-teacher (OPSD) with a strong external teacher
 (OPD).
 
@@ -32,7 +32,7 @@ problem-for-problem and every mean shares a denominator.
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
     --teacher-model Qwen/Qwen3-1.7B --pi-modes none answer hint full
 
-# strong teacher (OPD), query-only, same problems 
+# strong teacher (OPD), query-only, same problems
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
     --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
     --problem-model Qwen/Qwen3-1.7B --pi-modes none

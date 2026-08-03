@@ -42,6 +42,7 @@ away if the E- and M-steps are ever alternated.
 
 import hashlib
 import os
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -288,6 +289,18 @@ def teacher_inputs(batch: dict) -> tuple[torch.Tensor, torch.Tensor, int]:
 # Rows of the flattened (B*C, V) logit tensor converted to float32 at a time. Bounds the peak
 # float32 footprint of the log-softmax to chunk * vocab * 4 bytes (~620MB at 1024 x 151669).
 LOGP_CHUNK = 1024
+# Entropy needs the full normalized distribution for each row, so its float32 reduction
+# materializes more temporaries than selected-token log-probability alone. A smaller default
+# keeps the peak comfortably below the logp-only path (~155 MB per float32 tensor for Qwen's
+# 151,669-token vocabulary).
+ENTROPY_CHUNK = 256
+
+
+class PerTokenStats(NamedTuple):
+    """Selected-token log-probability and next-token entropy, both float32 and shape (1, C)."""
+
+    logps: torch.Tensor
+    entropy: torch.Tensor
 
 
 def _selective_logps_fp32(
@@ -326,6 +339,62 @@ def _selective_logps_fp32(
     return torch.cat(chunks).view(n_rows, n_tokens)
 
 
+def _selective_logps_entropy_fp32(
+    logits: torch.Tensor, index: torch.Tensor, chunk_size: int = ENTROPY_CHUNK
+) -> PerTokenStats:
+    """Selected log p and categorical entropy under `logits`, reduced in float32.
+
+    Entropy is reported in nats. The chunked implementation bounds the temporary full-vocabulary
+    `log_softmax`/probability tensors while retaining the exact same selected-token definition as
+    `_selective_logps_fp32`.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    n_rows, n_tokens, vocab = logits.shape
+    flat_logits = logits.reshape(n_rows * n_tokens, vocab)
+    flat_index = index.reshape(n_rows * n_tokens, 1)
+    logp_chunks, entropy_chunks = [], []
+    for start in range(0, flat_logits.size(0), chunk_size):
+        block = flat_logits[start : start + chunk_size].float()
+        log_probs = torch.log_softmax(block, dim=-1)
+        logp_chunks.append(
+            log_probs.gather(-1, flat_index[start : start + chunk_size]).squeeze(-1)
+        )
+        entropy_chunks.append(-(log_probs.exp() * log_probs).sum(dim=-1))
+    return PerTokenStats(
+        torch.cat(logp_chunks).view(n_rows, n_tokens),
+        torch.cat(entropy_chunks).view(n_rows, n_tokens),
+    )
+
+
+def _completion_logits(
+    model,
+    input_ids: torch.Tensor,
+    completion_ids: torch.Tensor,
+    caller: str,
+) -> torch.Tensor:
+    """Validate the batch-one contract and return logits aligned to completion tokens."""
+    if input_ids.ndim != 2 or completion_ids.ndim != 2:
+        raise ValueError(f"{caller} expects rank-2 input_ids and completion_ids")
+    if (
+        input_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
+        or completion_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
+    ):
+        raise ValueError(
+            f"{caller} requires physical batch size {MODEL_FORWARD_BATCH_SIZE}; "
+            "accumulate gradients instead of padding model inputs"
+        )
+    n_completion = completion_ids.size(1)
+    if input_ids.size(1) <= n_completion:
+        raise ValueError("input_ids must contain a non-empty prompt before completion_ids")
+    logits = model(
+        input_ids=input_ids,
+        logits_to_keep=n_completion + 1,
+        use_cache=False,
+    ).logits
+    return logits[:, :-1, :]  # drop the position predicting past the sequence end
+
+
 def per_token_logps(
     model, input_ids: torch.Tensor, completion_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -355,26 +424,26 @@ def per_token_logps(
     No attention mask or explicit position IDs are needed for a single unpadded sequence: the
     model's ordinary causal mask and arange positions are exactly the intended inputs.
     """
-    if input_ids.ndim != 2 or completion_ids.ndim != 2:
-        raise ValueError("per_token_logps expects rank-2 input_ids and completion_ids")
-    if (
-        input_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
-        or completion_ids.size(0) != MODEL_FORWARD_BATCH_SIZE
-    ):
-        raise ValueError(
-            f"per_token_logps requires physical batch size {MODEL_FORWARD_BATCH_SIZE}; "
-            "accumulate gradients instead of padding model inputs"
-        )
-    n_completion = completion_ids.size(1)
-    if input_ids.size(1) <= n_completion:
-        raise ValueError("input_ids must contain a non-empty prompt before completion_ids")
-    logits = model(
-        input_ids=input_ids,
-        logits_to_keep=n_completion + 1,
-        use_cache=False,
-    ).logits
-    logits = logits[:, :-1, :]  # drop the position predicting past the sequence end
+    logits = _completion_logits(model, input_ids, completion_ids, "per_token_logps")
     return _selective_logps_fp32(logits, completion_ids)
+
+
+def per_token_stats(
+    model,
+    input_ids: torch.Tensor,
+    completion_ids: torch.Tensor,
+    entropy_chunk_size: int = ENTROPY_CHUNK,
+) -> PerTokenStats:
+    """Selected-token log-probability and next-token entropy for a completion.
+
+    This is the diagnostic sibling of `per_token_logps`: it uses the same unpadded physical
+    batch-one forward and raw next-token distributions, then computes both outputs in float32.
+    Entropy is expensive but requires no second model forward.
+    """
+    logits = _completion_logits(model, input_ids, completion_ids, "per_token_stats")
+    return _selective_logps_entropy_fp32(
+        logits, completion_ids, chunk_size=entropy_chunk_size
+    )
 
 
 def concat_padded(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:

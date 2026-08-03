@@ -233,6 +233,47 @@ class NumericalPrecisionTest(unittest.TestCase):
         actual = _selective_logps_fp32(logits, index, chunk_size=3)
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
 
+    def test_fp32_logps_and_entropy_match_reference(self):
+        from train.opsd.train_self_teacher.lib import _selective_logps_entropy_fp32
+
+        torch.manual_seed(1)
+        logits = torch.randn(2, 5, 11, dtype=torch.bfloat16)
+        index = torch.randint(0, 11, (2, 5))
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        expected_logps = log_probs.gather(-1, index.unsqueeze(-1)).squeeze(-1)
+        expected_entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+
+        actual = _selective_logps_entropy_fp32(logits, index, chunk_size=3)
+        self.assertEqual(actual.logps.dtype, torch.float32)
+        self.assertEqual(actual.entropy.dtype, torch.float32)
+        self.assertTrue(torch.allclose(actual.logps, expected_logps, atol=1e-6))
+        self.assertTrue(torch.allclose(actual.entropy, expected_entropy, atol=1e-6))
+
+    def test_entropy_is_invariant_to_a_constant_logit_shift(self):
+        from train.opsd.train_self_teacher.lib import _selective_logps_entropy_fp32
+
+        logits = torch.randn(1, 4, 9)
+        index = torch.tensor([[0, 1, 2, 3]])
+        original = _selective_logps_entropy_fp32(logits, index, chunk_size=2)
+        shifted = _selective_logps_entropy_fp32(logits + 123.0, index, chunk_size=2)
+        self.assertTrue(torch.allclose(original.logps, shifted.logps, atol=1e-5))
+        self.assertTrue(torch.allclose(original.entropy, shifted.entropy, atol=1e-5))
+
+    def test_per_token_stats_reuses_the_batch_one_alignment(self):
+        from train.opsd.train_self_teacher.lib import per_token_stats
+
+        model = self.RecordingModel(vocab=8)
+        stats = per_token_stats(
+            model,
+            torch.tensor([[1, 2, 3]]),
+            torch.tensor([[2, 3]]),
+            entropy_chunk_size=1,
+        )
+        self.assertEqual(model.calls[0]["logits_to_keep"], 3)
+        self.assertEqual(stats.logps.shape, (1, 2))
+        self.assertEqual(stats.entropy.shape, (1, 2))
+        self.assertTrue(torch.allclose(stats.entropy, torch.full((1, 2), math.log(8))))
+
     def test_concat_padded_assembles_ragged_chunks(self):
         from train.opsd.train_self_teacher.lib import concat_padded
 
