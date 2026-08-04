@@ -1,15 +1,12 @@
 ### Baselines
 - [ ] train on deepscaleR
-- [x] base models
-- [x] sft on base models 
-- [ ] sdft on sft-ed models
-- [ ] instruct models
+- [ ] base models, sft-ed models, instruct models
 - [ ] all aime sets
 - [ ] beyondaime
 - [ ] hmmt
-- [ ] qwen 8B
-- [ ] opd from qwen 8B
+- [ ] qwen 8B as student, teacher
 - [ ] coding, knowledge tasks
+- [ ] hyperparameter sweep
 
 
 ### Research
@@ -21,7 +18,7 @@
   - [ ] `value(h_t) = ⟨h_t, e_Yes − e_No⟩ = logit(Yes) − logit(No)`
   - [ ] Model value = σ(margin) with a 0/1 target -> make the output a calibrated probability
   - [ ] sweep, anneal lambda with modified value functions
-  - [ ] Compare value function behaviours
+  - [ ] Analyze value function behaviours
   - [ ] Different LR for head and backbone
   - [ ] LoRA
 - PI conditioned value function
