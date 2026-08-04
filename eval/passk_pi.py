@@ -1,23 +1,32 @@
 """
 Measure how each privileged context (PI) lifts the SDFT self-teacher's pass@k on
-the (DeepMath) train set: full solution vs. answer vs. hint vs. no PI.
+the (DeepMath) train set: full solution, answer, hint, an unverified rollout, or no PI.
 
 The self-teacher is the model conditioned on the query + privileged context. With
 teacher_model_kind="base" the teacher IS the base student at initialization, so
 this is training-free: we sample from the base model under each PI's teacher
 prompt (built exactly as SDFTTrainer builds it) and grade against the gold answer.
 pass@k(PI) - pass@k(none) is the informativeness of that PI; `answer` is a near-
-trivial ceiling (the value is in the prompt), `hint` is the interesting middle.
+trivial ceiling (the value is in the prompt), `hint` is the interesting middle, and
+`rollout` tests whether another sample from the same model helps without verifier
+information, expert demonstrations, or environment feedback.
 
 Eval set = a random subset of the hint cache (utils/gen_hints.py), which carries
-question + final_answer + hint; `full` solutions are rejoined from DeepMath. All
-arms are evaluated on the SAME problems (restricted to those whose full-PI prompt
-fits the context) so every pass@k shares a denominator.
+question + final_answer + hint; `full` solutions are rejoined from DeepMath. For
+`rollout`, one fixed sample_idx from gen_rollouts.py is joined by question. Selection
+never reads the rollout's reward. All arms are evaluated on the SAME problems and
+restricted to prompts that fit every requested PI arm, so every pass@k shares a denominator.
 
 Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
 
 CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
     --model Qwen/Qwen3-1.7B --num-problems 128 --n 8 --k 1 8
+
+# Unverified-rollout PI ablation (generate the cache using the command in
+# train/opsd/train_self_teacher/gen_rollouts.py first).
+CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
+    --model Qwen/Qwen3-1.7B --pi-modes none rollout --num-problems 128 --n 8 --k 1 8 \
+    --rollout-pi-root data/pi/attempted_solution --rollout-pi-sample-idx 0
 """
 
 import argparse
@@ -30,8 +39,17 @@ from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
 from eval.run_eval import compute_pass_at_k
+from train.opsd.train_self_teacher.lib import rollout_path
 from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, TEACHER_PROMPT_TEMPLATE
 from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path
+
+
+PI_ROLLOUT = (
+    "Here is an attempted solution to the question above. It may or may not be correct:\n\n"
+    "{attempt}\n\n"
+    "Now write a complete solution of your own, including the reasoning."
+)
+PI_MODES = ("none", "rollout", "answer", "hint", "full")
 
 
 def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
@@ -48,6 +66,8 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
         privileged_context = PI_ANSWER.format(answer=problem["answer"])
     elif pi_mode == "hint":
         privileged_context = PI_HINT.format(hint=problem["hint"])
+    elif pi_mode == "rollout":
+        privileged_context = PI_ROLLOUT.format(attempt=problem["rollout"])
     else:
         raise ValueError(f"unknown pi_mode {pi_mode!r}")
     user_text = TEACHER_PROMPT_TEMPLATE.format(prompt=q, privileged_context=privileged_context)
@@ -55,7 +75,12 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
 
 
 def load_eval_problems(
-    model: str, num_problems: int, seed: int, need_full: bool, dataset: str = "deepmath"
+    model: str,
+    num_problems: int,
+    seed: int,
+    need_full: bool,
+    dataset: str = "deepmath",
+    required_questions: set[str] | None = None,
 ) -> list[dict]:
     """Random subset of the hint cache, with `full` solutions rejoined from `dataset`.
 
@@ -79,8 +104,20 @@ def load_eval_problems(
             f"{set(hints.unique('dataset'))}, not {dataset!r}."
         )
 
-    n = min(num_problems, len(hints))
-    idx = sorted(random.Random(seed).sample(range(len(hints)), n))
+    eligible_idx = list(range(len(hints)))
+    if required_questions is not None:
+        eligible_idx = [
+            idx for idx, question in enumerate(hints["question"])
+            if question in required_questions
+        ]
+        if not eligible_idx:
+            raise ValueError("The hint and rollout-PI caches have no questions in common.")
+        if len(eligible_idx) < num_problems:
+            print(f"  warning: rollout-PI cache covers only {len(eligible_idx)} eligible "
+                  f"hint questions; requested {num_problems}")
+
+    n = min(num_problems, len(eligible_idx))
+    idx = sorted(random.Random(seed).sample(eligible_idx, n))
     sub = hints.select(idx)
 
     problems = [
@@ -97,6 +134,118 @@ def load_eval_problems(
         if missing:
             print(f"  warning: {missing}/{len(problems)} problems had no {dataset} solution to rejoin")
     return problems
+
+
+def load_rollout_pi(
+    model: str,
+    dataset: str,
+    root: str,
+    sample_idx: int,
+) -> tuple[dict[str, str], dict]:
+    """Load one fixed attempted solution per question without consulting rewards."""
+    path = rollout_path(model, dataset, root)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"No rollout-PI cache for {model} on {dataset} at {path}. Generate it first:\n"
+            "  python -m train.opsd.train_self_teacher.gen_rollouts "
+            f"--model {model} --dataset {dataset} --output-root {root} "
+            "--skip-logp-scoring"
+        )
+    cache = load_from_disk(path)
+    required = {
+        "question",
+        "completion_text",
+        "sample_idx",
+        "gen_model",
+        "dataset",
+        "question_source",
+        "mixed_only",
+        "generation_seed",
+        "max_completion_length",
+    }
+    missing = required.difference(cache.column_names)
+    if missing:
+        raise ValueError(
+            f"Rollout-PI cache at {path} is missing provenance columns {sorted(missing)}. "
+            "Regenerate it with the current gen_rollouts.py and --force."
+        )
+    if set(cache.unique("gen_model")) != {model}:
+        raise ValueError(
+            f"Rollout-PI cache at {path} was generated by "
+            f"{set(cache.unique('gen_model'))}, not {model!r}."
+        )
+    if set(cache.unique("dataset")) != {dataset}:
+        raise ValueError(
+            f"Rollout-PI cache at {path} was generated for "
+            f"{set(cache.unique('dataset'))}, not {dataset!r}."
+        )
+    if set(cache.unique("question_source")) != {"hints"}:
+        raise ValueError(f"Rollout-PI cache at {path} was not generated from the hint cache.")
+    if set(cache.unique("mixed_only")) != {False}:
+        raise ValueError(
+            "The rollout-PI cache was generated with --mixed-only. That selection uses "
+            "verifier outcomes and invalidates the unverified-rollout ablation."
+        )
+
+    attempts: dict[str, str] = {}
+    # Deliberately access only these three columns: reward is neither selected on nor recorded.
+    for question, completion, cached_sample_idx in zip(
+        cache["question"], cache["completion_text"], cache["sample_idx"], strict=True
+    ):
+        if int(cached_sample_idx) != sample_idx:
+            continue
+        if question in attempts:
+            raise ValueError(
+                f"Rollout-PI cache has duplicate sample_idx={sample_idx} for question {question!r}."
+            )
+        attempts[question] = completion
+    if not attempts:
+        available = sorted(int(value) for value in cache.unique("sample_idx"))
+        raise ValueError(
+            f"No rollout with sample_idx={sample_idx} in {path}; available indices: {available}."
+        )
+
+    generation_seeds = sorted(int(value) for value in cache.unique("generation_seed"))
+    completion_budgets = sorted(
+        int(value) for value in cache.unique("max_completion_length")
+    )
+    metadata = {
+        "cache_path": path,
+        "sample_idx": sample_idx,
+        "selection_policy": "fixed_sample_idx_without_reward",
+        "n_available_questions": len(attempts),
+        "generation_seeds": generation_seeds,
+        "max_completion_lengths": completion_budgets,
+    }
+    return attempts, metadata
+
+
+def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str]):
+    """Keep the common subset whose prompt fits under every requested PI condition."""
+    feasible = []
+    modes = list(dict.fromkeys(pi_modes))
+    for problem in problems:
+        if "full" in modes and not problem.get("solution"):
+            continue
+        if "rollout" in modes and "rollout" not in problem:
+            continue
+        fits = True
+        for mode in modes:
+            ids = tokenizer.apply_chat_template(
+                [build_teacher_messages(problem, mode)],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+            )["input_ids"][0]
+            if len(ids) > budget:
+                fits = False
+                break
+        if fits:
+            feasible.append(problem)
+    dropped = len(problems) - len(feasible)
+    print(f"  common eval set = {len(feasible)} problems whose {modes} PI prompts fit "
+          f"{budget} tokens (dropped {dropped})")
+    return feasible
 
 
 def restrict_to_full_feasible(problems, tokenizer, budget: int):
@@ -143,8 +292,9 @@ def main():
                    help="Dataset whose hint cache defines the eval set (and source of "
                         "rejoined full solutions). Must match the hint cache's dataset.")
     p.add_argument("--pi-modes", nargs="+", default=["none", "answer", "hint", "full"],
-                   choices=["none", "answer", "hint", "full"],
-                   help="PI arms to compare. 'none' is the no-PI student baseline.")
+                   choices=list(PI_MODES),
+                   help="PI arms to compare. 'none' is the no-PI student baseline; 'rollout' "
+                        "is a fixed, unverified sample from the same model.")
     p.add_argument("--num-problems", type=int, default=128,
                    help="Random subset of the train (hint) set to evaluate on.")
     p.add_argument("--n", type=int, default=8, help="Samples per problem (n >= max k).")
@@ -153,6 +303,11 @@ def main():
                    help="Completion budget. Keep generous so full reasoning isn't "
                         "truncated (truncation -> no \\boxed -> undercounts pass@k).")
     p.add_argument("--output-dir", default="results/passk_pi")
+    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution",
+                   help="Root passed as --output-root to gen_rollouts.py for the rollout PI.")
+    p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
+                   help="Fixed cached sample_idx used as PI for every problem. Selection does "
+                        "not inspect correctness rewards.")
     p.add_argument("--save-samples", action="store_true",
                    help="Also dump per-problem n_correct for each mode.")
     # vLLM
@@ -164,11 +319,27 @@ def main():
 
     if max(args.k) > args.n:
         p.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
+    if args.rollout_pi_sample_idx < 0:
+        p.error("--rollout-pi-sample-idx must be >= 0")
+
+    rollout_attempts = None
+    rollout_metadata = None
+    if "rollout" in args.pi_modes:
+        rollout_attempts, rollout_metadata = load_rollout_pi(
+            args.model,
+            args.dataset,
+            args.rollout_pi_root,
+            args.rollout_pi_sample_idx,
+        )
 
     problems = load_eval_problems(
         args.model, args.num_problems, args.seed,
         need_full=("full" in args.pi_modes), dataset=args.dataset,
+        required_questions=(set(rollout_attempts) if rollout_attempts is not None else None),
     )
+    if rollout_attempts is not None:
+        for problem in problems:
+            problem["rollout"] = rollout_attempts[problem["question"]]
     print(f"Loaded {len(problems)} eval problems for {args.model}")
 
     llm = LLM(
@@ -184,10 +355,12 @@ def main():
         n=args.n, max_tokens=args.max_tokens, seed=args.seed,
     )
 
-    # Fix a common problem set across arms (full is the binding constraint).
-    if "full" in args.pi_modes:
-        budget = args.max_model_len - args.max_tokens
-        problems = restrict_to_full_feasible(problems, tokenizer, budget)
+    # Fix a common problem set across arms. A long attempted solution can be more binding
+    # than the reference solution, so check every requested prompt rather than assuming full.
+    budget = args.max_model_len - args.max_tokens
+    problems = restrict_to_pi_feasible(problems, tokenizer, budget, args.pi_modes)
+    if not problems:
+        raise RuntimeError("No common eval problems fit every requested PI prompt.")
 
     summary = {mode: {} for mode in args.pi_modes}
     per_problem = {}
@@ -201,7 +374,7 @@ def main():
     elapsed = time.time() - t0
 
     # Report table
-    print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n}, ")
+    print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n})")
     header = "PI mode  " + "  ".join(f"pass@{k:<3}" for k in args.k)
     print(header)
     for mode in args.pi_modes:
@@ -219,6 +392,8 @@ def main():
         "elapsed_s": elapsed,
         "pass_at_k": summary,
     }
+    if rollout_metadata is not None:
+        out["rollout_pi"] = rollout_metadata
     if args.save_samples:
         out["per_problem_n_correct"] = per_problem
     out_dir = os.path.join(args.output_dir, args.model.replace("/", "_"))

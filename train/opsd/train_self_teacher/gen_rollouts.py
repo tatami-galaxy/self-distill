@@ -1,6 +1,6 @@
 r"""
 Stage 1 of the trained-self-teacher arm: sample rollouts from the FROZEN student, grade them,
-and record the student's own log-probabilities for the sampled tokens.
+and, by default, record the student's own log-probabilities for the sampled tokens.
 
 Run ONCE per (model, dataset). The rollouts are drawn from the student's UN-PRIVILEGED prompt --
 the PI only enters when the teacher scores them in stage 2 -- so a single cache serves every
@@ -18,18 +18,27 @@ within-question discrimination. The mixed-outcome fraction is reported below, an
 keeps just those questions.
 
 Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns rollout_id,
-question_id, question, final_answer, completion_ids, completion_text, reward, student_logps,
-n_tokens, finish_reason, truncated, question_idx, sample_idx, generation_seed,
-max_completion_length, gen_model, dataset, question_source.
+question_id, question, final_answer, completion_ids, completion_text, reward, n_tokens,
+finish_reason, truncated, question_idx, sample_idx, generation_seed, max_completion_length,
+gen_model, dataset, question_source, mixed_only. The default scoring pass also adds
+student_logps.
 
-Scoring always runs in a spawned process. It is a correctness requirement :
+Unless --skip-logp-scoring is set, scoring runs in a spawned process. This is a correctness
+requirement:
 Initialising vLLM leaves global torch state altered, and freeing the engine does not restore it,
 so an HF forward that follows vLLM in the same process gives measurably different logprobs from
-the same forward in a clean one.
+the same forward in a clean one. Use --skip-logp-scoring when the cache is only supplying sampled
+completions, as in the attempted-solution PI pass@k ablation.
 
 # Generate/reuse rollouts and score them; the clean-process boundary is automatic.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 1024 --n 4
+
+# Generate attempted solutions for the pass@k rollout-PI ablation. Do not use --mixed-only:
+# PI selection must not depend on verifier outcomes.
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
+    --model Qwen/Qwen3-1.7B --dataset deepmath --output-root data/pi/attempted_solution \
+    --max-samples 1024 --n 4 --max-completion-length 8192 --skip-logp-scoring
 """
 
 import argparse
@@ -60,6 +69,47 @@ def summarize_outcomes(rows: list[dict]) -> tuple[float, float]:
     mixed = sum(1 for rewards in by_question.values() if 0 < sum(rewards) < len(rewards))
     pass_rate = sum(r["reward"] for r in rows) / max(len(rows), 1)
     return pass_rate, mixed / max(len(by_question), 1)
+
+
+def cache_matches_generation(cached: Dataset, args: argparse.Namespace) -> bool:
+    """Whether a cache contains the requested generated samples with matching provenance."""
+    required_columns = {
+        "question_source",
+        "gen_model",
+        "dataset",
+        "question_idx",
+        "sample_idx",
+        "generation_seed",
+        "max_completion_length",
+    }
+    if not required_columns.issubset(cached.column_names):
+        return False
+    if (
+        set(cached.unique("question_source")) != {"hints"}
+        or set(cached.unique("gen_model")) != {args.model}
+        or set(cached.unique("dataset")) != {args.dataset}
+        or set(cached.unique("generation_seed")) != {args.seed}
+        or set(cached.unique("max_completion_length")) != {args.max_completion_length}
+    ):
+        return False
+    # Legacy full caches predate this stamp and remain safe: per-question coverage below proves
+    # they were not filtered. A mixed-only request, however, needs an explicit matching stamp.
+    if "mixed_only" in cached.column_names:
+        if set(cached.unique("mixed_only")) != {args.mixed_only}:
+            return False
+    elif args.mixed_only:
+        return False
+
+    samples_by_question: dict[int, set[int]] = defaultdict(set)
+    for question_idx, sample_idx in zip(
+        cached["question_idx"], cached["sample_idx"], strict=True
+    ):
+        samples_by_question[int(question_idx)].add(int(sample_idx))
+    requested_samples = set(range(args.n))
+    return all(
+        requested_samples.issubset(samples_by_question.get(question_idx, set()))
+        for question_idx in range(args.max_samples)
+    )
 
 
 def rollout_id(
@@ -143,6 +193,7 @@ def generate(args, out_dir: str) -> None:
                 "gen_model": args.model,
                 "dataset": args.dataset,
                 "question_source": "hints",
+                "mixed_only": args.mixed_only,
             })
 
     pass_rate, mixed_rate = summarize_outcomes(rows)
@@ -258,8 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "dropping the easiest and hardest questions entirely.")
     p.add_argument("--max-completion-length", type=int, default=8192,
                    help="Completion budget.")
+    p.add_argument("--skip-logp-scoring", action="store_true",
+                   help="Only generate and grade rollouts; do not add student_logps. Use this "
+                        "for an attempted-solution PI cache used only by pass@k evaluation.")
     p.add_argument("--force", action="store_true",
-                   help="Regenerate and rescore even if a compatible cache exists.")
+                   help="Regenerate and, unless --skip-logp-scoring is set, rescore even if a "
+                        "compatible cache exists.")
     p.add_argument("--seed", type=int, default=42)
     # vLLM
     p.add_argument("--max-model-len", type=int, default=32768)
@@ -274,26 +329,22 @@ def main():
     out_dir = rollout_path(args.model, args.dataset, args.output_root)
     print(f"model: {args.model}  dataset: {args.dataset}  ->  {out_dir}")
 
-    # Reuse guard, matching utils/gen_hints.py: same model, at least as many rollouts.
-    wanted = args.max_samples * args.n
+    # Reuse only when provenance matches and every requested question/sample slot is present.
     if not args.force and os.path.isdir(out_dir):
         cached = load_from_disk(out_dir)
-        reusable = (
-            "question_source" in cached.column_names
-            and set(cached.unique("question_source")) == {"hints"}
-            and set(cached.unique("gen_model")) == {args.model}
-            and len(cached) >= wanted
-        )
-        if reusable:
-            print(f"Reusing {len(cached)} cached rollouts at {out_dir} (>= {wanted}, model "
-                  f"and hint source match). Use --force to regenerate.")
+        if cache_matches_generation(cached, args):
+            print(f"Reusing {len(cached)} cached rollouts at {out_dir} (generation settings "
+                  "and requested sample coverage match). Use --force to regenerate.")
         else:
             generate(args, out_dir)
     else:
         generate(args, out_dir)
 
-    # A spawned interpreter preserves clean HF numerics without exposing separate modes
-    score_in_clean_process(args, out_dir)
+    # A spawned interpreter preserves clean HF numerics without exposing separate modes.
+    if args.skip_logp_scoring:
+        print("Skipping student-logprob scoring (--skip-logp-scoring).")
+    else:
+        score_in_clean_process(args, out_dir)
 
 
 if __name__ == "__main__":
