@@ -32,13 +32,13 @@ completions, as in the attempted-solution PI pass@k ablation.
 
 # Generate/reuse rollouts and score them; the clean-process boundary is automatic.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
-    --model Qwen/Qwen3-4B --dataset deepmath --max-samples 1024 --n 4
+    --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2084 --n 4
 
 # Generate attempted solutions for the pass@k rollout-PI ablation. Do not use --mixed-only:
 # PI selection must not depend on verifier outcomes.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
     --model Qwen/Qwen3-1.7B --dataset deepmath --output-root data/pi/attempted_solution \
-    --max-samples 1024 --n 4 --max-completion-length 8192 --skip-logp-scoring
+    --n 1 --max-completion-length 8192 --skip-logp-scoring
 """
 
 import argparse
@@ -100,6 +100,12 @@ def cache_matches_generation(cached: Dataset, args: argparse.Namespace) -> bool:
     elif args.mixed_only:
         return False
 
+    requested_question_count = args.max_samples
+    if requested_question_count is None:
+        # Dense cached indices alone cannot distinguish a complete cache from an old prefix.
+        # Compare against the current validated hint source before declaring full-cache reuse.
+        requested_question_count = len(load_hint_cache(args.model, args.dataset))
+
     samples_by_question: dict[int, set[int]] = defaultdict(set)
     for question_idx, sample_idx in zip(
         cached["question_idx"], cached["sample_idx"], strict=True
@@ -108,7 +114,7 @@ def cache_matches_generation(cached: Dataset, args: argparse.Namespace) -> bool:
     requested_samples = set(range(args.n))
     return all(
         requested_samples.issubset(samples_by_question.get(question_idx, set()))
-        for question_idx in range(args.max_samples)
+        for question_idx in range(requested_question_count)
     )
 
 
@@ -298,8 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="The frozen student. MUST be the model trained in stage 3.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()))
     p.add_argument("--output-root", default="data/rollouts")
-    p.add_argument("--max-samples", type=int, default=2048,
-                   help="Questions to roll out. Total rollouts = this x --n.")
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Questions to roll out. Omit to use the full hint cache. Total "
+                        "rollouts = selected questions x --n.")
     p.add_argument("--n", type=int, default=4,
                    help="Rollouts per question. >1 is what stops the teacher fitting the outcome "
                         "from question difficulty alone; see the module docstring.")

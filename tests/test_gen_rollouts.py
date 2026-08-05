@@ -16,6 +16,7 @@ class RolloutCliTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "stage"))
         self.assertFalse(hasattr(args, "questions_from"))
         self.assertFalse(args.skip_logp_scoring)
+        self.assertIsNone(args.max_samples)
 
         for removed_args in (
             ["--stage", "score"],
@@ -147,6 +148,21 @@ class RolloutCacheCompatibilityTest(unittest.TestCase):
         self.assertFalse(
             gen_rollouts.cache_matches_generation(cached, self.args(mixed_only=True))
         )
+
+    def test_full_cache_request_checks_current_hint_cache_length(self):
+        full_cache = self.cache(
+            question_idx=(0, 0, 1, 1, 2, 2),
+            sample_idx=(0, 1, 0, 1, 0, 1),
+        )
+        args = self.args(max_samples=None)
+        with mock.patch.object(
+            gen_rollouts, "load_hint_cache", return_value=[None, None, None]
+        ) as load_hints:
+            self.assertTrue(gen_rollouts.cache_matches_generation(full_cache, args))
+            self.assertFalse(gen_rollouts.cache_matches_generation(self.cache(), args))
+
+        self.assertEqual(load_hints.call_count, 2)
+        load_hints.assert_called_with("student", "deepmath")
 
     def test_generation_settings_must_match(self):
         cached = self.cache()
