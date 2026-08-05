@@ -23,9 +23,9 @@
 # Data conventions:
 #
 # - Data source : JSON files under `results/`
-# - The summary table uses the **latest available checkpoint per arm**,
-#   not the best checkpoint, to avoid implicit checkpoint selection.
-# - Older AIME24 summaries do not contain `arm` or `eval_config`;
+# - Best-checkpoint tables select the highest configured pass@k within each
+#   algorithm/variant across runs.
+# - Older AIME summaries do not contain `arm` or `eval_config`;
 #   their identities are recovered from the directory layout and are marked as schema 0.
 # - Scores are shown on a 0–1 scale in tables and as percentages in plots.
 #
@@ -71,7 +71,7 @@ print(f"Repository: {ROOT}")
 print(f"Results:    {RESULTS}")
 
 
-# %% -------------------- AIME24 --------------------
+# %% -------------------- AIME --------------------
 #
 # For the initial overview, checkpoint curves are more informative than a single bar
 # per method: they show training dynamics and make clear
@@ -79,8 +79,19 @@ print(f"Results:    {RESULTS}")
 # evaluation as a horizontal reference. Variants and repeated runs remain separate series.
 #
 
-# %% -------------------- LOAD AIME24 RESULTS --------------------
-AIME_DIR = RESULTS / "aime24"
+# %% -------------------- LOAD AIME RESULTS --------------------
+AIME_YEAR = 25  # Select 24, 25, 26, ...
+AIME_DATASET = f"aime{AIME_YEAR}"
+AIME_LABEL = AIME_DATASET.upper()
+AIME_DIR = RESULTS / AIME_DATASET
+AVAILABLE_AIME_DATASETS = sorted(
+    path.name for path in RESULTS.glob("aime*") if path.is_dir()
+)
+if not AIME_DIR.is_dir():
+    raise FileNotFoundError(
+        f"No results directory for {AIME_LABEL}: {AIME_DIR}. "
+        f"Available AIME datasets: {AVAILABLE_AIME_DATASETS}"
+    )
 
 def read_json(path: Path) -> dict:
     with path.open() as handle:
@@ -108,7 +119,7 @@ def fallback_aime_arm(path: Path) -> dict:
         }
 
     if len(parts) < 4:
-        raise ValueError(f"Unrecognized AIME24 result path: {path}")
+        raise ValueError(f"Unrecognized {AIME_LABEL} result path: {path}")
 
     train_dataset, model, algo = parts[:3]
     step = parts[-1]
@@ -125,13 +136,19 @@ def fallback_aime_arm(path: Path) -> dict:
     }
 
 
-def load_aime24() -> pd.DataFrame:
+def load_aime() -> pd.DataFrame:
     rows = []
     for path in sorted(AIME_DIR.rglob("summary.json")):
         summary = read_json(path)
         fallback = fallback_aime_arm(path)
         arm = {**fallback, **(summary.get("arm") or {})}
         eval_config = summary.get("eval_config") or {}
+        recorded_eval_dataset = eval_config.get("eval_dataset")
+        if recorded_eval_dataset not in (None, AIME_DATASET):
+            raise ValueError(
+                f"{path} records eval dataset {recorded_eval_dataset!r}, "
+                f"expected {AIME_DATASET!r}"
+            )
         sampling = eval_config.get("sampling") or {}
         row = {
             **arm,
@@ -164,8 +181,8 @@ def load_aime24() -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-aime = load_aime24()
-print(f"Loaded {len(aime)} AIME24 summaries across {aime['model'].nunique()} models.")
+aime = load_aime()
+print(f"Loaded {len(aime)} {AIME_LABEL} summaries across {aime.model.nunique()} models.")
 display(
     aime.groupby(
         ["schema_version", "dataset_size", "n_samples", "max_tokens"],
@@ -174,8 +191,8 @@ display(
 )
 
 
-# %% -------------------- BEST AIME24 CHECKPOINTS BY MODEL --------------------
-AIME_BEST_K = 1  # Choose 1, 8, or 16.
+# %% -------------------- BEST AIME CHECKPOINTS BY MODEL --------------------
+AIME_BEST_K = 8  # Choose 1, 8, or 16.
 AIME_BEST_METRIC = f"pass@{AIME_BEST_K}"
 if AIME_BEST_K not in {1, 8, 16}:
     raise ValueError(f"AIME_BEST_K must be one of 1, 8, or 16; got {AIME_BEST_K}")
@@ -240,7 +257,7 @@ for model, model_results in aime_best.groupby("model", sort=True):
     ]
     display(
         table.style
-        .set_caption(f"{model} — best {AIME_BEST_METRIC}")
+        .set_caption(f"{AIME_LABEL} · {model} — best {AIME_BEST_METRIC}")
         .format({"pass@1": "{:.3f}", "pass@8": "{:.3f}", "pass@16": "{:.3f}"})
         .set_properties(**{"text-align": "center"})
         .set_table_styles([
@@ -251,7 +268,7 @@ for model, model_results in aime_best.groupby("model", sort=True):
         )
     )
 
-# %% -------------------- PLOT AIME24 LEARNING CURVES --------------------
+# %% -------------------- PLOT AIME LEARNING CURVES --------------------
 ALGO_COLORS = {
     "sft": "#4c78a8",
     "grpo": "#f58518",
@@ -301,7 +318,7 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 
     for ax in axes.flat[len(models):]:
         ax.set_visible(False)
-    fig.suptitle(f"AIME24 {metric} over training", fontsize=16, y=1.005)
+    fig.suptitle(f"{AIME_LABEL} {metric} over training", fontsize=16, y=1.005)
     fig.tight_layout()
     return fig
 
@@ -309,11 +326,11 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 plot_aime_curves(aime, "pass@1");
 
 
-# %% -------------------- AIME24 COMPARISON MATRIX -------------------- [markdown]
+# %% -------------------- AIME COMPARISON MATRIX -------------------- [markdown]
 # The table below is a compact model × algorithm/variant view of the same best-checkpoint selection. `AIME_BEST_K` controls both the per-model tables and this matrix; blanks mean an arm has not yet been evaluated for that model.
 #
 
-# %% -------------------- DISPLAY AIME24 MATRIX --------------------
+# %% -------------------- DISPLAY AIME MATRIX --------------------
 aime_best["algorithm_variant"] = aime_best.apply(
     lambda row: method_label(row, include_run=False), axis=1
 )
@@ -495,7 +512,7 @@ fig.tight_layout()
 # %% -------------------- DISPLAY RESULT INVENTORY --------------------
 inventory = pd.DataFrame([
     {
-        "section": "aime24",
+        "section": AIME_DATASET,
         "summary_files": len(aime),
         "models": aime["model"].nunique(),
         "conditions_or_arms": aime[["model", "algo", "variant", "run"]].drop_duplicates().shape[0],
