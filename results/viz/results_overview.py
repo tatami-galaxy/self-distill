@@ -80,7 +80,7 @@ print(f"Results:    {RESULTS}")
 #
 
 # %% -------------------- LOAD AIME RESULTS --------------------
-AIME_YEAR = 25  # Select 24, 25, 26, ...
+AIME_YEAR = 24  # Select 24, 25, 26, ...
 AIME_DATASET = f"aime{AIME_YEAR}"
 AIME_LABEL = AIME_DATASET.upper()
 AIME_DIR = RESULTS / AIME_DATASET
@@ -347,14 +347,15 @@ display(
 # %% -------------------- PRIVILEGED-INFORMATION PASS@K -------------------- [markdown]
 # ## Privileged-information pass@k
 #
-# These results measure how the same problem-solving model behaves when generation itself is conditioned on no PI, a hint, the answer, or the full solution. The raw pass@k values are shown directly; improvements relative to `none` can be added when deeper comparative analysis begins.
+# These results measure how the same problem-solving model behaves when generation itself is conditioned on no PI, an unverified rollout from the model, a hint, the answer, or the full solution. The raw pass@k values are shown directly; improvements relative to `none` can be added when deeper comparative analysis begins.
 #
 
 # %% -------------------- LOAD PASSK_PI RESULTS --------------------
 PASSK_PI_DIR = RESULTS / "passk_pi"
-PI_ORDER = ["none", "hint", "answer", "full"]
+PI_ORDER = ["none", "rollout", "hint", "answer", "full"]
 PI_COLORS = {
     "none": "#9d9d9d",
+    "rollout": "#b279a2",
     "hint": "#4c78a8",
     "answer": "#f58518",
     "full": "#54a24b",
@@ -425,24 +426,27 @@ grouped_bar(axes[1], passk_pi, "pass@8", "PI-conditioned generation: pass@8", pe
 fig.tight_layout()
 
 
-# %% -------------------- TEACHER BEHAVIOR -------------------- [markdown]
-# ## Teacher behavior
+# %% -------------------- TEACHER UNCERTAINTY -------------------- [markdown]
+# ## Teacher uncertainty
 #
-# Teacher-behavior summaries describe more than answer accuracy. The first dashboard keeps differently scaled quantities on separate axes: correctness, response length, truncation, and epistemic-marker density. This makes the behavioral shift under richer PI visible without combining incompatible units.
+# Teacher-uncertainty summaries characterize uncertainty verbalization while retaining answer accuracy, response length, and truncation as context. The dashboard keeps differently scaled quantities on separate axes, making the shift under richer PI visible without combining incompatible units.
 #
 
-# %% -------------------- LOAD TEACHER BEHAVIOR RESULTS --------------------
-TEACHER_DIR = RESULTS / "teacher_behavior"
+# %% -------------------- LOAD TEACHER UNCERTAINTY RESULTS --------------------
+TEACHER_UNCERTAINTY_DIR = RESULTS / "teacher_uncertainty"
 
 
-def load_teacher_behavior() -> tuple[pd.DataFrame, pd.DataFrame]:
-    behavior_rows = []
+def load_teacher_uncertainty() -> tuple[pd.DataFrame, pd.DataFrame]:
+    uncertainty_rows = []
     marker_rows = []
-    for path in sorted(TEACHER_DIR.glob("*/teacher_behavior_summary.json")):
+    for path in sorted(
+        TEACHER_UNCERTAINTY_DIR.glob("*/teacher_uncertainty_summary.json")
+    ):
         summary = read_json(path)
         teacher = summary["teacher_model"].split("/")[-1]
         problem_model = summary["problem_model"].split("/")[-1]
-        for pi_mode, metrics in summary["behavior"].items():
+        conditions = summary.get("uncertainty", summary.get("behavior", {}))
+        for pi_mode, metrics in conditions.items():
             common = {
                 "teacher_model": teacher,
                 "teacher_model_id": summary["teacher_model"],
@@ -454,30 +458,30 @@ def load_teacher_behavior() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "seed": summary["seed"],
                 "source": str(path.relative_to(ROOT)),
             }
-            behavior_rows.append({
+            uncertainty_rows.append({
                 **common,
                 **{key: value for key, value in metrics.items() if key != "e_by_marker_per_1k"},
             })
             for marker, value in metrics.get("e_by_marker_per_1k", {}).items():
                 marker_rows.append({**common, "marker": marker, "per_1k_tokens": value})
 
-    behavior = pd.DataFrame(behavior_rows)
+    uncertainty = pd.DataFrame(uncertainty_rows)
     markers = pd.DataFrame(marker_rows)
-    for frame in (behavior, markers):
+    for frame in (uncertainty, markers):
         if not frame.empty:
             frame["pi_mode"] = pd.Categorical(frame["pi_mode"], PI_ORDER, ordered=True)
             frame.sort_values(["teacher_model", "pi_mode"], inplace=True)
             frame.reset_index(drop=True, inplace=True)
-    return behavior, markers
+    return uncertainty, markers
 
 
-teacher_behavior, teacher_markers = load_teacher_behavior()
+teacher_uncertainty, teacher_markers = load_teacher_uncertainty()
 teacher_columns = [
     "teacher_model", "problem_model", "pi_mode", "pass@1", "mean_tokens",
     "trunc_rate", "unclosed_rate", "e_per_1k_tokens", "n_completions",
 ]
 display(
-    teacher_behavior[teacher_columns]
+    teacher_uncertainty[teacher_columns]
     .style.format({
         "pass@1": "{:.3f}", "mean_tokens": "{:,.0f}", "trunc_rate": "{:.3f}",
         "unclosed_rate": "{:.3f}", "e_per_1k_tokens": "{:.2f}",
@@ -485,14 +489,14 @@ display(
 )
 
 
-# %% -------------------- PLOT TEACHER BEHAVIOR --------------------
-teacher_plot = teacher_behavior.rename(columns={"teacher_model": "model"})
+# %% -------------------- PLOT TEACHER UNCERTAINTY --------------------
+teacher_plot = teacher_uncertainty.rename(columns={"teacher_model": "model"})
 fig, axes = plt.subplots(2, 2, figsize=(15, 9))
 grouped_bar(axes[0, 0], teacher_plot, "pass@1", "Teacher correctness", percent=True)
 grouped_bar(axes[0, 1], teacher_plot, "mean_tokens", "Mean completion length")
 grouped_bar(axes[1, 0], teacher_plot, "trunc_rate", "Truncation rate", percent=True)
 grouped_bar(axes[1, 1], teacher_plot, "e_per_1k_tokens", "Epistemic markers per 1k tokens")
-fig.suptitle("Teacher behavior by privileged context", fontsize=16, y=1.01)
+fig.suptitle("Teacher uncertainty by privileged context", fontsize=16, y=1.01)
 fig.tight_layout()
 
 
@@ -524,10 +528,10 @@ inventory = pd.DataFrame([
         "conditions_or_arms": len(passk_pi),
     },
     {
-        "section": "teacher_behavior",
-        "summary_files": teacher_behavior["source"].nunique(),
-        "models": teacher_behavior["teacher_model"].nunique(),
-        "conditions_or_arms": len(teacher_behavior),
+        "section": "teacher_uncertainty",
+        "summary_files": teacher_uncertainty["source"].nunique(),
+        "models": teacher_uncertainty["teacher_model"].nunique(),
+        "conditions_or_arms": len(teacher_uncertainty),
     },
 ])
 display(inventory)
