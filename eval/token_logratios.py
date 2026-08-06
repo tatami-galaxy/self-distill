@@ -1,6 +1,6 @@
 r"""Paired token log-ratio and entropy analysis on fixed frozen-student rollouts.
 
-Unlike eval.teacher_behavior, which samples each teacher, this module scores the exact same
+Unlike eval.teacher_uncertainty, which samples each teacher, this module scores the exact same
 student completion tokens under one explicitly selected teacher model and PI condition.
 
 Score conditions independently:

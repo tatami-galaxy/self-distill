@@ -86,7 +86,7 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 # The learnable calibration bias, checkpointed beside the teacher. A bare state dict rather than
 # part of the model, for the same reason train_ppo.py keeps its critic out of `self.model`: the
 # teacher must stay a plain PreTrainedModel so `save_pretrained` produces something
-# eval/teacher_behavior.py and stage 3 can load directly.
+# eval/teacher_uncertainty.py and stage 3 can load directly.
 CALIBRATION_FILE = "calibration.pt"
 
 # Resume identity for the data boundary: older checkpoints trained on rows now held out.
@@ -896,7 +896,7 @@ def main():
         print(f"  {key:28s} {value: .4f}{suffix}")
 
     final_dir = os.path.join(output_dir, "final")
-    trainer.save_model(final_dir)  # save_pretrained: loadable by stage 3 and teacher_behavior.py
+    trainer.save_model(final_dir)  # save_pretrained: loadable by stage 3 and teacher_uncertainty.py
     tokenizer.save_pretrained(final_dir)
     torch.save({"calibration_bias": trainer.calibration_bias.detach().cpu()},
                os.path.join(final_dir, CALIBRATION_FILE))

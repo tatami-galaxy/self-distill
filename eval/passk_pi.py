@@ -227,6 +227,22 @@ def load_rollout_pi(
     return attempts, metadata
 
 
+def attach_rollout_pi(
+    problems: list[dict], attempts: dict[int, tuple[str, str]]
+) -> list[dict]:
+    """Attach attempts by source index and verify the two caches still align by text."""
+    for problem in problems:
+        cached_question, completion = attempts[problem["question_idx"]]
+        if cached_question != problem["question"]:
+            raise ValueError(
+                "Rollout-PI and hint caches disagree at question_idx="
+                f"{problem['question_idx']}: rollout has {cached_question!r}, hint cache "
+                f"has {problem['question']!r}."
+            )
+        problem["rollout"] = completion
+    return problems
+
+
 def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str]):
     """Keep the common subset whose prompt fits under every requested PI condition."""
     feasible = []
@@ -347,15 +363,7 @@ def main():
         ),
     )
     if rollout_attempts is not None:
-        for problem in problems:
-            cached_question, completion = rollout_attempts[problem["question_idx"]]
-            if cached_question != problem["question"]:
-                raise ValueError(
-                    "Rollout-PI and hint caches disagree at question_idx="
-                    f"{problem['question_idx']}: rollout has {cached_question!r}, hint cache "
-                    f"has {problem['question']!r}."
-                )
-            problem["rollout"] = completion
+        problems = attach_rollout_pi(problems, rollout_attempts)
     print(f"Loaded {len(problems)} eval problems for {args.model}")
 
     llm = LLM(

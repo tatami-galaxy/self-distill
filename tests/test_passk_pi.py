@@ -69,6 +69,23 @@ class RolloutPiCacheTest(unittest.TestCase):
         self.assertEqual(set(attempts), {0, 1})
         self.assertEqual(attempts[0][0], attempts[1][0])
 
+        problems = [
+            {"question_idx": 0, "question": "duplicate q"},
+            {"question_idx": 1, "question": "duplicate q"},
+        ]
+        passk_pi.attach_rollout_pi(problems, attempts)
+        self.assertEqual(
+            [problem["rollout"] for problem in problems],
+            ["q1 attempt zero", "q2 attempt zero"],
+        )
+
+    def test_attachment_rejects_source_index_text_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "caches disagree"):
+            passk_pi.attach_rollout_pi(
+                [{"question_idx": 0, "question": "hint question"}],
+                {0: ("rollout question", "attempt")},
+            )
+
     def test_mixed_only_cache_is_rejected_as_verifier_selected(self):
         with (
             mock.patch.object(passk_pi, "rollout_path", return_value="pi/cache"),

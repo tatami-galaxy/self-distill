@@ -1,7 +1,6 @@
 """
-Characterize the GENERATION BEHAVIOR of an SDFT teacher under each privileged
-context (PI), and contrast the self-teacher (OPSD) with a strong external teacher
-(OPD).
+Characterize the verbalized uncertainty of an SDFT teacher under each privileged
+context (PI), and contrast the self-teacher (OPSD) with a strong external teacher (OPD).
 
 In SDFT the teacher never generates during training -- it *scores* the student's
 on-policy tokens. So "how long does the teacher reason" and "how much uncertainty
@@ -18,24 +17,26 @@ Two behaviors, per completion:
                        <think> trace vs the post-</think> answer.
 
 Two teacher kinds share this one script; they differ only in which model generates:
-  * self / OPSD  -- teacher-model == problem-model (the student), PI in {none, answer,
-                    hint, full}. The collapse prediction: full PI -> short, low-E(y).
+  * self / OPSD  -- teacher-model == problem-model (the student), PI in {none, rollout,
+                    answer, hint, full}. `rollout` is one fixed, unverified sample from
+                    that model. The collapse prediction: full PI -> short, low-E(y).
   * strong / OPD -- teacher-model = a bigger model (e.g. Qwen3-30B-A3B-Thinking-2507),
                     PI = none (its edge is capability, not information).
 
-The problem set is FIXED across both runs: --problem-model's hint cache, restricted
-to the full-PI-feasible subset under that model's tokenizer -- computed the same way
-regardless of which arms an invocation runs, so separate model-load runs line up
-problem-for-problem and every mean shares a denominator.
+The problem set is FIXED across arms: --problem-model's hint cache, restricted to the
+full-PI-feasible subset under that model's tokenizer. When rollout PI is requested it is
+also restricted to source indices covered by the rollout cache and rollout prompts that fit.
+Pass --align-rollout-pi to a separate strong-teacher `none` run so it uses that same subset.
 
 # self-teacher (OPSD), all PIs
-CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
-    --teacher-model Qwen/Qwen3-1.7B --pi-modes none answer hint full
+CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
+    --teacher-model Qwen/Qwen3-1.7B --pi-modes none rollout answer hint full \
+    --rollout-pi-root data/pi/attempted_solution --rollout-pi-sample-idx 0
 
 # strong teacher (OPD), query-only, same problems
-CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_behavior \
+CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
     --teacher-model Qwen/Qwen3-30B-A3B-Thinking-2507 \
-    --problem-model Qwen/Qwen3-1.7B --pi-modes none
+    --problem-model Qwen/Qwen3-1.7B --pi-modes none --align-rollout-pi
 """
 
 import argparse
@@ -47,9 +48,11 @@ import time
 from vllm import LLM, SamplingParams
 
 from eval.passk_pi import (
+    attach_rollout_pi,
     build_teacher_messages,
     load_eval_problems,
-    restrict_to_full_feasible,
+    load_rollout_pi,
+    restrict_to_pi_feasible,
 )
 from utils import DATASET_REGISTRY_TRAIN, grade
 
@@ -170,6 +173,7 @@ def generate_arm(llm, tokenizer, problems, pi_mode, sampling_params) -> list[dic
                 comp.text, len(comp.token_ids), comp.finish_reason, p["answer"]
             )
             rec["problem_idx"] = pi
+            rec["question_idx"] = p["question_idx"]
             rec["sample_idx"] = si
             records.append(rec)
     return records
@@ -191,16 +195,24 @@ def main():
                    help="Dataset whose hint cache (under --problem-model) defines the "
                         "fixed eval set. Must match the hint cache's dataset.")
     p.add_argument("--pi-modes", nargs="+", default=["none", "answer", "hint", "full"],
-                   choices=["none", "answer", "hint", "full"],
-                   help="PI arms to generate. Strong-teacher OPD uses just 'none'.")
+                   choices=["none", "rollout", "answer", "hint", "full"],
+                   help="PI arms to generate. 'rollout' uses a fixed unverified sample from "
+                        "--problem-model; strong-teacher OPD normally uses just 'none'.")
     p.add_argument("--num-problems", type=int, default=128,
                    help="Random subset of the problem-model's hint cache.")
-    p.add_argument("--n", type=int, default=4, help="Samples per problem.")
+    p.add_argument("--n", type=int, default=8, help="Samples per problem.")
     p.add_argument("--max-tokens", type=int, default=8192,
-                   help="Completion budget. Thinking teachers can overrun this; "
-                        "truncated completions are flagged (trunc_rate) since their "
-                        "censored length biases mean_tokens downward.")
-    p.add_argument("--output-dir", default="results/teacher_behavior")
+                    help="Completion budget. Truncated completions are flagged (trunc_rate)"
+                        "since their censored length biases mean_tokens downward.")
+    p.add_argument("--output-dir", default="results/teacher_uncertainty")
+    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution",
+                   help="Root passed as --output-root to gen_rollouts.py for rollout PI.")
+    p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
+                   help="Fixed cached sample_idx used as PI for every problem. Selection does "
+                        "not inspect correctness rewards.")
+    p.add_argument("--align-rollout-pi", action="store_true",
+                   help="Restrict to the rollout-PI common set even when rollout is not an "
+                        "output arm. Use for a separately loaded strong-teacher none baseline.")
     p.add_argument("--save-completions", action=argparse.BooleanOptionalAction, default=True,
                    help="Dump raw completion text + per-completion metrics to JSONL "
                         "(so future metrics are a re-parse, not a re-generation).")
@@ -213,19 +225,47 @@ def main():
 
     if args.n < 1:
         p.error("--n must be >= 1")
+    if args.rollout_pi_sample_idx < 0:
+        p.error("--rollout-pi-sample-idx must be >= 0")
     problem_model = args.problem_model or args.teacher_model
+
+    rollout_attempts = None
+    rollout_metadata = None
+    use_rollout_common_set = "rollout" in args.pi_modes or args.align_rollout_pi
+    if use_rollout_common_set:
+        rollout_attempts, rollout_metadata = load_rollout_pi(
+            problem_model,
+            args.dataset,
+            args.rollout_pi_root,
+            args.rollout_pi_sample_idx,
+        )
 
     # Fixed eval set: problem-model's hint cache, restricted to full-PI-feasible
     # under that model's tokenizer -- computed regardless of which arms we run, so
     # self- and strong-teacher invocations line up problem-for-problem.
     problems = load_eval_problems(
-        problem_model, args.num_problems, args.seed, need_full=True, dataset=args.dataset
+        problem_model,
+        args.num_problems,
+        args.seed,
+        need_full=True,
+        dataset=args.dataset,
+        required_question_indices=(
+            set(rollout_attempts) if rollout_attempts is not None else None
+        ),
     )
+    if rollout_attempts is not None:
+        problems = attach_rollout_pi(problems, rollout_attempts)
     from transformers import AutoTokenizer
     problem_tok = AutoTokenizer.from_pretrained(problem_model, trust_remote_code=True)
-    problems = restrict_to_full_feasible(
-        problems, problem_tok, args.max_model_len - args.max_tokens
+    common_set_modes = ["full"] + (["rollout"] if use_rollout_common_set else [])
+    problems = restrict_to_pi_feasible(
+        problems,
+        problem_tok,
+        args.max_model_len - args.max_tokens,
+        common_set_modes,
     )
+    if not problems:
+        raise RuntimeError("No common eval problems fit the requested PI prompts.")
     print(f"teacher={args.teacher_model}  problems from={problem_model}  "
           f"|eval set|={len(problems)}  pi_modes={args.pi_modes}")
 
@@ -274,7 +314,10 @@ def main():
         "elapsed_s": elapsed,
         "behavior": summary,
     }
-    summary_path = os.path.join(out_dir, "teacher_behavior_summary.json")
+    if rollout_metadata is not None:
+        rollout_metadata["used_for_common_set_only"] = "rollout" not in args.pi_modes
+        out["rollout_pi"] = rollout_metadata
+    summary_path = os.path.join(out_dir, "teacher_uncertainty_summary.json")
     with open(summary_path, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nSaved -> {summary_path}")
