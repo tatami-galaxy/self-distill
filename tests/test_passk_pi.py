@@ -11,6 +11,7 @@ def rollout_cache(*, mixed_only=False):
         "question": ["q1", "q1", "q2", "q2"],
         "completion_text": ["q1 attempt zero", "q1 attempt one",
                             "q2 attempt zero", "q2 attempt one"],
+        "question_idx": [0, 0, 1, 1],
         "sample_idx": [0, 1, 0, 1],
         # Opposite rewards ensure selecting sample_idx=1 cannot accidentally mean
         # selecting correct or incorrect attempts.
@@ -46,10 +47,27 @@ class RolloutPiCacheTest(unittest.TestCase):
                 "student", "deepmath", "pi", sample_idx=1
             )
 
-        self.assertEqual(attempts, {"q1": "q1 attempt one", "q2": "q2 attempt one"})
+        self.assertEqual(
+            attempts,
+            {0: ("q1", "q1 attempt one"), 1: ("q2", "q2 attempt one")},
+        )
         self.assertEqual(metadata["sample_idx"], 1)
         self.assertEqual(metadata["selection_policy"], "fixed_sample_idx_without_reward")
         self.assertEqual(metadata["n_available_questions"], 2)
+
+    def test_duplicate_question_text_at_distinct_source_indices_is_allowed(self):
+        cache = rollout_cache().select([0, 2]).map(lambda _: {"question": "duplicate q"})
+        with (
+            mock.patch.object(passk_pi, "rollout_path", return_value="pi/cache"),
+            mock.patch.object(passk_pi.os.path, "isdir", return_value=True),
+            mock.patch.object(passk_pi, "load_from_disk", return_value=cache),
+        ):
+            attempts, _ = passk_pi.load_rollout_pi(
+                "student", "deepmath", "pi", sample_idx=0
+            )
+
+        self.assertEqual(set(attempts), {0, 1})
+        self.assertEqual(attempts[0][0], attempts[1][0])
 
     def test_mixed_only_cache_is_rejected_as_verifier_selected(self):
         with (
@@ -82,10 +100,11 @@ class CommonProblemSetTest(unittest.TestCase):
                 num_problems=2,
                 seed=42,
                 need_full=False,
-                required_questions={"q1", "q2"},
+                required_question_indices={1, 2},
             )
 
         self.assertEqual({problem["question"] for problem in problems}, {"q1", "q2"})
+        self.assertEqual({problem["question_idx"] for problem in problems}, {1, 2})
 
     def test_long_rollout_pi_can_bind_common_prompt_set(self):
         class Tokenizer:

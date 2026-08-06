@@ -13,8 +13,9 @@ information, expert demonstrations, or environment feedback.
 
 Eval set = a random subset of the hint cache (utils/gen_hints.py), which carries
 question + final_answer + hint; `full` solutions are rejoined from DeepMath. For
-`rollout`, one fixed sample_idx from gen_rollouts.py is joined by question. Selection
-never reads the rollout's reward. All arms are evaluated on the SAME problems and
+`rollout`, one fixed sample_idx from gen_rollouts.py is joined by its source hint-cache
+index (so repeated question text remains unambiguous). Selection never reads the rollout's
+reward. All arms are evaluated on the SAME problems and
 restricted to prompts that fit every requested PI arm, so every pass@k shares a denominator.
 
 Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
@@ -80,7 +81,7 @@ def load_eval_problems(
     seed: int,
     need_full: bool,
     dataset: str = "deepmath",
-    required_questions: set[str] | None = None,
+    required_question_indices: set[int] | None = None,
 ) -> list[dict]:
     """Random subset of the hint cache, with `full` solutions rejoined from `dataset`.
 
@@ -105,13 +106,10 @@ def load_eval_problems(
         )
 
     eligible_idx = list(range(len(hints)))
-    if required_questions is not None:
-        eligible_idx = [
-            idx for idx, question in enumerate(hints["question"])
-            if question in required_questions
-        ]
+    if required_question_indices is not None:
+        eligible_idx = [idx for idx in eligible_idx if idx in required_question_indices]
         if not eligible_idx:
-            raise ValueError("The hint and rollout-PI caches have no questions in common.")
+            raise ValueError("The hint and rollout-PI caches have no source indices in common.")
         if len(eligible_idx) < num_problems:
             print(f"  warning: rollout-PI cache covers only {len(eligible_idx)} eligible "
                   f"hint questions; requested {num_problems}")
@@ -121,8 +119,13 @@ def load_eval_problems(
     sub = hints.select(idx)
 
     problems = [
-        {"question": r["question"], "answer": str(r["final_answer"]), "hint": r["hint"]}
-        for r in sub
+        {
+            "question_idx": question_idx,
+            "question": row["question"],
+            "answer": str(row["final_answer"]),
+            "hint": row["hint"],
+        }
+        for question_idx, row in zip(idx, sub, strict=True)
     ]
 
     if need_full:
@@ -141,8 +144,8 @@ def load_rollout_pi(
     dataset: str,
     root: str,
     sample_idx: int,
-) -> tuple[dict[str, str], dict]:
-    """Load one fixed attempted solution per question without consulting rewards."""
+) -> tuple[dict[int, tuple[str, str]], dict]:
+    """Load one fixed attempt per source hint index without consulting rewards."""
     path = rollout_path(model, dataset, root)
     if not os.path.isdir(path):
         raise FileNotFoundError(
@@ -154,6 +157,7 @@ def load_rollout_pi(
     cache = load_from_disk(path)
     required = {
         "question",
+        "question_idx",
         "completion_text",
         "sample_idx",
         "gen_model",
@@ -187,18 +191,21 @@ def load_rollout_pi(
             "verifier outcomes and invalidates the unverified-rollout ablation."
         )
 
-    attempts: dict[str, str] = {}
-    # Deliberately access only these three columns: reward is neither selected on nor recorded.
-    for question, completion, cached_sample_idx in zip(
-        cache["question"], cache["completion_text"], cache["sample_idx"], strict=True
+    attempts: dict[int, tuple[str, str]] = {}
+    # Deliberately access only these four columns: reward is neither selected on nor recorded.
+    for question_idx, question, completion, cached_sample_idx in zip(
+        cache["question_idx"], cache["question"], cache["completion_text"],
+        cache["sample_idx"], strict=True,
     ):
         if int(cached_sample_idx) != sample_idx:
             continue
-        if question in attempts:
+        question_idx = int(question_idx)
+        if question_idx in attempts:
             raise ValueError(
-                f"Rollout-PI cache has duplicate sample_idx={sample_idx} for question {question!r}."
+                f"Rollout-PI cache has duplicate sample_idx={sample_idx} for "
+                f"question_idx={question_idx}."
             )
-        attempts[question] = completion
+        attempts[question_idx] = (question, completion)
     if not attempts:
         available = sorted(int(value) for value in cache.unique("sample_idx"))
         raise ValueError(
@@ -335,11 +342,20 @@ def main():
     problems = load_eval_problems(
         args.model, args.num_problems, args.seed,
         need_full=("full" in args.pi_modes), dataset=args.dataset,
-        required_questions=(set(rollout_attempts) if rollout_attempts is not None else None),
+        required_question_indices=(
+            set(rollout_attempts) if rollout_attempts is not None else None
+        ),
     )
     if rollout_attempts is not None:
         for problem in problems:
-            problem["rollout"] = rollout_attempts[problem["question"]]
+            cached_question, completion = rollout_attempts[problem["question_idx"]]
+            if cached_question != problem["question"]:
+                raise ValueError(
+                    "Rollout-PI and hint caches disagree at question_idx="
+                    f"{problem['question_idx']}: rollout has {cached_question!r}, hint cache "
+                    f"has {problem['question']!r}."
+                )
+            problem["rollout"] = completion
     print(f"Loaded {len(problems)} eval problems for {args.model}")
 
     llm = LLM(
