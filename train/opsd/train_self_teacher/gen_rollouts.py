@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollou
 # Generate attempted solutions for the pass@k rollout-PI ablation. Do not use --mixed-only:
 # PI selection must not depend on verifier outcomes.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
-    --model Qwen/Qwen3-1.7B --dataset deepmath --output-root data/pi/attempted_solution \
+    --model Qwen/Qwen3-1.7B --dataset deepmath --output-root data/pi/attempted_solution_8k \
     --n 1 --max-completion-length 8192 --skip-logp-scoring
 """
 

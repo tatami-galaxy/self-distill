@@ -31,7 +31,7 @@ Pass --align-rollout-pi to a separate strong-teacher `none` run so it uses that 
 # self-teacher (OPSD), all PIs
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
     --teacher-model Qwen/Qwen3-1.7B --pi-modes none rollout answer hint full \
-    --rollout-pi-root data/pi/attempted_solution --rollout-pi-sample-idx 0
+    --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0
 
 # strong teacher (OPD), query-only, same problems
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
@@ -205,7 +205,7 @@ def main():
                     help="Completion budget. Truncated completions are flagged (trunc_rate)"
                         "since their censored length biases mean_tokens downward.")
     p.add_argument("--output-dir", default="results/teacher_uncertainty")
-    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution",
+    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
                    help="Root passed as --output-root to gen_rollouts.py for rollout PI.")
     p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
                    help="Fixed cached sample_idx used as PI for every problem. Selection does "

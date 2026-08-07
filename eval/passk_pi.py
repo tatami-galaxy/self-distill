@@ -18,16 +18,19 @@ index (so repeated question text remains unambiguous). Selection never reads the
 reward. All arms are evaluated on the SAME problems and
 restricted to prompts that fit every requested PI arm, so every pass@k shares a denominator.
 
+When both `none` and `rollout` are requested, the script also computes a paired
+`rollout - none` pass@k difference per problem, split by whether the fixed cached attempt
+was correct. The cached reward is used only for this post-hoc split, never for selection.
+
 Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
 
+# Generate the rollout cache using the command in
+# train/opsd/train_self_teacher/gen_rollouts.py first.
 CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
-    --model Qwen/Qwen3-1.7B --num-problems 128 --n 8 --k 1 8
-
-# Unverified-rollout PI ablation (generate the cache using the command in
-# train/opsd/train_self_teacher/gen_rollouts.py first).
-CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
-    --model Qwen/Qwen3-1.7B --pi-modes none rollout --num-problems 128 --n 8 --k 1 8 \
-    --rollout-pi-root data/pi/attempted_solution --rollout-pi-sample-idx 0
+    --model Qwen/Qwen3-1.7B --pi-modes none answer hint full rollout \
+    --num-problems 128 --n 8 --k 1 8 --save-samples \
+    --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0 \
+    --output-dir results/passk_pi_8k
 """
 
 import argparse
@@ -35,11 +38,12 @@ import json
 import os
 import random
 import time
+from typing import NamedTuple
 
 from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
-from eval.run_eval import compute_pass_at_k
+from eval.run_eval import compute_pass_at_k, pass_at_k
 from train.opsd.train_self_teacher.lib import rollout_path
 from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, TEACHER_PROMPT_TEMPLATE
 from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path
@@ -51,6 +55,12 @@ PI_ROLLOUT = (
     "Now write a complete solution of your own, including the reasoning."
 )
 PI_MODES = ("none", "rollout", "answer", "hint", "full")
+
+
+class RolloutAttempt(NamedTuple):
+    question: str
+    completion: str
+    correct: bool
 
 
 def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
@@ -144,8 +154,8 @@ def load_rollout_pi(
     dataset: str,
     root: str,
     sample_idx: int,
-) -> tuple[dict[int, tuple[str, str]], dict]:
-    """Load one fixed attempt per source hint index without consulting rewards."""
+) -> tuple[dict[int, RolloutAttempt], dict]:
+    """Load one fixed attempt per source index; reward never affects which attempt is kept."""
     path = rollout_path(model, dataset, root)
     if not os.path.isdir(path):
         raise FileNotFoundError(
@@ -159,6 +169,7 @@ def load_rollout_pi(
         "question",
         "question_idx",
         "completion_text",
+        "reward",
         "sample_idx",
         "gen_model",
         "dataset",
@@ -191,11 +202,12 @@ def load_rollout_pi(
             "verifier outcomes and invalidates the unverified-rollout ablation."
         )
 
-    attempts: dict[int, tuple[str, str]] = {}
-    # Deliberately access only these four columns: reward is neither selected on nor recorded.
-    for question_idx, question, completion, cached_sample_idx in zip(
+    attempts: dict[int, RolloutAttempt] = {}
+    # Select solely on sample_idx. Reward is read only after that choice, as the label for the
+    # post-hoc paired analysis; it never affects cache membership or prompt construction.
+    for question_idx, question, completion, reward, cached_sample_idx in zip(
         cache["question_idx"], cache["question"], cache["completion_text"],
-        cache["sample_idx"], strict=True,
+        cache["reward"], cache["sample_idx"], strict=True,
     ):
         if int(cached_sample_idx) != sample_idx:
             continue
@@ -205,7 +217,13 @@ def load_rollout_pi(
                 f"Rollout-PI cache has duplicate sample_idx={sample_idx} for "
                 f"question_idx={question_idx}."
             )
-        attempts[question_idx] = (question, completion)
+        reward = float(reward)
+        if reward not in (0.0, 1.0):
+            raise ValueError(
+                f"Rollout-PI cache has non-binary reward={reward} for "
+                f"question_idx={question_idx}, sample_idx={sample_idx}."
+            )
+        attempts[question_idx] = RolloutAttempt(question, completion, bool(reward))
     if not attempts:
         available = sorted(int(value) for value in cache.unique("sample_idx"))
         raise ValueError(
@@ -220,6 +238,7 @@ def load_rollout_pi(
         "cache_path": path,
         "sample_idx": sample_idx,
         "selection_policy": "fixed_sample_idx_without_reward",
+        "reward_usage": "posthoc_attempt_correctness_stratification_only",
         "n_available_questions": len(attempts),
         "generation_seeds": generation_seeds,
         "max_completion_lengths": completion_budgets,
@@ -228,19 +247,135 @@ def load_rollout_pi(
 
 
 def attach_rollout_pi(
-    problems: list[dict], attempts: dict[int, tuple[str, str]]
+    problems: list[dict], attempts: dict[int, RolloutAttempt]
 ) -> list[dict]:
     """Attach attempts by source index and verify the two caches still align by text."""
     for problem in problems:
-        cached_question, completion = attempts[problem["question_idx"]]
-        if cached_question != problem["question"]:
+        attempt = attempts[problem["question_idx"]]
+        if attempt.question != problem["question"]:
             raise ValueError(
                 "Rollout-PI and hint caches disagree at question_idx="
-                f"{problem['question_idx']}: rollout has {cached_question!r}, hint cache "
+                f"{problem['question_idx']}: rollout has {attempt.question!r}, hint cache "
                 f"has {problem['question']!r}."
             )
-        problem["rollout"] = completion
+        problem["rollout"] = attempt.completion
+        problem["attempt_correct"] = attempt.correct
     return problems
+
+
+def _percentile(sorted_values: list[float], quantile: float) -> float:
+    """Linearly interpolated percentile for an already sorted, non-empty list."""
+    position = (len(sorted_values) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
+def paired_bootstrap_ci(
+    deltas: list[float], num_samples: int, seed: int
+) -> list[float]:
+    """Problem-level paired bootstrap percentile interval for the mean delta."""
+    if not deltas:
+        raise ValueError("Cannot bootstrap an empty paired-delta group.")
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
+    rng = random.Random(seed)
+    n = len(deltas)
+    bootstrap_means = sorted(
+        sum(deltas[rng.randrange(n)] for _ in range(n)) / n
+        for _ in range(num_samples)
+    )
+    return [
+        _percentile(bootstrap_means, 0.025),
+        _percentile(bootstrap_means, 0.975),
+    ]
+
+
+def paired_rollout_minus_none(
+    problems: list[dict],
+    results_by_mode: dict[str, list[dict]],
+    ks: list[int],
+    bootstrap_samples: int,
+    seed: int,
+) -> tuple[dict, list[dict]]:
+    """Paired per-problem rollout-minus-none estimates, stratified by attempt outcome."""
+    if not {"none", "rollout"}.issubset(results_by_mode):
+        raise ValueError("Paired analysis requires both 'none' and 'rollout' results.")
+
+    indexed: dict[str, dict[int, dict]] = {}
+    for mode in ("none", "rollout"):
+        by_question: dict[int, dict] = {}
+        for result in results_by_mode[mode]:
+            question_idx = int(result["question_idx"])
+            if question_idx in by_question:
+                raise ValueError(f"Duplicate {mode} result for question_idx={question_idx}.")
+            by_question[question_idx] = result
+        indexed[mode] = by_question
+
+    problem_indices = [int(problem["question_idx"]) for problem in problems]
+    expected = set(problem_indices)
+    for mode in ("none", "rollout"):
+        actual = set(indexed[mode])
+        if actual != expected:
+            raise ValueError(
+                f"Cannot pair {mode} results: missing={sorted(expected - actual)}, "
+                f"extra={sorted(actual - expected)}."
+            )
+
+    per_problem = []
+    for problem in problems:
+        question_idx = int(problem["question_idx"])
+        none = indexed["none"][question_idx]
+        rollout = indexed["rollout"][question_idx]
+        pass_values = {}
+        for k in ks:
+            none_value = pass_at_k(none["n_samples"], none["n_correct"], k)
+            rollout_value = pass_at_k(rollout["n_samples"], rollout["n_correct"], k)
+            pass_values[f"pass@{k}"] = {
+                "none": none_value,
+                "rollout": rollout_value,
+                "delta": rollout_value - none_value,
+            }
+        per_problem.append({
+            "question_idx": question_idx,
+            "attempt_correct": bool(problem["attempt_correct"]),
+            "none_n_samples": none["n_samples"],
+            "none_n_correct": none["n_correct"],
+            "rollout_n_samples": rollout["n_samples"],
+            "rollout_n_correct": rollout["n_correct"],
+            "pass_at_k": pass_values,
+        })
+
+    paired = {
+        "comparison": "rollout - none",
+        "bootstrap_samples": bootstrap_samples,
+        "bootstrap_seed": seed,
+    }
+    for group_index, (label, attempt_correct) in enumerate(
+        (("attempt_correct", True), ("attempt_incorrect", False))
+    ):
+        rows = [row for row in per_problem if row["attempt_correct"] is attempt_correct]
+        if not rows:
+            raise ValueError(f"Paired analysis group {label!r} has no problems.")
+        metrics = {}
+        for k in ks:
+            key = f"pass@{k}"
+            none_values = [row["pass_at_k"][key]["none"] for row in rows]
+            rollout_values = [row["pass_at_k"][key]["rollout"] for row in rows]
+            deltas = [row["pass_at_k"][key]["delta"] for row in rows]
+            metrics[key] = {
+                "none": sum(none_values) / len(rows),
+                "rollout": sum(rollout_values) / len(rows),
+                "delta": sum(deltas) / len(rows),
+                "delta_ci95": paired_bootstrap_ci(
+                    deltas,
+                    bootstrap_samples,
+                    seed + group_index * 10_000 + k,
+                ),
+            }
+        paired[label] = {"n_problems": len(rows), "pass_at_k": metrics}
+    return paired, per_problem
 
 
 def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str]):
@@ -301,7 +436,11 @@ def eval_pi_mode(llm, tokenizer, problems, pi_mode, sampling_params) -> list[dic
     results = []
     for p, out in zip(problems, outputs, strict=True):
         n_correct = sum(grade(comp.text, p["answer"])[1] for comp in out.outputs)
-        results.append({"n_samples": len(out.outputs), "n_correct": n_correct})
+        results.append({
+            "question_idx": p["question_idx"],
+            "n_samples": len(out.outputs),
+            "n_correct": n_correct,
+        })
     return results
 
 
@@ -326,13 +465,16 @@ def main():
                    help="Completion budget. Keep generous so full reasoning isn't "
                         "truncated (truncation -> no \\boxed -> undercounts pass@k).")
     p.add_argument("--output-dir", default="results/passk_pi")
-    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution",
+    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
                    help="Root passed as --output-root to gen_rollouts.py for the rollout PI.")
     p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
                    help="Fixed cached sample_idx used as PI for every problem. Selection does "
                         "not inspect correctness rewards.")
+    p.add_argument("--paired-bootstrap-samples", type=int, default=10_000,
+                   help="Problem-level bootstrap replicates for the paired rollout-minus-none "
+                        "95%% confidence intervals.")
     p.add_argument("--save-samples", action="store_true",
-                   help="Also dump per-problem n_correct for each mode.")
+                   help="Also save per-problem n_correct values and paired pass@k deltas.")
     # vLLM
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -344,6 +486,8 @@ def main():
         p.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
     if args.rollout_pi_sample_idx < 0:
         p.error("--rollout-pi-sample-idx must be >= 0")
+    if args.paired_bootstrap_samples < 1:
+        p.error("--paired-bootstrap-samples must be >= 1")
 
     rollout_attempts = None
     rollout_metadata = None
@@ -387,15 +531,28 @@ def main():
         raise RuntimeError("No common eval problems fit every requested PI prompt.")
 
     summary = {mode: {} for mode in args.pi_modes}
-    per_problem = {}
+    results_by_mode = {}
+    per_problem_n_correct = {}
     t0 = time.time()
     for mode in args.pi_modes:
         results = eval_pi_mode(llm, tokenizer, problems, mode, sampling_params)
+        results_by_mode[mode] = results
         pak = compute_pass_at_k(results, args.k)
         summary[mode] = {f"pass@{k}": pak[k] for k in args.k}
-        per_problem[mode] = [r["n_correct"] for r in results]
+        per_problem_n_correct[mode] = [r["n_correct"] for r in results]
         print(f"  {mode:7s} " + "  ".join(f"pass@{k}={pak[k]*100:5.1f}%" for k in args.k))
     elapsed = time.time() - t0
+
+    paired_summary = None
+    paired_per_problem = None
+    if {"none", "rollout"}.issubset(results_by_mode):
+        paired_summary, paired_per_problem = paired_rollout_minus_none(
+            problems,
+            results_by_mode,
+            args.k,
+            args.paired_bootstrap_samples,
+            args.seed,
+        )
 
     # Report table
     print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n})")
@@ -404,6 +561,21 @@ def main():
     for mode in args.pi_modes:
         row = f"{mode:7s}  " + "  ".join(f"{summary[mode][f'pass@{k}']*100:6.1f}" for k in args.k)
         print(row)
+
+    if paired_summary is not None:
+        print("\nPaired rollout - none by cached attempt outcome")
+        for label in ("attempt_correct", "attempt_incorrect"):
+            group = paired_summary[label]
+            print(f"  {label} (n={group['n_problems']})")
+            for k in args.k:
+                metric = group["pass_at_k"][f"pass@{k}"]
+                ci_low, ci_high = metric["delta_ci95"]
+                print(
+                    f"    pass@{k}: none={metric['none']*100:5.1f}%  "
+                    f"rollout={metric['rollout']*100:5.1f}%  "
+                    f"delta={metric['delta']*100:+5.1f} pp  "
+                    f"95% CI [{ci_low*100:+5.1f}, {ci_high*100:+5.1f}] pp"
+                )
 
     # Save
     out = {
@@ -418,8 +590,12 @@ def main():
     }
     if rollout_metadata is not None:
         out["rollout_pi"] = rollout_metadata
+    if paired_summary is not None:
+        out["paired_rollout_minus_none"] = paired_summary
     if args.save_samples:
-        out["per_problem_n_correct"] = per_problem
+        out["per_problem_n_correct"] = per_problem_n_correct
+        if paired_per_problem is not None:
+            out["paired_rollout_minus_none_per_problem"] = paired_per_problem
     out_dir = os.path.join(args.output_dir, args.model.replace("/", "_"))
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "passk_pi_summary.json")
