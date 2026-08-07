@@ -24,13 +24,12 @@ was correct. The cached reward is used only for this post-hoc split, never for s
 
 Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
 
-# Generate the rollout cache using the command in
-# train/opsd/train_self_teacher/gen_rollouts.py first.
+# Generate the rollout cache using the command in train/opsd/train_self_teacher/gen_rollouts.py first.
 CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
     --model Qwen/Qwen3-1.7B --pi-modes none answer hint full rollout \
     --num-problems 128 --n 8 --k 1 8 --save-samples \
-    --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0 \
-    --output-dir results/passk_pi_8k
+    --rollout-pi-root data/pi/attempted_solution_16k --rollout-pi-sample-idx 0 \
+    --output-dir results/passk_pi_16k --max-tokens 16384
 """
 
 import argparse
@@ -477,7 +476,7 @@ def main():
     p.add_argument("--save-samples", action="store_true",
                    help="Also save per-problem n_correct values and paired pass@k deltas.")
     # vLLM
-    p.add_argument("--max-model-len", type=int, default=32768)
+    p.add_argument("--max-model-len", type=int, default=40000)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
