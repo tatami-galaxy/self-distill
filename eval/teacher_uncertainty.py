@@ -31,7 +31,8 @@ Pass --align-rollout-pi to a separate strong-teacher `none` run so it uses that 
 # self-teacher (OPSD), all PIs
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
     --teacher-model Qwen/Qwen3-1.7B --pi-modes none rollout answer hint full \
-    --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0
+    --rollout-pi-root data/pi/attempted_solution_16k --rollout-pi-sample-idx 0 \
+    --output-dir results/teacher_uncertainty_16k --max-tokens 16384
 
 # strong teacher (OPD), query-only, same problems
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
@@ -204,7 +205,7 @@ def main():
     p.add_argument("--max-tokens", type=int, default=8192,
                     help="Completion budget. Truncated completions are flagged (trunc_rate)"
                         "since their censored length biases mean_tokens downward.")
-    p.add_argument("--output-dir", default="results/teacher_uncertainty")
+    p.add_argument("--output-dir", default="results/teacher_uncertainty_8k")
     p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
                    help="Root passed as --output-root to gen_rollouts.py for rollout PI.")
     p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
@@ -217,7 +218,7 @@ def main():
                    help="Dump raw completion text + per-completion metrics to JSONL "
                         "(so future metrics are a re-parse, not a re-generation).")
     # vLLM
-    p.add_argument("--max-model-len", type=int, default=32768)
+    p.add_argument("--max-model-len", type=int, default=40000)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
