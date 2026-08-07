@@ -326,24 +326,6 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 plot_aime_curves(aime, "pass@1");
 
 
-# %% -------------------- AIME COMPARISON MATRIX -------------------- [markdown]
-# The table below is a compact model × algorithm/variant view of the same best-checkpoint selection. `AIME_BEST_K` controls both the per-model tables and this matrix; blanks mean an arm has not yet been evaluated for that model.
-#
-
-# %% -------------------- DISPLAY AIME MATRIX --------------------
-aime_best["algorithm_variant"] = aime_best.apply(
-    lambda row: method_label(row, include_run=False), axis=1
-)
-best_matrix = aime_best.pivot(
-    index="model", columns="algorithm_variant", values=AIME_BEST_METRIC
-)
-display(
-    best_matrix.style
-    .format("{:.3f}", na_rep="—")
-    .background_gradient(cmap="Blues", vmin=0, vmax=1)
-)
-
-
 # %% -------------------- PRIVILEGED-INFORMATION PASS@K -------------------- [markdown]
 # ## Privileged-information pass@k
 #
@@ -429,7 +411,10 @@ fig.tight_layout()
 # %% -------------------- TEACHER UNCERTAINTY -------------------- [markdown]
 # ## Teacher uncertainty
 #
-# Teacher-uncertainty summaries characterize uncertainty verbalization while retaining answer accuracy, response length, and truncation as context. The dashboard keeps differently scaled quantities on separate axes, making the shift under richer PI visible without combining incompatible units.
+# Teacher-uncertainty summaries characterize uncertainty verbalization
+# while retaining answer accuracy, response length, and truncation as context.
+# The dashboard keeps differently scaled quantities on separate axes,
+# making the shift under richer PI visible without combining incompatible units.
 #
 
 # %% -------------------- LOAD TEACHER UNCERTAINTY RESULTS --------------------
@@ -478,13 +463,13 @@ def load_teacher_uncertainty() -> tuple[pd.DataFrame, pd.DataFrame]:
 teacher_uncertainty, teacher_markers = load_teacher_uncertainty()
 teacher_columns = [
     "teacher_model", "problem_model", "pi_mode", "pass@1", "mean_tokens",
-    "trunc_rate", "unclosed_rate", "e_per_1k_tokens", "n_completions",
+    "trunc_rate", "unclosed_rate", "mean_e_think", "e_per_1k_tokens", "n_completions",
 ]
 display(
     teacher_uncertainty[teacher_columns]
     .style.format({
         "pass@1": "{:.3f}", "mean_tokens": "{:,.0f}", "trunc_rate": "{:.3f}",
-        "unclosed_rate": "{:.3f}", "e_per_1k_tokens": "{:.2f}",
+        "unclosed_rate": "{:.3f}", "mean_e_think": "{:.2f}", "e_per_1k_tokens": "{:.2f}",
     })
 )
 
