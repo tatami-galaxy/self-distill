@@ -9,6 +9,8 @@ Privileged context (`--pi-mode`):
   hint   -- a small set of concepts/results the model itself distilled from the
             full solution; precompute with `python -m utils.gen_hints` first
             (same --model). Sits between `full` and `answer`.
+  rollout -- one fixed, unverified solution attempt sampled from the same base model;
+             precompute with `train.opsd.train_self_teacher.gen_rollouts` first
 
 Resume (`--resume-from-checkpoint`) restores weights/optimizer/scheduler/RNG and
 skips already-seen data; pass the same hyperparameters (verified against run_meta.json).
@@ -25,6 +27,13 @@ and ~248 on a 4k one, so a long `hint` run can quietly start revisiting prompts.
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
     --model Qwen/Qwen3-4B --pi-mode full --dataset deepmath
+
+# rollout PI: generate the attempted-solution cache first (see gen_rollouts.py).
+# The larger prompt budget keeps the 8K attempt plus the question/instructions intact.
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
+    --model Qwen/Qwen3-4B --dataset deepmath --pi-mode rollout \
+    --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0 \
+    --max-prompt-length 16384 --max-completion-length 8192
 
 # multiple GPUs: data-parallel via accelerate, one process per GPU. In colocate
 # mode each process trains the policy and runs its own vLLM engine on its GPU.
@@ -44,8 +53,10 @@ from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 from utils import (
     DATASET_REGISTRY_TRAIN,
     TEACHER_PROMPT_TEMPLATE,
+    compose_pi_messages,
     format_prompt_math,
     hint_path,
+    load_hint_cache,
     load_train_dataset,
     validate_resume,
 )
@@ -70,6 +81,11 @@ PI_HINT = (
     "{hint}\n\n"
     "Use them for your own complete solution if needed."
 )
+PI_ROLLOUT = (
+    "Here is an attempted solution to the question above. It may or may not be correct:\n\n"
+    "{attempt}\n\n"
+    "Now write a complete solution of your own, including the reasoning."
+)
 
 # How SDFTTrainer stitches the student prompt and privileged context into the teacher's
 # user turn: imported from utils (train_ppo_pi builds the same prompt for its critic, and
@@ -88,6 +104,8 @@ def build_sdft_dataset(
     max_samples: int | None = None,
     model: str | None = None,
     max_prompt_length: int | None = None,
+    rollout_pi_root: str = "data/pi/attempted_solution_8k",
+    rollout_pi_sample_idx: int = 0,
 ):
     """
     `prompt`             -- conversational [system, user] messages, identical to
@@ -98,19 +116,36 @@ def build_sdft_dataset(
                             columns; everything else is dropped.
 
     `pi_mode="hint"` loads precomputed self-hints from disk (see build_hint_dataset);
-    `full`/`answer` are built inline from the dataset (question, final_answer,
-    solution). `full` requires a solution, so its rows are drawn from the
-    solution-bearing subset (see load_train_dataset).
+    `rollout` loads one fixed, unverified attempt per question from
+    gen_rollouts.py (see build_rollout_dataset); `full`/`answer` are built
+    inline from the dataset (question, final_answer, solution). `full` requires
+    a solution, so its rows are drawn from the solution-bearing subset (see
+    load_train_dataset).
 
-    For `pi_mode="full"` the demo lives entirely in the teacher prompt,
+    For `full` and `rollout`, the long PI lives entirely in the teacher prompt,
     which SDFTTrainer left-truncates to `max_prompt_length` -- silently lopping
-    the start of the demo (and the question). So when `model`/`max_prompt_length`
-    are given, drop `full` rows whose teacher prompt doesn't fit, keeping only
-    demos the teacher sees intact. Applied after `max_samples`, so the result may
-    hold fewer rows.
+    the start of the PI (and the question). So when `model`/`max_prompt_length`
+    are given, drop rows whose exact teacher prompt doesn't fit. Applied after
+    `max_samples`, so the result may hold fewer rows.
     """
     if pi_mode == "hint":
         return build_hint_dataset(model, dataset, max_samples)
+    if pi_mode == "rollout":
+        ds = build_rollout_dataset(
+            model,
+            dataset,
+            max_samples,
+            rollout_pi_root,
+            rollout_pi_sample_idx,
+        )
+        return filter_long_pi_prompts(
+            ds, pi_mode, model=model, max_prompt_length=max_prompt_length
+        )
+    if pi_mode not in ("full", "answer"):
+        raise ValueError(
+            f"unknown pi_mode {pi_mode!r}; expected one of "
+            "('full', 'answer', 'hint', 'rollout')"
+        )
 
     ds = load_train_dataset(
         dataset, max_samples=max_samples, require_solution=(pi_mode == "full")
@@ -128,34 +163,162 @@ def build_sdft_dataset(
 
     ds = ds.map(_map, remove_columns=ds.column_names)
 
-    if pi_mode == "full" and model is not None and max_prompt_length is not None:
-        from transformers import AutoTokenizer
+    return filter_long_pi_prompts(
+        ds, pi_mode, model=model, max_prompt_length=max_prompt_length
+    )
 
-        tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
-        def _teacher_prompt_fits(row):
-            # Reconstruct SDFTTrainer's teacher prompt: keep the system turn(s),
-            # fold the privileged context into the user turn via the template,
-            # then tokenize with add_generation_prompt=True (the trainer's path).
-            user_text = TEACHER_PROMPT_TEMPLATE.format(
-                prompt=row["prompt"][-1]["content"],
-                privileged_context=row["privileged_context"],
-            )
-            messages = row["prompt"][:-1] + [{"role": "user", "content": user_text}]
-            # Mirror SDFTTrainer._tokenize_prompts exactly: batch of one, read
-            # input_ids. (tokenize=True without return_dict yields a BatchEncoding
-            # whose len() is the field count, not the token count.)
-            ids = tok.apply_chat_template(
-                [messages], add_generation_prompt=True, tokenize=True, return_dict=True
-            )["input_ids"][0]
-            return len(ids) <= max_prompt_length
+def filter_long_pi_prompts(
+    ds,
+    pi_mode: str,
+    model: str | None,
+    max_prompt_length: int | None,
+):
+    """Drop long-PI rows that SDFTTrainer would otherwise silently left-truncate."""
+    if pi_mode not in ("full", "rollout") or model is None or max_prompt_length is None:
+        return ds
 
-        n_before = len(ds)
-        ds = ds.filter(_teacher_prompt_fits, num_proc=4)
-        print(f"  pi=full: kept {len(ds)}/{n_before} rows whose teacher prompt "
-              f"fits max_prompt_length={max_prompt_length}")
+    from transformers import AutoTokenizer
 
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    def _teacher_prompt_fits(row):
+        # Reconstruct SDFTTrainer's exact teacher prompt, including the generation header.
+        messages = compose_pi_messages(row["prompt"], row["privileged_context"])
+        # Mirror SDFTTrainer._tokenize_prompts exactly: batch of one, read input_ids.
+        # (tokenize=True without return_dict yields a BatchEncoding whose len() is the
+        # field count, not the token count.)
+        ids = tok.apply_chat_template(
+            [messages], add_generation_prompt=True, tokenize=True, return_dict=True
+        )["input_ids"][0]
+        return len(ids) <= max_prompt_length
+
+    n_before = len(ds)
+    ds = ds.filter(_teacher_prompt_fits, num_proc=4)
+    print(f"  pi={pi_mode}: kept {len(ds)}/{n_before} rows whose teacher prompt "
+          f"fits max_prompt_length={max_prompt_length}")
     return ds
+
+
+def rollout_pi_path(
+    model: str,
+    dataset: str,
+    root: str = "data/pi/attempted_solution_8k",
+) -> str:
+    """Attempted-solution cache path without importing self-teacher.lib (which imports us)."""
+    return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
+
+
+def build_rollout_dataset(
+    model: str | None,
+    dataset: str,
+    max_samples: int | None,
+    root: str,
+    sample_idx: int,
+):
+    """Join one fixed unverified attempt onto the matching self-hint questions.
+
+    Selection is exclusively by `sample_idx`; verifier rewards are never read. The
+    hint cache remains the source of question order so `--max-samples N` selects
+    the same first N questions as the hint arm.
+    """
+    if model is None:
+        raise ValueError("pi_mode='rollout' needs --model to locate its rollout cache.")
+    if sample_idx < 0:
+        raise ValueError("rollout_pi_sample_idx must be >= 0")
+
+    path = rollout_pi_path(model, dataset, root)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"No rollout-PI cache for {model} on {dataset} at {path}. Generate it first:\n"
+            "  python -m train.opsd.train_self_teacher.gen_rollouts "
+            f"--model {model} --dataset {dataset} --output-root {root} --n 1 "
+            "--max-completion-length 8192 --skip-logp-scoring"
+        )
+    cache = load_from_disk(path)
+    required = {
+        "question",
+        "question_idx",
+        "completion_text",
+        "sample_idx",
+        "gen_model",
+        "dataset",
+        "question_source",
+        "mixed_only",
+        "generation_seed",
+        "max_completion_length",
+    }
+    missing = required.difference(cache.column_names)
+    if missing:
+        raise ValueError(
+            f"Rollout-PI cache at {path} is missing provenance columns {sorted(missing)}. "
+            "Regenerate it with the current gen_rollouts.py and --force."
+        )
+    if set(cache.unique("gen_model")) != {model}:
+        raise ValueError(
+            f"Rollout-PI cache at {path} was generated by "
+            f"{set(cache.unique('gen_model'))}, not {model!r}."
+        )
+    if set(cache.unique("dataset")) != {dataset}:
+        raise ValueError(
+            f"Rollout-PI cache at {path} was generated for "
+            f"{set(cache.unique('dataset'))}, not {dataset!r}."
+        )
+    if set(cache.unique("question_source")) != {"hints"}:
+        raise ValueError(f"Rollout-PI cache at {path} was not generated from the hint cache.")
+    if set(cache.unique("mixed_only")) != {False}:
+        raise ValueError(
+            "The rollout-PI cache was generated with --mixed-only. That selection uses "
+            "verifier outcomes and invalidates the unverified-rollout ablation."
+        )
+
+    attempts: dict[int, tuple[str, str]] = {}
+    for question_idx, question, completion, cached_sample_idx in zip(
+        cache["question_idx"],
+        cache["question"],
+        cache["completion_text"],
+        cache["sample_idx"],
+        strict=True,
+    ):
+        if int(cached_sample_idx) != sample_idx:
+            continue
+        question_idx = int(question_idx)
+        if question_idx in attempts:
+            raise ValueError(
+                f"Rollout-PI cache has duplicate sample_idx={sample_idx} for "
+                f"question_idx={question_idx}."
+            )
+        attempts[question_idx] = (question, completion)
+    if not attempts:
+        available = sorted(int(value) for value in cache.unique("sample_idx"))
+        raise ValueError(
+            f"No rollout with sample_idx={sample_idx} in {path}; available indices: {available}."
+        )
+
+    questions = load_hint_cache(model, dataset, max_samples=max_samples)
+    missing_indices = [idx for idx in range(len(questions)) if idx not in attempts]
+    if missing_indices:
+        preview = missing_indices[:10]
+        raise ValueError(
+            f"Rollout-PI cache at {path} lacks sample_idx={sample_idx} for "
+            f"{len(missing_indices)}/{len(questions)} selected hint questions; "
+            f"first missing source indices: {preview}."
+        )
+
+    def _map(row, question_idx):
+        cached_question, attempt = attempts[question_idx]
+        if cached_question != row["question"]:
+            raise ValueError(
+                "Hint and rollout-PI caches disagree at "
+                f"question_idx={question_idx}: hint={row['question']!r}, "
+                f"rollout={cached_question!r}."
+            )
+        return {
+            "prompt": format_prompt_math(row["question"]),
+            "privileged_context": PI_ROLLOUT.format(attempt=attempt),
+        }
+
+    return questions.map(_map, with_indices=True, remove_columns=questions.column_names)
 
 
 def build_hint_dataset(model: str | None, dataset: str, max_samples: int | None):
@@ -217,9 +380,18 @@ def build_run_meta(args, num_train_examples: int) -> dict:
     return {
         "model": args.model,
         "pi_mode": args.pi_mode,
-        "gen_model": args.model if args.pi_mode == "hint" else None,
+        "gen_model": args.model if args.pi_mode in ("hint", "rollout") else None,
         "dataset": args.dataset,
         "max_samples": args.max_samples,
+        "rollout_pi_root": (
+            args.rollout_pi_root if args.pi_mode == "rollout" else None
+        ),
+        "rollout_pi_sample_idx": (
+            args.rollout_pi_sample_idx if args.pi_mode == "rollout" else None
+        ),
+        "rollout_pi_selection_policy": (
+            "fixed_sample_idx_without_reward" if args.pi_mode == "rollout" else None
+        ),
         "num_train_examples": num_train_examples,
         "distillation_mode": args.distillation_mode,
         "distillation_alpha": args.distillation_alpha,
@@ -249,18 +421,26 @@ def main():
     )
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
-                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). For "
-                        "--pi-mode hint/full the solution-bearing subset is used.")
+                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). 'hint' and "
+                        "'rollout' use the model's hint-cache question order; 'full' uses "
+                        "the solution-bearing subset.")
     p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/sdft")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Subset the training set")
     # privileged context
-    p.add_argument("--pi-mode", default="full", choices=["full", "answer", "hint"],
+    p.add_argument("--pi-mode", default="full",
+                   choices=["full", "answer", "hint", "rollout"],
                    help="Teacher-only privileged context: 'full' worked demo (paper "
                         "default), 'answer' boxed value, or 'hint' precomputed "
-                        "self-hints (run utils.gen_hints first). See PI_* templates.")
+                        "self-hints (run utils.gen_hints first), or 'rollout' one fixed "
+                        "unverified attempt from the same model.")
+    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
+                   help="Root passed as --output-root to gen_rollouts.py for rollout PI.")
+    p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
+                   help="Fixed cached sample_idx used as rollout PI for every question. "
+                        "Selection never inspects correctness rewards.")
     # SDFT objective
     p.add_argument("--distillation-mode", default="sampled_token",
                    choices=["topk_logits", "full_logits", "sampled_token"],
@@ -293,7 +473,8 @@ def main():
     # generation
     p.add_argument("--max-prompt-length", type=int, default=8192,
                    help="Prompts longer than this are left-truncated. The teacher "
-                        "prompt carries the privileged context, so 'full' demos need room.")
+                        "prompt carries the privileged context, so 'full' and 'rollout' "
+                        "PI need room.")
     p.add_argument("--max-completion-length", type=int, default=8192)
     p.add_argument("--num-generations", type=int, default=1,
                    help="On-policy rollouts per prompt. Must divide the global batch. "
@@ -338,6 +519,8 @@ def main():
                    help="Downgrade a run_meta.json hyperparameter mismatch from an error to "
                         "a warning (use only if you understand the data-skip consequences).")
     args = p.parse_args()
+    if args.rollout_pi_sample_idx < 0:
+        p.error("--rollout-pi-sample-idx must be >= 0")
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(
@@ -351,7 +534,13 @@ def main():
         max_samples=args.max_samples,
         model=args.model,
         max_prompt_length=args.max_prompt_length,
+        rollout_pi_root=args.rollout_pi_root,
+        rollout_pi_sample_idx=args.rollout_pi_sample_idx,
     )
+    if len(train_dataset) == 0:
+        raise RuntimeError(
+            "No training examples remain after PI cache joining and prompt-length filtering."
+        )
     print(f"Loaded {len(train_dataset)} examples")
     print(f"  sample prompt: {train_dataset[0]['prompt'][-1]['content'][:120]!r}")
     print(f"  sample privileged_context: {train_dataset[0]['privileged_context'][:120]!r}")

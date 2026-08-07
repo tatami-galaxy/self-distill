@@ -45,15 +45,16 @@ from vllm import LLM, SamplingParams
 
 from eval.run_eval import compute_pass_at_k, pass_at_k
 from train.opsd.train_self_teacher.lib import rollout_path
-from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, TEACHER_PROMPT_TEMPLATE
+from train.opsd.train_sdft import (
+    PI_ANSWER,
+    PI_FULL,
+    PI_HINT,
+    PI_ROLLOUT,
+    TEACHER_PROMPT_TEMPLATE,
+)
 from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path
 
 
-PI_ROLLOUT = (
-    "Here is an attempted solution to the question above. It may or may not be correct:\n\n"
-    "{attempt}\n\n"
-    "Now write a complete solution of your own, including the reasoning."
-)
 PI_MODES = ("none", "rollout", "answer", "hint", "full")
 
 
