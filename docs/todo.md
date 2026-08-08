@@ -34,4 +34,5 @@
   - [ ] Train self-teacher for hint generation
     - [ ] Objective from self-teacher behavior (example : entropy)
     - [ ] Objective from teacher-student log ratio
+    - [ ] Hint generation with information bottleneck -> pass@k with generated hint -> RL (VAE/Autoencoder)
 - [ ] Analyze PI conditioned self-teacher behavior
