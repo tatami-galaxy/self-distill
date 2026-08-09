@@ -1,12 +1,15 @@
 """Privileged information: verbalized uncertainty vs. pass@8.
 
-Combines two result families that were produced by separate runs:
+Combines two result families that were produced by separate runs, once per
+generation-length budget:
 
-  - x: `mean_e_think` from results/teacher_uncertainty/*/teacher_uncertainty_summary.json
-  - y: `pass@8`      from results/passk_pi/*/passk_pi_summary.json
+  - x: `mean_e_think` from results/teacher_uncertainty_{budget}/*/teacher_uncertainty_summary.json
+  - y: `pass@8`      from results/passk_pi_{budget}/*/passk_pi_summary.json
 
 One curve per model; one marker per PI mode. The x-axis is inverted so the PI
 ladder reads left to right, from no privileged information to the full solution.
+
+Writes one figure per budget.
 
 Usage:
     .venv/bin/python results/viz/pi_uncertainty_tradeoff.py
@@ -36,7 +39,7 @@ def find_repo_root(start: Path | None = None) -> Path:
 
 ROOT = find_repo_root()
 RESULTS = ROOT / "results"
-OUT = Path(__file__).parent / "pi_uncertainty_tradeoff_linear_inverted.png"
+FIGURES = RESULTS / "figures"  # generated output; not tracked by git
 
 # -------------------- style --------------------
 
@@ -58,24 +61,43 @@ PI_ORDER = ["full", "rollout", "answer", "hint", "none"]
 
 # -------------------- axis layout --------------------
 
-XLIM = (100, -4)  # inverted: markers increase to the left
+XLIM = (100, -8)  # inverted: markers increase to the left
 YLIM = (80, 101.5)
 XTICKS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 YTICKS = [80, 85, 90, 95, 100]
-LEGEND_ANCHOR = (0.48, 0.03)
+LEGEND_ANCHOR = (0.35, 0.04)
 
-# Hand-tuned label offsets in points: (dx, dy, ha, va)
-LABEL_OFFSETS = {
-    ("Qwen3-4B", "full"): (-2, 15, "center", "bottom"),
-    ("Qwen3-4B", "rollout"): (-4, -16, "center", "top"),
-    ("Qwen3-4B", "answer"): (4, 16, "center", "bottom"),
+# Hand-tuned label offsets in points: (dx, dy, ha, va). The two budgets place their
+# points differently enough that each needs its own layout.
+LABEL_OFFSETS_8K = {
+    ("Qwen3-4B", "full"): (-14, 0, "right", "center"),
+    ("Qwen3-4B", "rollout"): (0, 15, "center", "bottom"),
+    ("Qwen3-4B", "answer"): (0, 16, "center", "bottom"),
     ("Qwen3-4B", "hint"): (-14, 2, "right", "center"),
     ("Qwen3-4B", "none"): (-14, 1, "right", "center"),
-    ("Qwen3-1.7B", "full"): (2, -16, "center", "top"),
-    ("Qwen3-1.7B", "rollout"): (2, -16, "center", "top"),
-    ("Qwen3-1.7B", "answer"): (15, 6, "left", "bottom"),
-    ("Qwen3-1.7B", "hint"): (14, -4, "left", "center"),
-    ("Qwen3-1.7B", "none"): (2, -16, "center", "top"),
+    ("Qwen3-1.7B", "full"): (14, 0, "left", "center"),
+    ("Qwen3-1.7B", "rollout"): (0, -16, "center", "top"),
+    ("Qwen3-1.7B", "answer"): (14, 4, "left", "bottom"),
+    ("Qwen3-1.7B", "hint"): (14, -2, "left", "center"),
+    ("Qwen3-1.7B", "none"): (0, -16, "center", "top"),
+}
+
+LABEL_OFFSETS_16K = {
+    ("Qwen3-4B", "full"): (-14, 0, "right", "center"),
+    ("Qwen3-4B", "rollout"): (-8, -13, "right", "top"),
+    ("Qwen3-4B", "answer"): (0, 15, "center", "bottom"),
+    ("Qwen3-4B", "hint"): (-14, 2, "right", "center"),
+    ("Qwen3-4B", "none"): (0, -16, "center", "top"),
+    ("Qwen3-1.7B", "full"): (14, 0, "left", "center"),
+    ("Qwen3-1.7B", "rollout"): (0, -16, "center", "top"),
+    ("Qwen3-1.7B", "answer"): (14, 4, "left", "bottom"),
+    ("Qwen3-1.7B", "hint"): (14, -2, "left", "center"),
+    ("Qwen3-1.7B", "none"): (0, -16, "center", "top"),
+}
+
+BUDGETS = {
+    "8k": {"offsets": LABEL_OFFSETS_8K},
+    "16k": {"offsets": LABEL_OFFSETS_16K},
 }
 
 MAX_PROBLEM_COUNT_SPREAD = 5
@@ -89,18 +111,21 @@ def read_json(path: Path) -> dict:
         return json.load(handle)
 
 
-def load_points() -> dict[str, list[dict]]:
+def load_points(budget: str) -> dict[str, list[dict]]:
     """Join teacher-uncertainty x-values onto passk_pi y-values, keyed by model + PI mode."""
     uncertainty: dict[tuple[str, str], dict] = {}
-    for path in sorted(RESULTS.glob("teacher_uncertainty/*/teacher_uncertainty_summary.json")):
+    pattern = f"teacher_uncertainty_{budget}/*/teacher_uncertainty_summary.json"
+    for path in sorted(RESULTS.glob(pattern)):
         summary = read_json(path)
         model = summary["teacher_model"].split("/")[-1]
         conditions = summary.get("uncertainty", summary.get("behavior", {}))
         for pi_mode, metrics in conditions.items():
             uncertainty[(model, pi_mode)] = metrics
+    if not uncertainty:
+        raise FileNotFoundError(f"No teacher-uncertainty summaries matched {pattern}")
 
     series: dict[str, list[dict]] = {}
-    for path in sorted(RESULTS.glob("passk_pi/*/passk_pi_summary.json")):
+    for path in sorted(RESULTS.glob(f"passk_pi_{budget}/*/passk_pi_summary.json")):
         summary = read_json(path)
         model = summary["model"].split("/")[-1]
         points = []
@@ -121,6 +146,8 @@ def load_points() -> dict[str, list[dict]]:
             )
         points.sort(key=lambda point: PI_ORDER.index(point["pi_mode"]))
         series[model] = points
+    if not series:
+        raise FileNotFoundError(f"No passk_pi summaries matched passk_pi_{budget}/")
     return series
 
 
@@ -192,7 +219,7 @@ def add_direction_arrows(fig, ax, xlabel, ylabel) -> None:
     ax.annotate("", xy=(-0.052, y_end), xytext=(-0.052, y_start), **style)
 
 
-def build_figure(series: dict[str, list[dict]]):
+def build_figure(series: dict[str, list[dict]], offsets: dict):
     fig = plt.figure(figsize=(15.2, 8.3), dpi=200, facecolor=CANVAS)
 
     card = FancyBboxPatch(
@@ -235,9 +262,7 @@ def build_figure(series: dict[str, list[dict]]):
             label=style["label"],
         )
         for point in points:
-            dx, dy, ha, va = LABEL_OFFSETS.get(
-                (model, point["pi_mode"]), (0, 13, "center", "bottom")
-            )
+            dx, dy, ha, va = offsets.get((model, point["pi_mode"]), (0, 13, "center", "bottom"))
             ax.annotate(
                 point["pi_mode"],
                 xy=(point["x"], point["y"]),
@@ -299,15 +324,20 @@ def build_figure(series: dict[str, list[dict]]):
 
 if __name__ == "__main__":
     mpl.rcParams["savefig.facecolor"] = CANVAS
-    series = load_points()
-    for model, points in series.items():
-        print(f"{model}:")
-        for point in points:
-            print(
-                f"  {point['pi_mode']:8s} e_think={point['x']:6.2f}  "
-                f"pass@8={point['y']:5.1f}  pass@1={point['pass@1']:5.1f}"
-            )
+    FIGURES.mkdir(parents=True, exist_ok=True)
+    for budget, config in BUDGETS.items():
+        series = load_points(budget)
+        print(f"=== {budget}")
+        for model, points in series.items():
+            print(f"  {model}:")
+            for point in points:
+                print(
+                    f"    {point['pi_mode']:8s} e_think={point['x']:6.2f}  "
+                    f"pass@8={point['y']:5.1f}  pass@1={point['pass@1']:5.1f}"
+                )
 
-    figure = build_figure(series)
-    figure.savefig(OUT, dpi=200, facecolor=CANVAS)
-    print(f"\nWrote {OUT}")
+        out = FIGURES / f"pi_uncertainty_tradeoff_linear_inverted_{budget}.png"
+        figure = build_figure(series, config["offsets"])
+        figure.savefig(out, dpi=200, facecolor=CANVAS)
+        plt.close(figure)
+        print(f"  wrote {out.relative_to(ROOT)}")
