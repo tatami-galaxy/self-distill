@@ -80,7 +80,7 @@ print(f"Results:    {RESULTS}")
 #
 
 # %% -------------------- LOAD AIME RESULTS --------------------
-AIME_YEAR = 24  # Select 24, 25, 26, ...
+AIME_YEAR = 25  # Select 24, 25, 26, ...
 AIME_DATASET = f"aime{AIME_YEAR}"
 AIME_LABEL = AIME_DATASET.upper()
 AIME_DIR = RESULTS / AIME_DATASET
