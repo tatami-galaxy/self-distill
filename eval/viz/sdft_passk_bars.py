@@ -184,7 +184,7 @@ def build_figure(table: dict):
     fig.patches.append(card)
 
     fig.text(
-        0.5, 0.960, "Self-distillation on AIME24",
+        0.5, 0.960, "Self-distillation results on AIME24",
         ha="center", va="center", fontproperties=SANS, fontsize=25,
         fontweight="bold", color=INK,
     )
