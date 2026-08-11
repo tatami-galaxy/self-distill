@@ -1,0 +1,1093 @@
+r"""Measure the raw per-token SDFT advantage across training checkpoints.
+
+For a student checkpoint ``pi_k`` and the frozen base teacher ``pi_0`` conditioned
+on privileged information ``c``:
+
+    A_t(c) = log pi_0(y_t | x, c, y_<t) - log pi_k(y_t | x, y_<t)
+
+where ``y`` is freshly sampled from ``pi_k`` without privileged information.
+Positive ``A_t`` upweights the sampled token under the SDFT update; negative
+``A_t`` downweights it. Because ``y_t ~ pi_k`` under the raw student distribution,
+
+    E[A_t | x, y_<t] = -KL(pi_k(. | x, y_<t) || pi_0(. | x, c, y_<t)).
+
+We report advantage throughout so aggregate and later token-level analyses share
+one sign convention. The primary statistic is token-weighted:
+
+    mean_advantage_per_token = sum_t A_t / number_of_scored_tokens.
+
+Only the matched evaluation PI reproduces the advantage used by a training run;
+the other PI columns are counterfactual probes on exactly the same student tokens.
+The ``none`` condition uses the unprivileged frozen base model, so it measures
+policy drift and is zero only at step 0.
+
+``sweep`` runs generation and scoring in distinct spawned processes for every
+requested checkpoint, then aggregates. This is a correctness boundary: initializing
+vLLM changes process-global Torch state, so HF log-probabilities are computed in a
+clean interpreter.
+
+Example:
+
+    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.advantage_dynamics \
+      --phase sweep \
+      --run-dir /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-1.7B/deepmath_hint \
+      --pi-modes none answer hint full rollout \
+      --num-problems 64 --n 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import json
+import multiprocessing
+import os
+import random
+import shutil
+import subprocess
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+from datasets import Dataset, load_from_disk
+
+from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT, rollout_pi_path
+from utils import compose_pi_messages, format_prompt_math, grade, load_hint_cache, load_train_dataset
+
+
+PI_MODES = ("none", "answer", "hint", "full", "rollout")
+REQUIRED_TRAINING_CONFIG = {
+    "distillation_mode": "sampled_token",
+    "distillation_alpha": 1.0,
+    "teacher_model_kind": "base",
+    "generate_from_teacher": False,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def model_slug(model: str) -> str:
+    return model.rstrip("/").split("/")[-1].replace(os.sep, "_")
+
+
+def stable_question_id(question: str, final_answer: str) -> str:
+    return _sha256_text(f"{question}\0{final_answer}")[:24]
+
+
+def stable_rollout_id(
+    checkpoint: str, question_id: str, sample_idx: int, completion_ids: list[int], seed: int
+) -> str:
+    payload = json.dumps(
+        {
+            "checkpoint": checkpoint,
+            "question_id": question_id,
+            "sample_idx": sample_idx,
+            "completion_ids": completion_ids,
+            "seed": seed,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _sha256_text(payload)[:24]
+
+
+def fingerprint_ids(ids: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for value in ids:
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def git_commit() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with temporary.open("w") as file:
+        json.dump(value, file, indent=2, sort_keys=True)
+        file.write("\n")
+    os.replace(temporary, path)
+
+
+def read_json(path: Path) -> dict:
+    with path.open() as file:
+        return json.load(file)
+
+
+def save_dataset_atomic(dataset: Dataset, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    dataset.save_to_disk(str(temporary))
+    if path.exists():
+        shutil.rmtree(path)
+    os.rename(temporary, path)
+
+
+def tokenizer_vocab_hash(tokenizer) -> str:
+    digest = hashlib.sha256()
+    for token, token_id in sorted(tokenizer.get_vocab().items()):
+        digest.update(token.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(token_id).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def tokenizer_metadata(tokenizer) -> dict:
+    return {
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_hash": tokenizer_vocab_hash(tokenizer),
+        "chat_template_hash": _sha256_text(str(getattr(tokenizer, "chat_template", ""))),
+        "special_ids": sorted(int(value) for value in tokenizer.all_special_ids),
+    }
+
+
+def verify_tokenizer_compatibility(student_tokenizer, teacher_tokenizer) -> tuple[dict, dict]:
+    student_meta = tokenizer_metadata(student_tokenizer)
+    teacher_meta = tokenizer_metadata(teacher_tokenizer)
+    if student_meta["vocab_hash"] != teacher_meta["vocab_hash"]:
+        raise ValueError("Student and teacher have different token-to-ID mappings")
+    if student_meta["special_ids"] != teacher_meta["special_ids"]:
+        raise ValueError("Student and teacher have different special-token IDs")
+    return student_meta, teacher_meta
+
+
+# ---------------------------------------------------------------------------
+# Run/checkpoint discovery and training-config validation
+# ---------------------------------------------------------------------------
+
+
+def discover_checkpoints(run_dir: str | Path, include_step_zero: bool = True) -> dict[int, str]:
+    run_dir = Path(run_dir)
+    checkpoints = {0: ""} if include_step_zero else {}
+    for path in run_dir.glob("checkpoint-*"):
+        suffix = path.name.removeprefix("checkpoint-")
+        if path.is_dir() and suffix.isdigit():
+            checkpoints[int(suffix)] = str(path.resolve())
+    return dict(sorted(checkpoints.items()))
+
+
+def load_saved_training_args(run_dir: Path):
+    checkpoints = discover_checkpoints(run_dir, include_step_zero=False)
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoint-<step> directories found under {run_dir}")
+    first = Path(next(iter(checkpoints.values()))) / "training_args.bin"
+    if not first.is_file():
+        raise FileNotFoundError(f"No training_args.bin at {first}")
+    import torch
+
+    return torch.load(first, map_location="cpu", weights_only=False)
+
+
+def validate_training_configuration(training_args) -> dict:
+    """Require the configuration for which raw advantage was the training signal."""
+    mismatches = []
+    for name, expected in REQUIRED_TRAINING_CONFIG.items():
+        actual = getattr(training_args, name, None)
+        if actual != expected:
+            mismatches.append(f"{name}={actual!r} (expected {expected!r})")
+    top_k = getattr(training_args, "top_k", None)
+    if top_k not in (0, -1, None):
+        mismatches.append(f"top_k={top_k!r} (expected disabled)")
+    min_p = getattr(training_args, "min_p", None)
+    if min_p not in (0, 0.0, None):
+        mismatches.append(f"min_p={min_p!r} (expected disabled)")
+
+    accumulation = int(getattr(training_args, "gradient_accumulation_steps", 1))
+    steps_per_generation = int(getattr(training_args, "steps_per_generation", accumulation))
+    num_iterations = int(getattr(training_args, "num_iterations", 1))
+    generate_every = steps_per_generation * num_iterations
+    importance_correction_active = accumulation % generate_every != 0
+    if importance_correction_active:
+        mismatches.append(
+            "rollout importance correction is active; raw advantage is not the complete "
+            "clipped training coefficient"
+        )
+    if mismatches:
+        raise ValueError(
+            "This evaluator requires raw sampled-token reverse-KL SDFT with a frozen "
+            "base teacher:\n  " + "\n  ".join(mismatches)
+        )
+    return {
+        "distillation_mode": training_args.distillation_mode,
+        "distillation_alpha": float(training_args.distillation_alpha),
+        "teacher_model_kind": training_args.teacher_model_kind,
+        "generate_from_teacher": bool(training_args.generate_from_teacher),
+        "temperature": float(training_args.temperature),
+        "top_p": float(training_args.top_p),
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": float(training_args.repetition_penalty),
+        "num_loss_tokens_to_skip": int(training_args.num_loss_tokens_to_skip),
+        "max_completion_length": int(training_args.max_completion_length),
+        "max_prompt_length": int(training_args.max_prompt_length),
+        "gradient_accumulation_steps": accumulation,
+        "steps_per_generation": steps_per_generation,
+        "num_iterations": num_iterations,
+        "distillation_is_clip": getattr(training_args, "distillation_is_clip", None),
+        "importance_correction_active": importance_correction_active,
+    }
+
+
+def prepare_run(args: argparse.Namespace) -> dict:
+    run_dir = Path(args.run_dir).resolve()
+    meta_path = run_dir / "run_meta.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"No run_meta.json at {meta_path}")
+    run_meta = read_json(meta_path)
+    missing = {"model", "dataset", "pi_mode"} - set(run_meta)
+    if missing:
+        raise ValueError(f"{meta_path} is missing required fields {sorted(missing)}")
+    if run_meta["pi_mode"] not in PI_MODES:
+        raise ValueError(f"Unknown training PI {run_meta['pi_mode']!r}")
+
+    training_config = validate_training_configuration(load_saved_training_args(run_dir))
+    args.max_completion_length = (
+        args.max_completion_length
+        if args.max_completion_length is not None
+        else training_config["max_completion_length"]
+    )
+    if args.max_completion_length < 1:
+        raise ValueError("--max-completion-length must be >= 1")
+
+    checkpoints = discover_checkpoints(run_dir)
+    checkpoints[0] = run_meta["model"]
+    available_steps = list(checkpoints)
+    selected_steps = args.steps if args.steps is not None else available_steps
+    if args.step is not None:
+        selected_steps = [args.step]
+    unknown = sorted(set(selected_steps) - set(available_steps))
+    if unknown:
+        raise ValueError(f"Unknown steps {unknown}; available steps are {available_steps}")
+    args.pi_modes = list(dict.fromkeys(args.pi_modes))
+    output_dir = (Path(args.output_root) / model_slug(run_meta["model"]) / run_dir.name).resolve()
+    return {
+        "run_dir": str(run_dir),
+        "run_meta": run_meta,
+        "training_config": training_config,
+        "base_model": run_meta["model"],
+        "dataset": run_meta["dataset"],
+        "training_pi_mode": run_meta["pi_mode"],
+        "checkpoints": checkpoints,
+        "selected_steps": sorted(set(selected_steps)),
+        "output_dir": str(output_dir),
+    }
+
+
+def step_dir(run: dict, step: int) -> Path:
+    return Path(run["output_dir"]) / f"step-{step:06d}"
+
+
+# ---------------------------------------------------------------------------
+# PI composition and deterministic common cohort
+# ---------------------------------------------------------------------------
+
+
+def privileged_context(problem: dict, pi_mode: str) -> str:
+    if pi_mode == "none":
+        return ""
+    if pi_mode == "answer":
+        return PI_ANSWER.format(answer=problem["final_answer"])
+    if pi_mode == "hint":
+        return PI_HINT.format(hint=problem["hint"])
+    if pi_mode == "full":
+        return PI_FULL.format(demo=problem["solution"])
+    if pi_mode == "rollout":
+        return PI_ROLLOUT.format(attempt=problem["rollout"])
+    raise ValueError(f"Unknown PI mode {pi_mode!r}")
+
+
+def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
+    student = format_prompt_math(problem["question"])
+    if pi_mode == "none":
+        return student
+    return compose_pi_messages(student, privileged_context(problem, pi_mode))
+
+
+def _load_rollout_attempts(model: str, dataset: str, root: str, sample_idx: int):
+    path = Path(rollout_pi_path(model, dataset, root))
+    if not path.is_dir():
+        raise FileNotFoundError(f"No rollout-PI cache at {path}")
+    cache = load_from_disk(str(path))
+    required = {
+        "question", "question_idx", "completion_text", "sample_idx", "gen_model",
+        "dataset", "question_source", "mixed_only",
+    }
+    missing = required - set(cache.column_names)
+    if missing:
+        raise ValueError(f"Rollout-PI cache {path} is missing {sorted(missing)}")
+    if set(cache.unique("gen_model")) != {model} or set(cache.unique("dataset")) != {dataset}:
+        raise ValueError(f"Rollout-PI cache {path} has incompatible model/dataset provenance")
+    if set(cache.unique("question_source")) != {"hints"}:
+        raise ValueError(f"Rollout-PI cache {path} was not generated from hints")
+    if set(cache.unique("mixed_only")) != {False}:
+        raise ValueError(f"Rollout-PI cache {path} used outcome-dependent selection")
+    attempts = {}
+    for idx, question, completion, cached_sample in zip(
+        cache["question_idx"], cache["question"], cache["completion_text"],
+        cache["sample_idx"], strict=True,
+    ):
+        if int(cached_sample) != sample_idx:
+            continue
+        idx = int(idx)
+        if idx in attempts:
+            raise ValueError(f"Duplicate rollout PI sample for question_idx={idx}")
+        attempts[idx] = (str(question), str(completion))
+    if not attempts:
+        raise ValueError(f"No rollout PI sample_idx={sample_idx} found in {path}")
+    return attempts
+
+
+def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
+    return {
+        "base_model": run["base_model"],
+        "dataset": run["dataset"],
+        "pi_modes": args.pi_modes,
+        "num_problems": args.num_problems,
+        "seed": args.seed,
+        "max_model_len": args.max_model_len,
+        "max_completion_length": args.max_completion_length,
+        "training_max_prompt_length": run["training_config"]["max_prompt_length"],
+        "rollout_pi_root": args.rollout_pi_root,
+        "rollout_pi_sample_idx": args.rollout_pi_sample_idx,
+    }
+
+
+def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
+    from transformers import AutoTokenizer
+
+    hints = load_hint_cache(run["base_model"], run["dataset"])
+    solutions = None
+    if "full" in args.pi_modes:
+        source = load_train_dataset(run["dataset"], require_solution=True)
+        solutions = {str(row["question"]): str(row["solution"]) for row in source}
+    attempts = None
+    if "rollout" in args.pi_modes:
+        attempts = _load_rollout_attempts(
+            run["base_model"], run["dataset"], args.rollout_pi_root,
+            args.rollout_pi_sample_idx,
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(run["base_model"], trust_remote_code=True)
+    available_context = args.max_model_len - args.max_completion_length
+    if available_context < 1:
+        raise ValueError("--max-model-len must exceed --max-completion-length")
+    # Match the trainer's prompt cap while also reserving the requested generation budget.
+    budget = min(run["training_config"]["max_prompt_length"], available_context)
+
+    candidates = list(range(len(hints)))
+    random.Random(args.seed).shuffle(candidates)
+    rows, seen_ids = [], set()
+    considered = missing_context = too_long = 0
+    for question_idx in candidates:
+        if len(rows) >= args.num_problems:
+            break
+        considered += 1
+        hint_row = hints[question_idx]
+        problem = {
+            "question_idx": question_idx,
+            "question": str(hint_row["question"]),
+            "final_answer": str(hint_row["final_answer"]),
+            "hint": str(hint_row["hint"]),
+        }
+        if solutions is not None:
+            solution = solutions.get(problem["question"])
+            if not solution:
+                missing_context += 1
+                continue
+            problem["solution"] = solution
+        if attempts is not None:
+            attempt = attempts.get(question_idx)
+            if attempt is None:
+                missing_context += 1
+                continue
+            cached_question, completion = attempt
+            if cached_question != problem["question"]:
+                raise ValueError(f"Hint/rollout cache mismatch at question_idx={question_idx}")
+            problem["rollout"] = completion
+
+        question_id = stable_question_id(problem["question"], problem["final_answer"])
+        if question_id in seen_ids:
+            question_id = _sha256_text(f"{question_id}\0{question_idx}")[:24]
+        student_messages = format_prompt_math(problem["question"])
+        student_ids = tokenizer.apply_chat_template(
+            [student_messages], add_generation_prompt=True, tokenize=True, return_dict=True
+        )["input_ids"][0]
+        prompt_columns, fits = {}, len(student_ids) <= budget
+        for pi_mode in args.pi_modes:
+            ids = tokenizer.apply_chat_template(
+                [build_teacher_messages(problem, pi_mode)], add_generation_prompt=True,
+                tokenize=True, return_dict=True,
+            )["input_ids"][0]
+            prompt_columns[f"teacher_prompt_ids_{pi_mode}"] = list(ids)
+            fits = fits and len(ids) <= budget
+        if not fits:
+            too_long += 1
+            continue
+        seen_ids.add(question_id)
+        rows.append(
+            {
+                **problem,
+                "question_id": question_id,
+                "student_prompt_ids": list(student_ids),
+                "student_prompt_text": tokenizer.apply_chat_template(
+                    student_messages, tokenize=False, add_generation_prompt=True
+                ),
+                **prompt_columns,
+            }
+        )
+    if len(rows) < args.num_problems:
+        raise RuntimeError(
+            f"Only {len(rows)}/{args.num_problems} questions have every PI and fit "
+            f"the common {budget}-token prompt budget"
+        )
+    dataset = Dataset.from_list(rows)
+    metadata = {
+        "status": "complete",
+        "config": _cohort_config(args, run),
+        "cohort_fingerprint": fingerprint_ids(dataset["question_id"]),
+        "question_ids": list(dataset["question_id"]),
+        "num_questions": len(dataset),
+        "source_hint_rows": len(hints),
+        "candidates_considered": considered,
+        "missing_required_context": missing_context,
+        "prompt_too_long": too_long,
+        "prompt_budget": budget,
+        "tokenizer": tokenizer_metadata(tokenizer),
+    }
+    return dataset, metadata
+
+
+def ensure_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
+    root = Path(run["output_dir"])
+    dataset_path, meta_path = root / "cohort", root / "cohort_meta.json"
+    config = _cohort_config(args, run)
+    if dataset_path.is_dir() and meta_path.is_file():
+        metadata = read_json(meta_path)
+        if metadata.get("config") == config:
+            dataset = load_from_disk(str(dataset_path))
+            if fingerprint_ids(dataset["question_id"]) == metadata.get("cohort_fingerprint"):
+                return dataset, metadata
+            if not args.force:
+                raise ValueError(f"Cohort fingerprint mismatch at {dataset_path}")
+        elif not args.force:
+            raise ValueError(f"Existing cohort at {dataset_path} has different provenance")
+    dataset, metadata = build_cohort(args, run)
+    save_dataset_atomic(dataset, dataset_path)
+    write_json_atomic(meta_path, metadata)
+    return dataset, metadata
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+
+
+def _rollout_config(args, run, step, cohort_meta) -> dict:
+    return {
+        "student_model": run["checkpoints"][step],
+        "base_model": run["base_model"],
+        "step": step,
+        "dataset": run["dataset"],
+        "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+        "num_questions": cohort_meta["num_questions"],
+        "n": args.n,
+        "seed": args.seed,
+        "max_completion_length": args.max_completion_length,
+        "max_model_len": args.max_model_len,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "tensor_parallel_size": args.tensor_parallel_size,
+    }
+
+
+def generate_phase(args: argparse.Namespace, run: dict, step: int) -> None:
+    from vllm import LLM, SamplingParams
+
+    cohort, cohort_meta = ensure_cohort(args, run)
+    out = step_dir(run, step)
+    rollout_dir, meta_path = out / "rollouts", out / "rollout_meta.json"
+    config = _rollout_config(args, run, step, cohort_meta)
+    if rollout_dir.is_dir() and meta_path.is_file() and not args.force:
+        if read_json(meta_path).get("config") == config:
+            print(f"Reusing rollout cache for step {step}: {rollout_dir}")
+            return
+        raise ValueError(f"Existing rollouts at {rollout_dir} have different provenance")
+
+    student_model = run["checkpoints"][step]
+    print(f"Generating step {step} from {student_model}")
+    llm = LLM(
+        model=student_model,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
+        seed=args.seed,
+        trust_remote_code=True,
+    )
+    sampling = SamplingParams(
+        n=args.n,
+        max_tokens=args.max_completion_length,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        seed=args.seed,
+    )
+    outputs = llm.generate(list(cohort["student_prompt_text"]), sampling)
+    if len(outputs) != len(cohort):
+        raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(cohort)} prompts")
+    rows = []
+    for problem, output in zip(cohort, outputs, strict=True):
+        if len(output.outputs) != args.n:
+            raise RuntimeError(
+                f"vLLM returned {len(output.outputs)}/{args.n} samples for "
+                f"{problem['question_id']}"
+            )
+        for sample_idx, completion in enumerate(output.outputs):
+            completion_ids = list(completion.token_ids)
+            if not completion_ids:
+                raise RuntimeError(f"Empty completion for {problem['question_id']}/{sample_idx}")
+            finish_reason = str(completion.finish_reason or "unknown")
+            _, correct = grade(completion.text, problem["final_answer"])
+            rows.append(
+                {
+                    "rollout_id": stable_rollout_id(
+                        student_model, problem["question_id"], sample_idx,
+                        completion_ids, args.seed,
+                    ),
+                    "question_id": problem["question_id"],
+                    "question_idx": int(problem["question_idx"]),
+                    "sample_idx": sample_idx,
+                    "question": problem["question"],
+                    "final_answer": problem["final_answer"],
+                    "completion_ids": completion_ids,
+                    "completion_text": completion.text,
+                    "n_tokens": len(completion_ids),
+                    "reward": float(correct),
+                    "finish_reason": finish_reason,
+                    "truncated": finish_reason == "length",
+                }
+            )
+    if not rows:
+        raise RuntimeError("Generation produced no rollout rows")
+    rollouts = Dataset.from_list(rows)
+    save_dataset_atomic(rollouts, rollout_dir)
+    write_json_atomic(
+        meta_path,
+        {
+            "status": "complete",
+            "config": config,
+            "num_rollouts": len(rollouts),
+            "num_tokens": sum(rollouts["n_tokens"]),
+            "rollout_fingerprint": fingerprint_ids(rollouts["rollout_id"]),
+            "pass_rate": sum(rollouts["reward"]) / len(rollouts),
+        },
+    )
+    print(f"Saved {len(rollouts)} rollouts -> {rollout_dir}")
+    del llm
+    gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Clean-process HF scoring
+# ---------------------------------------------------------------------------
+
+
+def _input_device(model):
+    try:
+        return model.get_input_embeddings().weight.device
+    except (AttributeError, StopIteration):
+        return next(model.parameters()).device
+
+
+def _load_model(model_path: str, dtype_name: str):
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype_name]
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, dtype=dtype, trust_remote_code=True
+    ).eval()
+    model.to("cuda")
+    return model
+
+
+def _score_one(model, prompt_ids: list[int], completion_id_list: list[int]) -> list[float]:
+    import torch
+    from train.opsd.train_self_teacher.lib import per_token_logps
+
+    device = _input_device(model)
+    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+    completion = torch.tensor(completion_id_list, dtype=torch.long, device=device).unsqueeze(0)
+    with torch.inference_mode():
+        logps = per_token_logps(
+            model, torch.cat([prompt, completion], dim=1), completion
+        )
+    return [float(value) for value in logps.squeeze(0).cpu().tolist()]
+
+
+def compute_advantages(
+    teacher_logps: Iterable[float], student_logps: Iterable[float]
+) -> list[float]:
+    teacher, student = list(teacher_logps), list(student_logps)
+    if len(teacher) != len(student):
+        raise ValueError(
+            f"Teacher/student token-score lengths differ: {len(teacher)} != {len(student)}"
+        )
+    return [float(t - s) for t, s in zip(teacher, student, strict=True)]
+
+
+def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
+    return {
+        "student_model": run["checkpoints"][step],
+        "base_teacher": run["base_model"],
+        "step": step,
+        "dataset": run["dataset"],
+        "training_pi_mode": run["training_pi_mode"],
+        "eval_pi_modes": args.pi_modes,
+        "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+        "rollout_fingerprint": rollout_meta["rollout_fingerprint"],
+        "dtype": args.dtype,
+        "num_loss_tokens_to_skip": run["training_config"]["num_loss_tokens_to_skip"],
+    }
+
+
+def score_phase(args: argparse.Namespace, run: dict, step: int) -> None:
+    import torch
+    from transformers import AutoTokenizer
+
+    cohort, cohort_meta = ensure_cohort(args, run)
+    cohort_by_id = {row["question_id"]: row for row in cohort}
+    out = step_dir(run, step)
+    rollout_dir, rollout_meta_path = out / "rollouts", out / "rollout_meta.json"
+    if not rollout_dir.is_dir() or not rollout_meta_path.is_file():
+        raise FileNotFoundError(f"Generate step {step} before scoring")
+    rollouts = load_from_disk(str(rollout_dir))
+    rollout_meta = read_json(rollout_meta_path)
+    if rollout_meta.get("config") != _rollout_config(args, run, step, cohort_meta):
+        raise ValueError(f"Rollout provenance mismatch at {rollout_dir}")
+
+    scores_dir, score_meta_path = out / "scores", out / "score_meta.json"
+    config = _score_config(args, run, step, cohort_meta, rollout_meta)
+    if scores_dir.is_dir() and score_meta_path.is_file() and not args.force:
+        if read_json(score_meta_path).get("config") == config:
+            print(f"Reusing scores for step {step}: {scores_dir}")
+            return
+        raise ValueError(f"Existing scores at {scores_dir} have different provenance")
+
+    student_path = run["checkpoints"][step]
+    student_tokenizer = AutoTokenizer.from_pretrained(student_path, trust_remote_code=True)
+    teacher_tokenizer = AutoTokenizer.from_pretrained(run["base_model"], trust_remote_code=True)
+    student_tokenizer_meta, teacher_tokenizer_meta = verify_tokenizer_compatibility(
+        student_tokenizer, teacher_tokenizer
+    )
+
+    print(f"Scoring student logprobs at step {step}: {student_path}")
+    student_model = _load_model(student_path, args.dtype)
+    student_logps = []
+    for row_index, rollout in enumerate(rollouts):
+        problem = cohort_by_id[rollout["question_id"]]
+        values = _score_one(student_model, problem["student_prompt_ids"], rollout["completion_ids"])
+        if len(values) != len(rollout["completion_ids"]):
+            raise RuntimeError(f"Student token alignment failed for {rollout['rollout_id']}")
+        student_logps.append(values)
+        if row_index % 25 == 0:
+            print(f"  student {row_index + 1}/{len(rollouts)}")
+
+    if step == 0:
+        teacher_model = student_model
+    else:
+        del student_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        teacher_model = _load_model(run["base_model"], args.dtype)
+
+    skip = run["training_config"]["num_loss_tokens_to_skip"]
+    score_rows = []
+    for pi_mode in args.pi_modes:
+        prompt_column = f"teacher_prompt_ids_{pi_mode}"
+        print(f"Scoring teacher under PI={pi_mode}")
+        for row_index, rollout in enumerate(rollouts):
+            problem = cohort_by_id[rollout["question_id"]]
+            teacher_logps = _score_one(
+                teacher_model, problem[prompt_column], rollout["completion_ids"]
+            )
+            advantages = compute_advantages(teacher_logps, student_logps[row_index])
+            included = advantages[skip:]
+            score_rows.append(
+                {
+                    "rollout_id": rollout["rollout_id"],
+                    "question_id": rollout["question_id"],
+                    "question_idx": int(rollout["question_idx"]),
+                    "sample_idx": int(rollout["sample_idx"]),
+                    "eval_pi_mode": pi_mode,
+                    "reward": float(rollout["reward"]),
+                    "truncated": bool(rollout["truncated"]),
+                    "n_tokens": len(advantages),
+                    "loss_token_start": skip,
+                    "student_logps": student_logps[row_index],
+                    "teacher_logps": teacher_logps,
+                    "advantages": advantages,
+                    "advantage_sum": float(sum(included)),
+                    "num_scored_tokens": len(included),
+                    "mean_advantage": float(sum(included) / len(included)) if included else None,
+                    "positive_token_fraction": (
+                        sum(value > 0 for value in included) / len(included) if included else None
+                    ),
+                }
+            )
+            if row_index % 25 == 0:
+                print(f"  {pi_mode} {row_index + 1}/{len(rollouts)}")
+
+    del teacher_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    scores = Dataset.from_list(score_rows)
+    save_dataset_atomic(scores, scores_dir)
+    write_json_atomic(
+        score_meta_path,
+        {
+            "status": "complete",
+            "config": config,
+            "num_score_rows": len(scores),
+            "student_tokenizer": student_tokenizer_meta,
+            "teacher_tokenizer": teacher_tokenizer_meta,
+            "score_fingerprint": fingerprint_ids(
+                f"{rid}:{pi}" for rid, pi in zip(
+                    scores["rollout_id"], scores["eval_pi_mode"], strict=True
+                )
+            ),
+        },
+    )
+    print(f"Saved {len(scores)} score rows -> {scores_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
+def _quantile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("Cannot take a quantile of an empty list")
+    position = probability * (len(ordered) - 1)
+    lower, upper = int(position), min(int(position) + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def question_cluster_bootstrap_ci(
+    question_totals: dict[str, tuple[float, int]], samples: int, seed: int
+) -> list[float]:
+    if samples < 1:
+        raise ValueError("bootstrap samples must be >= 1")
+    question_ids = sorted(question_totals)
+    if not question_ids:
+        raise ValueError("No questions available for bootstrap")
+    rng, estimates = random.Random(seed), []
+    for _ in range(samples):
+        chosen = [rng.choice(question_ids) for _ in question_ids]
+        total = sum(question_totals[q][0] for q in chosen)
+        count = sum(question_totals[q][1] for q in chosen)
+        estimates.append(total / count)
+    return [_quantile(estimates, 0.025), _quantile(estimates, 0.975)]
+
+
+def _split_summary(total: float, count: int) -> dict:
+    return {
+        "advantage_sum": float(total),
+        "num_tokens": int(count),
+        "mean_advantage_per_token": float(total / count) if count else None,
+    }
+
+
+def summarize_score_rows(rows: Iterable[dict], bootstrap_samples: int, seed: int) -> dict[str, dict]:
+    by_pi = defaultdict(list)
+    for row in rows:
+        by_pi[str(row["eval_pi_mode"])].append(row)
+    summaries = {}
+    for pi_index, pi_mode in enumerate(PI_MODES):
+        pi_rows = by_pi.get(pi_mode, [])
+        if not pi_rows:
+            continue
+        total = count = positive = negative = zero = 0
+        rollout_means = []
+        question_totals = defaultdict(lambda: [0.0, 0])
+        split_totals = {
+            "correct": [0.0, 0], "incorrect": [0.0, 0],
+            "truncated": [0.0, 0], "completed": [0.0, 0],
+        }
+        for row in pi_rows:
+            start = int(row.get("loss_token_start", 0))
+            advantages = [float(value) for value in row["advantages"][start:]]
+            if not advantages:
+                continue
+            row_sum, row_count = sum(advantages), len(advantages)
+            total += row_sum
+            count += row_count
+            positive += sum(value > 0 for value in advantages)
+            negative += sum(value < 0 for value in advantages)
+            zero += sum(value == 0 for value in advantages)
+            rollout_means.append(row_sum / row_count)
+            question_totals[str(row["question_id"])][0] += row_sum
+            question_totals[str(row["question_id"])][1] += row_count
+            outcome = "correct" if float(row["reward"]) == 1.0 else "incorrect"
+            finish = "truncated" if bool(row["truncated"]) else "completed"
+            for key in (outcome, finish):
+                split_totals[key][0] += row_sum
+                split_totals[key][1] += row_count
+        if not count:
+            raise ValueError(f"PI {pi_mode!r} has no scored tokens")
+        typed_totals = {key: (float(v[0]), int(v[1])) for key, v in question_totals.items()}
+        summaries[pi_mode] = {
+            **_split_summary(total, count),
+            "mean_rollout_advantage": sum(rollout_means) / len(rollout_means),
+            "positive_token_fraction": positive / count,
+            "negative_token_fraction": negative / count,
+            "zero_token_fraction": zero / count,
+            "num_rollouts": len(rollout_means),
+            "num_questions": len(question_totals),
+            "question_cluster_ci95": question_cluster_bootstrap_ci(
+                typed_totals, bootstrap_samples, seed + pi_index * 10_000
+            ),
+            "by_outcome": {
+                key: _split_summary(float(value[0]), int(value[1]))
+                for key, value in split_totals.items()
+            },
+        }
+    return summaries
+
+
+def aggregate_step(args, run, step) -> dict:
+    out = step_dir(run, step)
+    scores_dir = out / "scores"
+    if not scores_dir.is_dir():
+        raise FileNotFoundError(f"No scores for step {step}: {scores_dir}")
+    scores = load_from_disk(str(scores_dir))
+    summary = {
+        "method": "sdft_advantage_dynamics",
+        "run_dir": run["run_dir"],
+        "base_model": run["base_model"],
+        "student_model": run["checkpoints"][step],
+        "dataset": run["dataset"],
+        "training_pi_mode": run["training_pi_mode"],
+        "step": step,
+        "definition": "log_p_frozen_base_teacher_minus_log_p_checkpoint_student",
+        "aggregation": "token_weighted",
+        "num_loss_tokens_to_skip": run["training_config"]["num_loss_tokens_to_skip"],
+        "rollout_fingerprint": read_json(out / "rollout_meta.json")["rollout_fingerprint"],
+        "score_fingerprint": read_json(out / "score_meta.json")["score_fingerprint"],
+        "advantages": summarize_score_rows(scores, args.bootstrap_samples, args.seed + step),
+    }
+    write_json_atomic(out / "summary.json", summary)
+    print(f"Saved step summary -> {out / 'summary.json'}")
+    return summary
+
+
+def aggregate_dynamics(args, run, steps) -> dict:
+    summaries = [aggregate_step(args, run, step) for step in sorted(set(steps))]
+    dynamics = {
+        "method": "sdft_advantage_dynamics",
+        "run_dir": run["run_dir"],
+        "base_model": run["base_model"],
+        "dataset": run["dataset"],
+        "training_pi_mode": run["training_pi_mode"],
+        "steps": summaries,
+    }
+    write_json_atomic(Path(run["output_dir"]) / "dynamics.json", dynamics)
+    return dynamics
+
+
+# ---------------------------------------------------------------------------
+# Orchestration and CLI
+# ---------------------------------------------------------------------------
+
+
+def _run_spawned(target, args, run, step, label) -> None:
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=target, args=(args, run, step))
+    process.start()
+    process.join()
+    exitcode = process.exitcode
+    process.close()
+    if exitcode != 0:
+        raise RuntimeError(f"{label} failed for step {step} with exit code {exitcode}")
+
+
+def write_run_manifest(args, run, cohort_meta) -> None:
+    write_json_atomic(
+        Path(run["output_dir"]) / "manifest.json",
+        {
+            "method": "sdft_advantage_dynamics",
+            "run_dir": run["run_dir"],
+            "run_meta": run["run_meta"],
+            "training_config": run["training_config"],
+            "base_model": run["base_model"],
+            "dataset": run["dataset"],
+            "training_pi_mode": run["training_pi_mode"],
+            "selected_steps": run["selected_steps"],
+            "eval_pi_modes": args.pi_modes,
+            "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+            "generation": {
+                "n": args.n,
+                "seed": args.seed,
+                "max_completion_length": args.max_completion_length,
+                "max_model_len": args.max_model_len,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+            },
+            "dtype": args.dtype,
+            "git_commit": git_commit(),
+        },
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("sweep", "generate", "score", "aggregate"),
+        default="sweep",
+        help="Pipeline phase to run (default: %(default)s).",
+    )
+    parser.add_argument("--run-dir", required=True, help="SDFT run directory containing checkpoints.")
+    parser.add_argument(
+        "--steps", nargs="+", type=int, default=None,
+        help="Checkpoint steps to evaluate; defaults to step 0 and all checkpoints.",
+    )
+    parser.add_argument(
+        "--step", type=int, default=None,
+        help="Single checkpoint step for generate/score or a one-step sweep.",
+    )
+    parser.add_argument(
+        "--pi-modes", nargs="+", choices=PI_MODES,
+        default=["none", "answer", "hint", "full"],
+        help="Teacher PI conditions scored on each rollout (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--num-problems", type=int, default=64,
+        help="Number of shared training problems to evaluate (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--n", type=int, default=2,
+        help="Fresh student rollouts per problem and checkpoint (default: %(default)s).",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Sampling and bootstrap seed.")
+    parser.add_argument(
+        "--max-completion-length", type=int, default=None,
+        help="Maximum rollout tokens; defaults to the saved training value.",
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, default=40000,
+        help="vLLM context-window limit, including prompt and completion (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--rollout-pi-root", default="data/pi/attempted_solution_8k",
+        help="Root of attempted-solution caches used by rollout PI.",
+    )
+    parser.add_argument(
+        "--rollout-pi-sample-idx", type=int, default=0,
+        help="Fixed cached attempt index used by rollout PI (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--bootstrap-samples", type=int, default=10_000,
+        help="Question-cluster bootstrap replicates (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--output-root", default="results/advantage_dynamics",
+        help="Root directory for cohorts, scores, and summaries (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16",
+        help="HF model dtype used for log-probability scoring (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.85,
+        help="Fraction of GPU memory available to vLLM (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=1,
+        help="Number of GPUs used by vLLM tensor parallelism (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Replace checkpoint artifacts whose provenance differs.",
+    )
+    return parser
+
+
+def validate_cli(parser, args) -> None:
+    if args.num_problems < 1:
+        parser.error("--num-problems must be >= 1")
+    if args.n < 1:
+        parser.error("--n must be >= 1")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
+    if args.bootstrap_samples < 1:
+        parser.error("--bootstrap-samples must be >= 1")
+    if args.max_model_len < 2:
+        parser.error("--max-model-len must be >= 2")
+    if args.rollout_pi_sample_idx < 0:
+        parser.error("--rollout-pi-sample-idx must be >= 0")
+    if args.step is not None and args.steps is not None:
+        parser.error("Pass only one of --step and --steps")
+    if args.phase in ("generate", "score") and args.step is None:
+        parser.error(f"--phase {args.phase} requires --step")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_cli(parser, args)
+    run = prepare_run(args)
+    cohort, cohort_meta = ensure_cohort(args, run)
+    del cohort
+    write_run_manifest(args, run, cohort_meta)
+
+    if args.phase == "generate":
+        generate_phase(args, run, args.step)
+        return
+    if args.phase == "score":
+        score_phase(args, run, args.step)
+        return
+    if args.phase == "aggregate":
+        aggregate_dynamics(args, run, run["selected_steps"])
+        return
+
+    for step in run["selected_steps"]:
+        print(f"\n{'=' * 72}\nAdvantage dynamics: step {step}\n{'=' * 72}")
+        _run_spawned(generate_phase, args, run, step, "generation")
+        _run_spawned(score_phase, args, run, step, "scoring")
+        aggregate_step(args, run, step)
+    aggregate_dynamics(args, run, run["selected_steps"])
+    print(f"Saved dynamics -> {Path(run['output_dir']) / 'dynamics.json'}")
+
+
+if __name__ == "__main__":
+    main()
