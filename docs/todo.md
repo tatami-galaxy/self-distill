@@ -1,7 +1,6 @@
 ### Baselines
-- [ ] train on deepscaleR
+- [x] train on deepscaleR
 - [ ] base models, sft-ed models, instruct models
-- [ ] all aime sets
 - [ ] beyondaime
 - [ ] hmmt
 - [ ] qwen 8B as student, teacher
@@ -29,10 +28,9 @@
     - [x] Endpoint
     - [x] Asymmetric
     - [x] Asymmetric cumulative
-    - [ ] All PIs
     - [ ] Hyperparameter sweep
   - [ ] Train self-teacher for hint generation
     - [ ] Objective from self-teacher behavior (example : entropy)
     - [ ] Objective from teacher-student log ratio
     - [ ] Hint generation with information bottleneck -> pass@k with generated hint -> RL (VAE/Autoencoder)
-- [ ] Analyze PI conditioned self-teacher behavior
+- [x] Analyze PI conditioned self-teacher behavior

@@ -1,4 +1,4 @@
-r"""Measure the raw per-token SDFT advantage across training checkpoints.
+r"""Measure the matched raw per-token SDFT advantage across training checkpoints.
 
 For a student checkpoint ``pi_k`` and the frozen base teacher ``pi_0`` conditioned
 on privileged information ``c``:
@@ -16,10 +16,18 @@ one sign convention. The primary statistic is token-weighted:
 
     mean_advantage_per_token = sum_t A_t / number_of_scored_tokens.
 
-Only the matched evaluation PI reproduces the advantage used by a training run;
-the other PI columns are counterfactual probes on exactly the same student tokens.
-The ``none`` condition uses the unprivileged frozen base model, so it measures
-policy drift and is zero only at step 0.
+``--pi-mode`` is required and identifies the PI used to train ``--run-dir``. It
+must match ``pi_mode`` in that run's ``run_meta.json``; it does not select an
+arbitrary counterfactual teacher. For every checkpoint, the evaluator samples
+fresh unprivileged student rollouts once and scores those same tokens under exactly
+two frozen-base-teacher conditions:
+
+* ``none``: no PI, a control measuring policy drift from the base model;
+* the training PI: the answer, hint, full solution, or cached rollout used by the
+  run, reproducing the kind of advantage used during training.
+
+At step 0 the ``none`` advantage is zero up to numerical error. No other PI modes
+are evaluated.
 
 ``sweep`` runs generation and scoring in distinct spawned processes for every
 requested checkpoint, then aggregates. This is a correctness boundary: initializing
@@ -31,8 +39,8 @@ Example:
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.advantage_dynamics \
       --phase sweep \
       --run-dir /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-1.7B/deepmath_hint \
-      --pi-modes none answer hint full rollout \
-      --num-problems 64 --n 2
+      --pi-mode hint \
+      --num-problems 128 --n 8
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ from utils import compose_pi_messages, format_prompt_math, grade, load_hint_cach
 
 
 PI_MODES = ("none", "answer", "hint", "full", "rollout")
+TRAINING_PI_MODES = PI_MODES[1:]
 REQUIRED_TRAINING_CONFIG = {
     "distillation_mode": "sampled_token",
     "distillation_alpha": 1.0,
@@ -269,8 +278,13 @@ def prepare_run(args: argparse.Namespace) -> dict:
     missing = {"model", "dataset", "pi_mode"} - set(run_meta)
     if missing:
         raise ValueError(f"{meta_path} is missing required fields {sorted(missing)}")
-    if run_meta["pi_mode"] not in PI_MODES:
+    if run_meta["pi_mode"] not in TRAINING_PI_MODES:
         raise ValueError(f"Unknown training PI {run_meta['pi_mode']!r}")
+    if args.pi_mode != run_meta["pi_mode"]:
+        raise ValueError(
+            f"--pi-mode {args.pi_mode!r} does not match training PI "
+            f"{run_meta['pi_mode']!r} recorded in {meta_path}"
+        )
 
     training_config = validate_training_configuration(load_saved_training_args(run_dir))
     args.max_completion_length = (
@@ -290,7 +304,6 @@ def prepare_run(args: argparse.Namespace) -> dict:
     unknown = sorted(set(selected_steps) - set(available_steps))
     if unknown:
         raise ValueError(f"Unknown steps {unknown}; available steps are {available_steps}")
-    args.pi_modes = list(dict.fromkeys(args.pi_modes))
     output_dir = (Path(args.output_root) / model_slug(run_meta["model"]) / run_dir.name).resolve()
     return {
         "run_dir": str(run_dir),
@@ -299,6 +312,7 @@ def prepare_run(args: argparse.Namespace) -> dict:
         "base_model": run_meta["model"],
         "dataset": run_meta["dataset"],
         "training_pi_mode": run_meta["pi_mode"],
+        "eval_pi_modes": ["none", run_meta["pi_mode"]],
         "checkpoints": checkpoints,
         "selected_steps": sorted(set(selected_steps)),
         "output_dir": str(output_dir),
@@ -378,7 +392,7 @@ def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
     return {
         "base_model": run["base_model"],
         "dataset": run["dataset"],
-        "pi_modes": args.pi_modes,
+        "pi_modes": run["eval_pi_modes"],
         "num_problems": args.num_problems,
         "seed": args.seed,
         "max_model_len": args.max_model_len,
@@ -390,16 +404,16 @@ def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
 
 
 def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
-    """Build a deterministic question cohort feasible under every requested PI."""
+    """Build a deterministic cohort feasible under none and the matched training PI."""
     from transformers import AutoTokenizer
 
     hints = load_hint_cache(run["base_model"], run["dataset"])
     solutions = None
-    if "full" in args.pi_modes:
+    if "full" in run["eval_pi_modes"]:
         source = load_train_dataset(run["dataset"], require_solution=True)
         solutions = {str(row["question"]): str(row["solution"]) for row in source}
     attempts = None
-    if "rollout" in args.pi_modes:
+    if "rollout" in run["eval_pi_modes"]:
         attempts = _load_rollout_attempts(
             run["base_model"], run["dataset"], args.rollout_pi_root,
             args.rollout_pi_sample_idx,
@@ -451,7 +465,7 @@ def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
             [student_messages], add_generation_prompt=True, tokenize=True, return_dict=True
         )["input_ids"][0]
         prompt_columns, fits = {}, len(student_ids) <= budget
-        for pi_mode in args.pi_modes:
+        for pi_mode in run["eval_pi_modes"]:
             ids = tokenizer.apply_chat_template(
                 [build_teacher_messages(problem, pi_mode)], add_generation_prompt=True,
                 tokenize=True, return_dict=True,
@@ -693,7 +707,7 @@ def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
         "step": step,
         "dataset": run["dataset"],
         "training_pi_mode": run["training_pi_mode"],
-        "eval_pi_modes": args.pi_modes,
+        "eval_pi_modes": run["eval_pi_modes"],
         "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
         "rollout_fingerprint": rollout_meta["rollout_fingerprint"],
         "dtype": args.dtype,
@@ -754,7 +768,7 @@ def score_phase(args: argparse.Namespace, run: dict, step: int) -> None:
 
     skip = run["training_config"]["num_loss_tokens_to_skip"]
     score_rows = []
-    for pi_mode in args.pi_modes:
+    for pi_mode in run["eval_pi_modes"]:
         prompt_column = f"teacher_prompt_ids_{pi_mode}"
         print(f"Scoring teacher under PI={pi_mode}")
         for row_index, rollout in enumerate(rollouts):
@@ -994,7 +1008,7 @@ def write_run_manifest(args, run, cohort_meta) -> None:
             "dataset": run["dataset"],
             "training_pi_mode": run["training_pi_mode"],
             "selected_steps": run["selected_steps"],
-            "eval_pi_modes": args.pi_modes,
+            "eval_pi_modes": run["eval_pi_modes"],
             "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
             "generation": {
                 "n": args.n,
@@ -1034,9 +1048,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Single checkpoint step for generate/score or a one-step sweep.",
     )
     parser.add_argument(
-        "--pi-modes", nargs="+", choices=PI_MODES,
-        default=["none", "answer", "hint", "full", "rollout"],
-        help="Teacher PI conditions scored on each rollout (default: %(default)s).",
+        "--pi-mode", required=True, choices=TRAINING_PI_MODES,
+        help="Training PI for this run; must match run_meta.json.",
     )
     parser.add_argument(
         "--num-problems", type=int, default=128,

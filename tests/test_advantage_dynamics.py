@@ -191,11 +191,28 @@ class PromptAndCliTest(unittest.TestCase):
                 messages = advantage_dynamics.build_teacher_messages(problem, pi_mode)
                 self.assertIn(text, messages[-1]["content"])
 
-    def test_parser_defaults_to_full_sweep(self):
-        args = advantage_dynamics.build_parser().parse_args(["--run-dir", "run"])
+    def test_parser_requires_training_pi(self):
+        with self.assertRaises(SystemExit):
+            advantage_dynamics.build_parser().parse_args(["--run-dir", "run"])
+
+    def test_parser_accepts_one_training_pi(self):
+        args = advantage_dynamics.build_parser().parse_args(
+            ["--run-dir", "run", "--pi-mode", "hint"]
+        )
         self.assertEqual(args.phase, "sweep")
-        self.assertEqual(args.pi_modes, ["none", "answer", "hint", "full", "rollout"])
+        self.assertEqual(args.pi_mode, "hint")
         self.assertIsNone(args.steps)
+
+    def test_run_pi_mismatch_is_rejected_before_checkpoint_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "run_meta.json").write_text(
+                '{"model":"base","dataset":"deepmath","pi_mode":"hint"}'
+            )
+            args = advantage_dynamics.build_parser().parse_args(
+                ["--run-dir", temporary, "--pi-mode", "full"]
+            )
+            with self.assertRaisesRegex(ValueError, "does not match training PI"):
+                advantage_dynamics.prepare_run(args)
 
 
 if __name__ == "__main__":
