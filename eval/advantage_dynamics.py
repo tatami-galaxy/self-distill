@@ -69,20 +69,24 @@ REQUIRED_TRAINING_CONFIG = {
 
 
 def _sha256_text(text: str) -> str:
+    """Return the hexadecimal SHA-256 digest of UTF-8 text."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def model_slug(model: str) -> str:
+    """Return the final path component of a model identifier."""
     return model.rstrip("/").split("/")[-1].replace(os.sep, "_")
 
 
 def stable_question_id(question: str, final_answer: str) -> str:
+    """Build a stable ID from a question and its reference answer."""
     return _sha256_text(f"{question}\0{final_answer}")[:24]
 
 
 def stable_rollout_id(
     checkpoint: str, question_id: str, sample_idx: int, completion_ids: list[int], seed: int
 ) -> str:
+    """Build a stable ID for one sampled completion."""
     payload = json.dumps(
         {
             "checkpoint": checkpoint,
@@ -98,6 +102,7 @@ def stable_rollout_id(
 
 
 def fingerprint_ids(ids: Iterable[str]) -> str:
+    """Hash an ordered sequence of IDs into one provenance fingerprint."""
     digest = hashlib.sha256()
     for value in ids:
         digest.update(str(value).encode("utf-8"))
@@ -106,6 +111,7 @@ def fingerprint_ids(ids: Iterable[str]) -> str:
 
 
 def git_commit() -> str | None:
+    """Return the current Git commit, or None when it cannot be resolved."""
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
@@ -115,6 +121,7 @@ def git_commit() -> str | None:
 
 
 def write_json_atomic(path: Path, value: Any) -> None:
+    """Serialize JSON through a temporary file and atomically replace the target."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     with temporary.open("w") as file:
@@ -124,11 +131,13 @@ def write_json_atomic(path: Path, value: Any) -> None:
 
 
 def read_json(path: Path) -> dict:
+    """Load and return a JSON object from path."""
     with path.open() as file:
         return json.load(file)
 
 
 def save_dataset_atomic(dataset: Dataset, path: Path) -> None:
+    """Save a Dataset through a temporary directory and replace the target."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     if temporary.exists():
@@ -140,6 +149,7 @@ def save_dataset_atomic(dataset: Dataset, path: Path) -> None:
 
 
 def tokenizer_vocab_hash(tokenizer) -> str:
+    """Hash a tokenizer's complete token-to-ID mapping."""
     digest = hashlib.sha256()
     for token, token_id in sorted(tokenizer.get_vocab().items()):
         digest.update(token.encode("utf-8", errors="surrogatepass"))
@@ -150,6 +160,7 @@ def tokenizer_vocab_hash(tokenizer) -> str:
 
 
 def tokenizer_metadata(tokenizer) -> dict:
+    """Collect tokenizer identity fields used for score provenance."""
     return {
         "name_or_path": getattr(tokenizer, "name_or_path", None),
         "vocab_hash": tokenizer_vocab_hash(tokenizer),
@@ -159,6 +170,7 @@ def tokenizer_metadata(tokenizer) -> dict:
 
 
 def verify_tokenizer_compatibility(student_tokenizer, teacher_tokenizer) -> tuple[dict, dict]:
+    """Validate that student and teacher token IDs have identical meanings."""
     student_meta = tokenizer_metadata(student_tokenizer)
     teacher_meta = tokenizer_metadata(teacher_tokenizer)
     if student_meta["vocab_hash"] != teacher_meta["vocab_hash"]:
@@ -174,6 +186,7 @@ def verify_tokenizer_compatibility(student_tokenizer, teacher_tokenizer) -> tupl
 
 
 def discover_checkpoints(run_dir: str | Path, include_step_zero: bool = True) -> dict[int, str]:
+    """Map numeric checkpoint steps to paths, optionally including virtual step 0."""
     run_dir = Path(run_dir)
     checkpoints = {0: ""} if include_step_zero else {}
     for path in run_dir.glob("checkpoint-*"):
@@ -184,6 +197,7 @@ def discover_checkpoints(run_dir: str | Path, include_step_zero: bool = True) ->
 
 
 def load_saved_training_args(run_dir: Path):
+    """Load training arguments from the earliest numeric checkpoint."""
     checkpoints = discover_checkpoints(run_dir, include_step_zero=False)
     if not checkpoints:
         raise FileNotFoundError(f"No checkpoint-<step> directories found under {run_dir}")
@@ -246,6 +260,7 @@ def validate_training_configuration(training_args) -> dict:
 
 
 def prepare_run(args: argparse.Namespace) -> dict:
+    """Validate run metadata and resolve checkpoints, steps, and output paths."""
     run_dir = Path(args.run_dir).resolve()
     meta_path = run_dir / "run_meta.json"
     if not meta_path.is_file():
@@ -291,6 +306,7 @@ def prepare_run(args: argparse.Namespace) -> dict:
 
 
 def step_dir(run: dict, step: int) -> Path:
+    """Return the output directory for one training step."""
     return Path(run["output_dir"]) / f"step-{step:06d}"
 
 
@@ -300,6 +316,7 @@ def step_dir(run: dict, step: int) -> Path:
 
 
 def privileged_context(problem: dict, pi_mode: str) -> str:
+    """Render the teacher-only context for one PI mode."""
     if pi_mode == "none":
         return ""
     if pi_mode == "answer":
@@ -314,6 +331,7 @@ def privileged_context(problem: dict, pi_mode: str) -> str:
 
 
 def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
+    """Build the teacher conversation while leaving the student prompt unchanged."""
     student = format_prompt_math(problem["question"])
     if pi_mode == "none":
         return student
@@ -321,6 +339,7 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
 
 
 def _load_rollout_attempts(model: str, dataset: str, root: str, sample_idx: int):
+    """Load one provenance-checked attempted solution per cached question."""
     path = Path(rollout_pi_path(model, dataset, root))
     if not path.is_dir():
         raise FileNotFoundError(f"No rollout-PI cache at {path}")
@@ -355,6 +374,7 @@ def _load_rollout_attempts(model: str, dataset: str, root: str, sample_idx: int)
 
 
 def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
+    """Return the cohort settings that determine cache identity."""
     return {
         "base_model": run["base_model"],
         "dataset": run["dataset"],
@@ -370,6 +390,7 @@ def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
 
 
 def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
+    """Build a deterministic question cohort feasible under every requested PI."""
     from transformers import AutoTokenizer
 
     hints = load_hint_cache(run["base_model"], run["dataset"])
@@ -475,6 +496,7 @@ def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
 
 
 def ensure_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
+    """Reuse a valid cohort cache or build and persist a new one."""
     root = Path(run["output_dir"])
     dataset_path, meta_path = root / "cohort", root / "cohort_meta.json"
     config = _cohort_config(args, run)
@@ -500,6 +522,7 @@ def ensure_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
 
 
 def _rollout_config(args, run, step, cohort_meta) -> dict:
+    """Return generation settings that determine rollout cache identity."""
     return {
         "student_model": run["checkpoints"][step],
         "base_model": run["base_model"],
@@ -521,6 +544,7 @@ def _rollout_config(args, run, step, cohort_meta) -> dict:
 
 
 def generate_phase(args: argparse.Namespace, run: dict, step: int) -> None:
+    """Generate and grade fresh student rollouts for one checkpoint."""
     from vllm import LLM, SamplingParams
 
     cohort, cohort_meta = ensure_cohort(args, run)
@@ -614,6 +638,7 @@ def generate_phase(args: argparse.Namespace, run: dict, step: int) -> None:
 
 
 def _input_device(model):
+    """Return the device expected by a model's input embeddings."""
     try:
         return model.get_input_embeddings().weight.device
     except (AttributeError, StopIteration):
@@ -621,6 +646,7 @@ def _input_device(model):
 
 
 def _load_model(model_path: str, dtype_name: str):
+    """Load an evaluation model on CUDA with the requested weight dtype."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -633,6 +659,7 @@ def _load_model(model_path: str, dtype_name: str):
 
 
 def _score_one(model, prompt_ids: list[int], completion_id_list: list[int]) -> list[float]:
+    """Score one unpadded completion and return raw per-token log-probabilities."""
     import torch
     from train.opsd.train_self_teacher.lib import per_token_logps
 
@@ -649,6 +676,7 @@ def _score_one(model, prompt_ids: list[int], completion_id_list: list[int]) -> l
 def compute_advantages(
     teacher_logps: Iterable[float], student_logps: Iterable[float]
 ) -> list[float]:
+    """Compute token advantages as teacher log-probability minus student log-probability."""
     teacher, student = list(teacher_logps), list(student_logps)
     if len(teacher) != len(student):
         raise ValueError(
@@ -658,6 +686,7 @@ def compute_advantages(
 
 
 def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
+    """Return scoring settings that determine score cache identity."""
     return {
         "student_model": run["checkpoints"][step],
         "base_teacher": run["base_model"],
@@ -673,6 +702,7 @@ def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
 
 
 def score_phase(args: argparse.Namespace, run: dict, step: int) -> None:
+    """Score one checkpoint's rollouts under the student and all teacher PIs."""
     import torch
     from transformers import AutoTokenizer
 
@@ -788,6 +818,7 @@ def score_phase(args: argparse.Namespace, run: dict, step: int) -> None:
 
 
 def _quantile(values: list[float], probability: float) -> float:
+    """Return a linearly interpolated empirical quantile."""
     ordered = sorted(values)
     if not ordered:
         raise ValueError("Cannot take a quantile of an empty list")
@@ -800,6 +831,7 @@ def _quantile(values: list[float], probability: float) -> float:
 def question_cluster_bootstrap_ci(
     question_totals: dict[str, tuple[float, int]], samples: int, seed: int
 ) -> list[float]:
+    """Estimate a token-weighted confidence interval by resampling questions."""
     if samples < 1:
         raise ValueError("bootstrap samples must be >= 1")
     question_ids = sorted(question_totals)
@@ -815,6 +847,7 @@ def question_cluster_bootstrap_ci(
 
 
 def _split_summary(total: float, count: int) -> dict:
+    """Package a token count, advantage sum, and token-weighted mean."""
     return {
         "advantage_sum": float(total),
         "num_tokens": int(count),
@@ -823,6 +856,7 @@ def _split_summary(total: float, count: int) -> dict:
 
 
 def summarize_score_rows(rows: Iterable[dict], bootstrap_samples: int, seed: int) -> dict[str, dict]:
+    """Aggregate per-rollout score rows into per-PI advantage statistics."""
     by_pi = defaultdict(list)
     for row in rows:
         by_pi[str(row["eval_pi_mode"])].append(row)
@@ -880,6 +914,7 @@ def summarize_score_rows(rows: Iterable[dict], bootstrap_samples: int, seed: int
 
 
 def aggregate_step(args, run, step) -> dict:
+    """Write and return the aggregate advantage summary for one checkpoint."""
     out = step_dir(run, step)
     scores_dir = out / "scores"
     if not scores_dir.is_dir():
@@ -905,8 +940,18 @@ def aggregate_step(args, run, step) -> dict:
     return summary
 
 
-def aggregate_dynamics(args, run, steps) -> dict:
-    summaries = [aggregate_step(args, run, step) for step in sorted(set(steps))]
+def aggregate_dynamics(args, run, steps, step_summaries: list[dict] | None = None) -> dict:
+    """Combine checkpoint summaries, reusing supplied summaries when available."""
+    selected_steps = sorted(set(steps))
+    if step_summaries is None:
+        summaries = [aggregate_step(args, run, step) for step in selected_steps]
+    else:
+        summaries = list(step_summaries)
+        summary_steps = [int(summary["step"]) for summary in summaries]
+        if summary_steps != selected_steps:
+            raise ValueError(
+                f"Summary steps {summary_steps} do not match selected steps {selected_steps}"
+            )
     dynamics = {
         "method": "sdft_advantage_dynamics",
         "run_dir": run["run_dir"],
@@ -925,6 +970,7 @@ def aggregate_dynamics(args, run, steps) -> dict:
 
 
 def _run_spawned(target, args, run, step, label) -> None:
+    """Run a checkpoint phase in a clean spawned process and propagate failure."""
     context = multiprocessing.get_context("spawn")
     process = context.Process(target=target, args=(args, run, step))
     process.start()
@@ -936,6 +982,7 @@ def _run_spawned(target, args, run, step, label) -> None:
 
 
 def write_run_manifest(args, run, cohort_meta) -> None:
+    """Persist run, cohort, generation, and source-control provenance."""
     write_json_atomic(
         Path(run["output_dir"]) / "manifest.json",
         {
@@ -967,6 +1014,7 @@ def write_run_manifest(args, run, cohort_meta) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line parser for generation, scoring, and aggregation."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -987,11 +1035,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pi-modes", nargs="+", choices=PI_MODES,
-        default=["none", "answer", "hint", "full"],
+        default=["none", "answer", "hint", "full", "rollout"],
         help="Teacher PI conditions scored on each rollout (default: %(default)s).",
     )
     parser.add_argument(
-        "--num-problems", type=int, default=64,
+        "--num-problems", type=int, default=128,
         help="Number of shared training problems to evaluate (default: %(default)s).",
     )
     parser.add_argument(
@@ -1043,6 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_cli(parser, args) -> None:
+    """Reject invalid or ambiguous command-line argument combinations."""
     if args.num_problems < 1:
         parser.error("--num-problems must be >= 1")
     if args.n < 1:
@@ -1062,6 +1111,7 @@ def validate_cli(parser, args) -> None:
 
 
 def main() -> None:
+    """Parse arguments and dispatch the requested evaluator phase."""
     parser = build_parser()
     args = parser.parse_args()
     validate_cli(parser, args)
@@ -1080,12 +1130,13 @@ def main() -> None:
         aggregate_dynamics(args, run, run["selected_steps"])
         return
 
+    step_summaries = []
     for step in run["selected_steps"]:
         print(f"\n{'=' * 72}\nAdvantage dynamics: step {step}\n{'=' * 72}")
         _run_spawned(generate_phase, args, run, step, "generation")
         _run_spawned(score_phase, args, run, step, "scoring")
-        aggregate_step(args, run, step)
-    aggregate_dynamics(args, run, run["selected_steps"])
+        step_summaries.append(aggregate_step(args, run, step))
+    aggregate_dynamics(args, run, run["selected_steps"], step_summaries)
     print(f"Saved dynamics -> {Path(run['output_dir']) / 'dynamics.json'}")
 
 

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from eval import advantage_dynamics
 from utils import format_prompt_math
@@ -89,6 +90,27 @@ class AdvantageDefinitionTest(unittest.TestCase):
         second = advantage_dynamics.question_cluster_bootstrap_ci(totals, 50, 3)
         self.assertEqual(first, second)
 
+    def test_dynamics_reuses_already_computed_step_summaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run = {
+                "output_dir": temporary,
+                "run_dir": "run",
+                "base_model": "base",
+                "dataset": "deepmath",
+                "training_pi_mode": "hint",
+            }
+            summaries = [{"step": 20, "advantages": {}}]
+            with mock.patch.object(
+                advantage_dynamics,
+                "aggregate_step",
+                side_effect=AssertionError("aggregate_step should not be called"),
+            ):
+                dynamics = advantage_dynamics.aggregate_dynamics(
+                    SimpleNamespace(), run, [20], summaries
+                )
+            self.assertEqual(dynamics["steps"], summaries)
+            self.assertTrue((Path(temporary) / "dynamics.json").is_file())
+
 
 class ProvenanceTest(unittest.TestCase):
     def test_tokenizer_mapping_mismatch_is_rejected(self):
@@ -172,7 +194,7 @@ class PromptAndCliTest(unittest.TestCase):
     def test_parser_defaults_to_full_sweep(self):
         args = advantage_dynamics.build_parser().parse_args(["--run-dir", "run"])
         self.assertEqual(args.phase, "sweep")
-        self.assertEqual(args.pi_modes, ["none", "answer", "hint", "full"])
+        self.assertEqual(args.pi_modes, ["none", "answer", "hint", "full", "rollout"])
         self.assertIsNone(args.steps)
 
 

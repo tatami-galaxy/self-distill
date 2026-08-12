@@ -30,6 +30,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
 
 # rollout PI: generate the attempted-solution cache first (see gen_rollouts.py).
 # The larger prompt budget keeps the 8K attempt plus the question/instructions intact.
+# This is mostly fine because the rollouts had a max token budget of 8k.
+# On the other hand if we do this for the full PI we will include many ~16k rollouts.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
     --model Qwen/Qwen3-4B --dataset deepmath --pi-mode rollout \
     --rollout-pi-root data/pi/attempted_solution_8k --rollout-pi-sample-idx 0 \
