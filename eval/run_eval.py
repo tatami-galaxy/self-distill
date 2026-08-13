@@ -80,7 +80,7 @@ SUMMARY_SCHEMA_VERSION = 2
 # for GOLD the teacher ARE the independent variable under study, so filing two of them under
 # a bare `sdft/` or `gold/` would merge runs that the experiment exists to tell apart.
 VARIANT_REQUIRED = {
-    "sdft": "the privileged context, e.g. --variant hint",
+    "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
     "ppo_pi": "the critic's privileged context, e.g. --variant hint",
     # For sdft_tt the variable is the pair (PI, E-step objective): the per-token and aggregate
@@ -411,8 +411,9 @@ def main():
     parser.add_argument(
         "--variant", default=None,
         help="What distinguishes this arm within its algorithm: the privileged context for "
-             "sdft (full/answer/hint), the teacher slug for gold. Required for those two, "
-             "optional elsewhere (e.g. a PI-conditioned PPO critic).",
+             "sdft (full/answer/hint/rollout/self_rollout), the teacher slug for gold, "
+             "or the critic PI for ppo_pi. Required where the algorithm has multiple "
+             "experiment arms; optional elsewhere.",
     )
     parser.add_argument(
         "--run", default=None,
