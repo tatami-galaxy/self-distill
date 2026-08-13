@@ -1,56 +1,32 @@
-r"""
-Stage 2 of the trained-self-teacher arm: regress the teacher:student log ratio onto the verified
-outcome.
+"""
+Stage 2 of the trained-self-teacher arm: train a PI-conditioned teacher with a conservative
+asymmetric update to its teacher:student sampled-token log ratio.
 
-It reads the frozen-student rollouts cached by
-train/opsd/train_self_teacher/gen_rollouts.py, attaches a privileged context, and trains a copy of the student -- the
-teacher -- so that
+It reads frozen-student rollouts from stage 1 and trains a copy of the student so
 
     rho_t = log pi_phi(y_t | x, c, y_<t) - log pi_theta(y_t | x, y_<t)
 
-predicts whether the rollout it came from was correct. Four objectives (see train/opsd/train_self_teacher/lib.py
-for the full rationale):
+becomes more favorable only on successful tokens the initial teacher penalized. Both supported
+objectives preserve every other completion token at its initial ratio:
 
-  --objective pointwise : regress each rho_t towards +/- tau.
-                          Its fixed point is a flat advantage, so it is meant to be run as a
-                          bounded nudge, not to convergence. Watch `ratio_dispersion_retained`.
-  --objective endpoint  : regress only the trace total sigmoid(beta*S_T/N + b).
-                          One constraint per trace instead of one per token, so per-token allocation
-                          stays free and credit can be sparse. Gentler, cannot flatten.
-  --objective asymmetric: preserve rho_t^0 except on successful tokens it initially penalized.
-                          Each such token is individually lifted towards a finite margin; failed
-                          trajectories and all non-targeted tokens are anchored to initialization.
-  --objective asymmetric_cumulative: use the same fixed lift mask and complement anchor, but
-                          constrain only its terminal aggregate so credit can remain sparse.
+  --objective asymmetric           regress each targeted token toward its finite lift target.
+  --objective asymmetric_aggregate constrain the targeted tokens' mean residual, allowing
+                                   compensating changes and sparser credit allocation.
 
-Stage 3 is only worth if this stage shows the ratio became outcome-predictive :
-INIT vs TRAINED, printed at startup and written to diagnostics_init.json.
-Diagnostics use COMPLETE HELD-OUT QUESTIONS: no rollout from a diagnostic question reaches the optimizer.
+`--sampled-logp-anchor` optionally penalizes sampled-token teacher log-probability drift over the
+whole completion, including lift tokens. It trades lift strength against keeping the teacher close
+to its initialization for stage-3 imitation.
 
-  brier_q*_fitted              question-grouped out-of-fold outcome Brier; compare with
-                               brier_floor_crossfit.
-  within_question_auc_q*       shortcut-resistant ranking within mixed-outcome questions.
-  correct_penalty_relief       weighted question-centered relief on every initially penalized
-                               successful rollout; correct_penalized_count is its support.
-  wrong_ratio_delta / wrong_ratio_rms_drift
-                               signed and magnitude drift from initialization on failures.
-  ratio_dispersion_retained    fraction of the initial within-trace credit structure retained.
-  credit_mass_last_quartile    late-firing detector; `--pi-mode answer` is expected to trip it.
+Diagnostics use complete held-out questions: no rollout from a diagnostic question reaches the
+optimizer. The key go/no-go readings are within-question outcome ranking, relief on initially
+penalized successful traces, drift on failures, retained ratio dispersion, and credit location.
 
-# one E-step, hint PI, pointwise objective
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
-    --model Qwen/Qwen3-4B --dataset deepmath --pi-mode hint --objective pointwise
+Example:
 
-# the full ladder off the one rollout cache
-for pi in hint answer full none; do for obj in pointwise endpoint asymmetric asymmetric_cumulative; do
-  CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
-      --model Qwen/Qwen3-4B --pi-mode $pi --objective $obj; done; done
-
-# smoke
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
-    --model Qwen/Qwen3-1.7B --pi-mode none --max-steps 2 --save-steps 2 --diag-rows 4
+    CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
+        --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
+        --objective asymmetric_aggregate --sampled-logp-anchor 0.1
 """
-
 import argparse
 import hashlib
 import json
@@ -59,12 +35,10 @@ from functools import partial
 
 import torch
 from datasets import load_from_disk
-from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 from train.opsd.train_self_teacher.lib import (
-    LENGTH_NORMS,
+    ASYMMETRIC_OBJECTIVES,
     MODEL_FORWARD_BATCH_SIZE,
     PI_MODES,
     TEACHER_VERSION,
@@ -74,20 +48,13 @@ from train.opsd.train_self_teacher.lib import (
     concat_padded,
     log_ratio,
     objective_asymmetric,
-    objective_endpoint,
-    objective_pointwise,
     rollout_path,
+    sampled_logp_anchor,
     teacher_prompt_template,
     teacher_token_logps,
 )
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
-
-# The learnable calibration bias, checkpointed beside the teacher. A bare state dict rather than
-# part of the model, for the same reason train_ppo.py keeps its critic out of `self.model`: the
-# teacher must stay a plain PreTrainedModel so `save_pretrained` produces something
-# eval/teacher_uncertainty.py and stage 3 can load directly.
-CALIBRATION_FILE = "calibration.pt"
 
 # Resume identity for the data boundary: older checkpoints trained on rows now held out.
 QUESTION_SPLIT_VERSION = "question_hash_v1"
@@ -95,70 +62,28 @@ QUESTION_SPLIT_VERSION = "question_hash_v1"
 # The exact dataset-level weighting encoded in `asym_lift_weight`; part of run provenance because
 # changing it changes the objective even when every scalar hyperparameter stays fixed.
 ASYMMETRIC_WEIGHTING_VERSION = "eligible_success_question_equal_v1"
-ASYMMETRIC_LIFT_REDUCTIONS = {
-    "asymmetric": "pointwise",
-    "asymmetric_cumulative": "cumulative",
-}
 
 
 class SelfTeacherTrainer(Trainer):
-    """HF Trainer whose loss is the outcome regression on the teacher:student log ratio."""
+    """HF Trainer for the conservative asymmetric teacher:student log-ratio update."""
 
-    def __init__(self, *args, objective, pointwise_loss, tau, beta, length_norm,
-                 bias_learning_rate, kl_anchor, asym_margin, asym_lift_alpha,
-                 asym_anchor_weight, diag_crossfit_folds=5,
-                 **kwargs):
+    def __init__(self, *args, objective, sampled_logp_anchor_weight, asym_margin,
+                 asym_lift_alpha, asym_anchor_weight, diag_crossfit_folds=5, **kwargs):
         super().__init__(*args, **kwargs)
+        if objective not in ASYMMETRIC_OBJECTIVES:
+            raise ValueError(f"unknown self-teacher objective {objective!r}")
         self.objective = objective
-        self.pointwise_loss = pointwise_loss
-        self.tau = tau
-        self.beta = beta
-        self.length_norm = length_norm
-        self.bias_learning_rate = bias_learning_rate
-        self.kl_anchor = kl_anchor
+        self.sampled_logp_anchor_weight = sampled_logp_anchor_weight
         self.asym_margin = asym_margin
         self.asym_lift_alpha = asym_lift_alpha
         self.asym_anchor_weight = asym_anchor_weight
         self.diag_crossfit_folds = diag_crossfit_folds
-        # VPD's delta: one scalar absorbing the outcome base rate so the ratio does not have to
-        # encode it, and the "shift every rho by a constant" degenerate solution is unavailable.
-        self.calibration_bias = nn.Parameter(
-            torch.zeros((), device=self.accelerator.device, dtype=torch.float32)
-        )
         self._diag_rows = None
         self._diag_collate = None
         self._diag_question_ids = None
         self._diag_initial_ratios = None
         self._train_ratio_sum = None
         self._train_ratio_count = None
-
-    # -- the bias needs its own, much larger learning rate ---------------------
-
-    def create_optimizer(self, *args, **kwargs):
-        """Append the calibration bias as its own param group.
-
-        Set HERE rather than patched onto param_groups afterwards, so `create_scheduler` (which
-        runs next and records each group's `initial_lr`) schedules it from its own base rate --
-        the same reason train_ppo.py adds its critic group inside create_optimizer.
-
-        The separate rate is not a nicety: at the teacher's 1e-6 a single scalar would take tens
-        of thousands of steps to travel the couple of nats that a 60%-vs-40% base rate implies,
-        so the ratio would spend the whole run compensating for it.
-        """
-        optimizer = super().create_optimizer(*args, **kwargs)
-        optimizer.add_param_group({"params": [self.calibration_bias], "lr": self.bias_learning_rate})
-
-        # Transformers clears gradients with `model.zero_grad()` after each optimizer update. The
-        # calibration scalar deliberately lives outside `model`, so without an explicit clear its
-        # gradient would leak across optimizer steps forever. An optimizer post-step hook preserves
-        # accumulation across all microbatches in THIS update and clears exactly at its boundary.
-        bias = self.calibration_bias
-
-        def clear_bias_grad(_optimizer, _args, _kwargs):
-            bias.grad = None
-
-        self._bias_grad_clear_hook = optimizer.register_step_post_hook(clear_bias_grad)
-        return optimizer
 
     # -- loss ------------------------------------------------------------------
 
@@ -170,38 +95,18 @@ class SelfTeacherTrainer(Trainer):
         ratios = log_ratio(logps, inputs)
         mask = inputs["completion_mask"].float()
         reward = inputs["reward"]
-
-        if self.objective == "pointwise":
-            loss = objective_pointwise(
-                ratios, mask, reward, tau=self.tau, loss=self.pointwise_loss, beta=self.beta
+        initial_ratios = log_ratio(inputs["teacher_logps_init"], inputs)
+        loss = objective_asymmetric(
+            ratios, initial_ratios, mask, reward, inputs["asym_lift_weight"],
+            margin=self.asym_margin,
+            lift_alpha=self.asym_lift_alpha,
+            anchor_weight=self.asym_anchor_weight,
+            aggregate=self.objective == "asymmetric_aggregate",
+        )
+        if self.sampled_logp_anchor_weight > 0.0:
+            loss = loss + self.sampled_logp_anchor_weight * sampled_logp_anchor(
+                logps, inputs["teacher_logps_init"], mask
             )
-        elif self.objective == "endpoint":
-            loss = objective_endpoint(
-                ratios, mask, reward, self.beta, self.calibration_bias, self.length_norm
-            )
-        elif self.objective in ASYMMETRIC_LIFT_REDUCTIONS:
-            initial_ratios = log_ratio(inputs["teacher_logps_init"], inputs)
-            loss = objective_asymmetric(
-                ratios,
-                initial_ratios,
-                mask,
-                reward,
-                inputs["asym_lift_weight"],
-                margin=self.asym_margin,
-                lift_alpha=self.asym_lift_alpha,
-                anchor_weight=self.asym_anchor_weight,
-                lift_reduction=ASYMMETRIC_LIFT_REDUCTIONS[self.objective],
-            )
-        else:
-            raise ValueError(f"unknown self-teacher objective {self.objective!r}")
-
-        if self.kl_anchor > 0.0:
-            # Proximal term against the teacher AT INIT, keeping it usable as an imitation target
-            # in stage 3. Needed because the R=0 branch of pointwise/endpoint is unlikelihood
-            # training on PI-conformant tokens, which can improve the ratio while degrading the
-            # text the teacher would generate.
-            drift = (logps - inputs["teacher_logps_init"]) ** 2
-            loss = loss + self.kl_anchor * (drift * mask).sum() / mask.sum().clamp(min=1.0)
 
         if model.training:
             self._accumulate_train_ratio(ratios, mask)
@@ -248,10 +153,7 @@ class SelfTeacherTrainer(Trainer):
         ratio_count = self.accelerator.reduce(self._train_ratio_count, reduction="sum")
         self._train_ratio_sum = None
         self._train_ratio_count = None
-        return {
-            "st/ratio_mean": (ratio_sum / ratio_count.clamp(min=1.0)).item(),
-            "st/calibration_bias": self.calibration_bias.item(),
-        }
+        return {"st/ratio_mean": (ratio_sum / ratio_count.clamp(min=1.0)).item()}
 
     # -- diagnostics -----------------------------------------------------------
 
@@ -306,7 +208,6 @@ class SelfTeacherTrainer(Trainer):
             self._diag_initial_ratios = ratios.detach().cpu().clone()
         return calibration_metrics(
             ratios, mask, reward,
-            length_norm=self.length_norm,
             crossfit_folds=self.diag_crossfit_folds,
             question_ids=self._diag_question_ids,
             initial_ratios=self._diag_initial_ratios,
@@ -323,32 +224,6 @@ class SelfTeacherTrainer(Trainer):
             self.control.should_log = True
         return super()._maybe_log_save_evaluate(*args, **kwargs)
 
-    # -- checkpoint the bias alongside the teacher -----------------------------
-
-    def _save_checkpoint(self, model, trial):
-        super()._save_checkpoint(model, trial)
-        if self.args.should_save:
-            ckpt_dir = os.path.join(
-                self._get_output_dir(trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-            )
-            torch.save({"calibration_bias": self.calibration_bias.detach().cpu()},
-                       os.path.join(ckpt_dir, CALIBRATION_FILE))
-
-    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        super()._load_from_checkpoint(resume_from_checkpoint, model)
-        path = os.path.join(resume_from_checkpoint, CALIBRATION_FILE)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"No {CALIBRATION_FILE} in {resume_from_checkpoint}. The calibration bias absorbs "
-                "the outcome base rate, so resuming without it would restart from 0 while the "
-                "teacher's ratio still assumes the learned offset -- every diagnostic would look "
-                "healthy and every value would be shifted."
-            )
-        state = torch.load(path, map_location="cpu", weights_only=True)
-        # In place: the optimizer holds a reference to this exact tensor.
-        with torch.no_grad():
-            self.calibration_bias.copy_(state["calibration_bias"].to(self.calibration_bias.device))
-        print(f"Restored calibration bias <- {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +234,8 @@ class SelfTeacherTrainer(Trainer):
 def add_init_teacher_logps(dataset, model, collate, device) -> "Dataset":
     """Score every row under the UNTRAINED teacher to freeze its token-level reference.
 
-    One no-grad pass at startup, used by either --kl-anchor or either asymmetric objective. The
-    collator omits the column for objectives that do not need it.
+    One no-grad pass at startup freezes the reference used by both asymmetric objectives and the
+    optional sampled-logp anchor.
     """
     print(f"  scoring {len(dataset)} rows under the initial teacher")
     was_training = model.training
@@ -552,34 +427,16 @@ def build_run_meta(
         "diag_crossfit_folds": getattr(args, "diag_crossfit_folds", None),
         "objective": args.objective,
         "diag_rows_limit": getattr(args, "diag_rows", None),
-        "pointwise_loss": args.pointwise_loss,
-        "tau": args.tau,
-        "beta": args.beta,
-        "length_norm": args.length_norm,
-        "kl_anchor": args.kl_anchor,
-        "asym_margin": (
-            getattr(args, "asym_margin", None)
-            if args.objective in ASYMMETRIC_LIFT_REDUCTIONS else None
-        ),
-        "asym_lift_alpha": (
-            getattr(args, "asym_lift_alpha", None)
-            if args.objective in ASYMMETRIC_LIFT_REDUCTIONS else None
-        ),
-        "asym_anchor_weight": (
-            getattr(args, "asym_anchor_weight", None)
-            if args.objective in ASYMMETRIC_LIFT_REDUCTIONS else None
-        ),
-        "asym_weighting": (
-            ASYMMETRIC_WEIGHTING_VERSION
-            if args.objective in ASYMMETRIC_LIFT_REDUCTIONS else None
-        ),
-        "asym_lift_reduction": ASYMMETRIC_LIFT_REDUCTIONS.get(args.objective),
+        "sampled_logp_anchor": args.sampled_logp_anchor,
+        "asym_margin": args.asym_margin,
+        "asym_lift_alpha": args.asym_lift_alpha,
+        "asym_anchor_weight": args.asym_anchor_weight,
+        "asym_weighting": ASYMMETRIC_WEIGHTING_VERSION,
         "max_teacher_prompt_length": args.max_teacher_prompt_length,
         # resume-critical, learning rates: on resume these come from the CHECKPOINT, not the CLI
         # (optimizer.load_state_dict restores each group's lr AFTER create_scheduler), so
         # recording them turns a silently-ignored change into an error.
         "learning_rate": args.learning_rate,
-        "bias_learning_rate": args.bias_learning_rate,
         # resume-critical: dataset order + batch chunking.
         "seed": args.seed,
         "per_device_train_batch_size": MODEL_FORWARD_BATCH_SIZE,
@@ -596,7 +453,7 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--model", default="Qwen/Qwen3-4B",
+    p.add_argument("--model", default="Qwen/Qwen3-1.7B",
                    help="The student. The teacher is initialised from these same weights, and the "
                         "rollout cache must have been generated by them.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()))
@@ -618,46 +475,24 @@ def main():
                         "question and the chat template header and keep the demo. Binding for "
                         "--pi-mode full only.")
     # objective
-    p.add_argument("--objective", default="pointwise",
-                   choices=["pointwise", "endpoint", *ASYMMETRIC_LIFT_REDUCTIONS],
-                   help="pointwise regresses every rho_t towards +/-tau; "
-                        "endpoint regresses only the trace total; asymmetric individually lifts "
-                        "successful, initially penalized tokens; asymmetric_cumulative instead "
-                        "constrains their normalized terminal aggregate. Both anchor the complement.")
-    p.add_argument("--pointwise-loss", default="squared", choices=["squared", "logistic"],
-                   help="For --objective pointwise. 'squared' targets a bounded +/-tau on the RAW "
-                        "ratio (finite fixed point). 'logistic' is BCE on beta*rho, whose gradient "
-                        "saturates at a constant rather than vanishing -- use it if the bounded "
-                        "target is reached before the ratio becomes informative.")
-    p.add_argument("--tau", type=float, default=0.1,
-                   help="Target magnitude in nats per token for --pointwise-loss squared.")
-    p.add_argument("--beta", type=float, default=1.0,
-                   help="Scale on the ratio inside the sigmoid (endpoint / logistic).")
+    p.add_argument("--objective", default="asymmetric", choices=list(ASYMMETRIC_OBJECTIVES),
+                   help="asymmetric regresses each fixed lift token separately; "
+                        "asymmetric_aggregate constrains their mean residual. Both preserve the "
+                        "complement of the lift set at initialization.")
     p.add_argument("--asym-margin", type=float, default=0.0,
-                   help="For either asymmetric objective: only successful tokens with rho^0 below this "
-                        "margin enter the fixed lift set.")
+                   help="Only successful tokens with rho^0 below this margin enter the fixed lift set.")
     p.add_argument("--asym-lift-alpha", type=float, default=1.0,
-                   help="For either asymmetric objective: fraction of the rho^0-to-margin gap used as "
-                        "the finite lift target. Must be in [0, 1].")
+                   help="Fraction of the rho^0-to-margin gap used as the finite lift target. "
+                        "Must be in [0, 1].")
     p.add_argument("--asym-anchor-weight", type=float, default=1.0,
-                   help="For either asymmetric objective: coefficient on initialization drift over the "
-                        "complement of the fixed lift set.")
-    p.add_argument("--length-norm", default="mean", choices=list(LENGTH_NORMS),
-                   help="Divisor on S_T for --objective endpoint. 'mean' (per token) removes the "
-                        "length dependence; with 'none' a fixed beta saturates the sigmoid on long "
-                        "traces and silently trains on short ones only.")
-    p.add_argument("--kl-anchor", type=float, default=0.0,
-                   help="Proximal penalty pulling the teacher's logprobs back towards their values "
-                        "at init, keeping it usable as stage 3's imitation target. Costs one "
-                        "no-grad pass over the dataset at startup. 0 disables.")
+                   help="Coefficient on ratio drift over the complement of the fixed lift set.")
+    p.add_argument("--sampled-logp-anchor", type=float, default=0.0,
+                   help="Optional coefficient on sampled-token teacher log-probability drift from "
+                        "initialization over the whole completion, including lift tokens.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6,
                    help="Teacher LR. Low by design: this is a corrective nudge to a pretrained "
                         "model, not SFT. Raise towards 1e-5 if the diagnostics do not move.")
-    p.add_argument("--bias-learning-rate", type=float, default=1e-2,
-                   help="LR for the single calibration-bias scalar, SEPARATE from the teacher's. "
-                        "It has to travel a couple of nats to absorb the outcome base rate, which "
-                        "at the teacher's rate would take the entire run.")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
@@ -687,8 +522,8 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     # resume
     p.add_argument("--resume-from-checkpoint", default=None,
-                   help="Resume dir ('checkpoint-<step>'). Restores the teacher, the calibration "
-                        "bias, the optimizer/scheduler/RNG, and skips seen rows. Pass the SAME "
+                   help="Resume dir ('checkpoint-<step>'). Restores the teacher, optimizer, "
+                        "scheduler/RNG, and skips seen rows. Pass the SAME "
                         "--model, --dataset, --pi-mode, --objective, --seed and gradient "
                         "accumulation as the original run (verified against its run_meta.json).")
     p.add_argument("--force-resume", action="store_true")
@@ -698,8 +533,8 @@ def main():
         p.error("--asym-lift-alpha must be between 0 and 1")
     if args.asym_anchor_weight < 0.0:
         p.error("--asym-anchor-weight must be non-negative")
-    if args.objective in ASYMMETRIC_LIFT_REDUCTIONS and args.kl_anchor > 0.0:
-        p.error("--kl-anchor cannot be combined with an asymmetric objective; its anchor overlaps the lift set")
+    if args.sampled_logp_anchor < 0.0:
+        p.error("--sampled-logp-anchor must be non-negative")
     if not 0 < args.validation_fraction < 1:
         p.error("--validation-fraction must be strictly between 0 and 1")
     if args.diag_rows <= 0:
@@ -707,10 +542,6 @@ def main():
     if args.diag_crossfit_folds < 2:
         p.error("--diag-crossfit-folds must be at least 2")
 
-    if args.objective == "endpoint" and args.length_norm == "none":
-        print("  warning: --objective endpoint with --length-norm none. S_T accumulates over "
-              "thousands of tokens, so the sigmoid will saturate on long traces and their "
-              "gradient will vanish. Use 'mean' unless you have rescaled --beta to match.")
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(
@@ -754,6 +585,9 @@ def main():
         rollouts, args.pi_mode, tokenizer,
         dataset=args.dataset, max_teacher_prompt_length=args.max_teacher_prompt_length,
     )
+    print(train_dataset)
+    print(train_dataset[0]['has_pi'])
+    quit()
     print(f"Loaded {len(train_dataset)} rollouts  "
           f"(pass rate {sum(train_dataset['reward']) / max(len(train_dataset), 1):.3f})")
     if args.pi_mode != "none" and not all(train_dataset["has_pi"]):
@@ -854,26 +688,18 @@ def main():
         data_collator=collate,
         processing_class=tokenizer,
         objective=args.objective,
-        pointwise_loss=args.pointwise_loss,
-        tau=args.tau,
-        beta=args.beta,
-        length_norm=args.length_norm,
-        bias_learning_rate=args.bias_learning_rate,
-        kl_anchor=args.kl_anchor,
+        sampled_logp_anchor_weight=args.sampled_logp_anchor,
         asym_margin=args.asym_margin,
         asym_lift_alpha=args.asym_lift_alpha,
         asym_anchor_weight=args.asym_anchor_weight,
         diag_crossfit_folds=args.diag_crossfit_folds,
     )
 
-    if args.kl_anchor > 0.0 or args.objective in ASYMMETRIC_LIFT_REDUCTIONS:
-        train_dataset = add_init_teacher_logps(
-            train_dataset, trainer.model, collate,
-            trainer.accelerator.device,
-        )
-        if args.objective in ASYMMETRIC_LIFT_REDUCTIONS:
-            train_dataset = add_asymmetric_lift_weights(train_dataset, args.asym_margin)
-        trainer.train_dataset = train_dataset
+    train_dataset = add_init_teacher_logps(
+        train_dataset, trainer.model, collate, trainer.accelerator.device
+    )
+    train_dataset = add_asymmetric_lift_weights(train_dataset, args.asym_margin)
+    trainer.train_dataset = train_dataset
 
     # -- init diagnostics: the baseline every later reading is compared against --
     n_diag = len(diagnostic_dataset)
@@ -898,8 +724,6 @@ def main():
     final_dir = os.path.join(output_dir, "final")
     trainer.save_model(final_dir)  # save_pretrained: loadable by stage 3 and teacher_uncertainty.py
     tokenizer.save_pretrained(final_dir)
-    torch.save({"calibration_bias": trainer.calibration_bias.detach().cpu()},
-               os.path.join(final_dir, CALIBRATION_FILE))
     if training_args.process_index == 0:
         with open(os.path.join(output_dir, "diagnostics_final.json"), "w") as f:
             json.dump(final_metrics, f, indent=2)

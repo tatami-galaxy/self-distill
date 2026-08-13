@@ -1,10 +1,7 @@
-"""Trained self-teacher: prompt alignment, the two objectives, and the diagnostics.
+"""Trained self-teacher: prompt alignment, asymmetric objectives, and diagnostics.
 
-The objective tests are the important ones. `objective_pointwise` exists to concentrate the
-teacher's corrective pull on the tokens it currently penalizes MOST -- the off-PI exploration that
-nonetheless worked -- and that property lives entirely in the choice of link function. A
-well-meaning change to a sigmoid link would silently invert it (sigma' vanishes in the tail), so
-the gradient ordering is pinned here rather than left to the docstring.
+The objective tests pin the disjoint fixed lift/complement masks, the distinction between
+per-token and aggregate lift constraints, and the optional sampled-logp anchor.
 
 The alignment tests assert against TRL's real `_tokenize_prompts`, not a reimplementation: the
 teacher's logprobs are only comparable to the student's cached ones while both prompts end on the
@@ -23,6 +20,8 @@ import torch
 
 from tests.helpers import TOKENIZER_ID, FakeChatTokenizer, make_prompt_stub
 from train.opsd.train_self_teacher.lib import (
+    ASYMMETRIC_OBJECTIVES,
+    TEACHER_VERSION,
     asymmetric_lift_mask,
     calibration_metrics,
     collate_teacher_batch,
@@ -31,12 +30,10 @@ from train.opsd.train_self_teacher.lib import (
     log_ratio,
     macro_group_rank_auc,
     objective_asymmetric,
-    objective_endpoint,
-    objective_pointwise,
     privileged_context,
     rank_auc,
     render_teacher_prompt_ids,
-    sequence_logit,
+    sampled_logp_anchor,
     teacher_inputs,
     teacher_prompt_template,
 )
@@ -283,119 +280,11 @@ class NumericalPrecisionTest(unittest.TestCase):
         self.assertTrue(torch.equal(out[1], torch.full((4,), 3.0)))
 
 
-class PointwiseObjectiveTest(unittest.TestCase):
-    """(c). The gradient must push hardest on the tokens the teacher penalizes most."""
-
-    def setUp(self):
-        # One correct trace whose per-token ratios span from strongly penalized to mildly liked.
-        self.ratios = torch.tensor([[-3.0, -1.0, 0.0, 0.5]], requires_grad=True)
-        self.mask = torch.ones(1, 4)
-        self.reward = torch.tensor([1.0])
-
-    def _grad(self, loss):
-        (grad,) = torch.autograd.grad(loss, self.ratios)
-        return grad[0]
-
-    def test_squared_pushes_hardest_on_the_most_penalized_token(self):
-        grad = self._grad(objective_pointwise(self.ratios, self.mask, self.reward, tau=0.1))
-        # Descent moves rho by -grad, so a MORE NEGATIVE grad is a LARGER upward push. The
-        # ordering must be strictly increasing from the most penalized token to the least.
-        self.assertLess(grad[0].item(), grad[1].item())
-        self.assertLess(grad[1].item(), grad[2].item())
-        self.assertLess(grad[2].item(), grad[3].item())
-        # And the most penalized token is pushed UP, not down.
-        self.assertLess(grad[0].item(), 0.0)
-
-    def test_sigmoid_link_would_invert_the_ordering(self):
-        # Not an assertion about our code -- a guard on the reasoning behind it. Squared error on
-        # a SIGMOID carries a sigma' factor that vanishes in the tail, so the token at rho=-3
-        # would receive LESS pull than the one at rho=-1: the opposite of the mechanism this
-        # objective exists to provide. Pinned so a future "let's bound it with a sigmoid" change
-        # has to confront it.
-        values = torch.sigmoid(self.ratios)
-        loss = ((values - self.reward.unsqueeze(1)) ** 2).mean()
-        grad = self._grad(loss)
-        self.assertGreater(abs(grad[0].item()), 0.0)
-        self.assertLess(abs(grad[0].item()), abs(grad[1].item()))
-
-    def test_logistic_variant_keeps_pulling_in_the_tail(self):
-        grad = self._grad(
-            objective_pointwise(self.ratios, self.mask, self.reward, loss="logistic", beta=1.0)
-        )
-        # BCE-with-logits saturates at a CONSTANT rather than at zero, so the tail token still
-        # gets the largest push.
-        self.assertLess(grad[0].item(), grad[3].item())
-        self.assertLess(grad[0].item(), 0.0)
-
-    def test_wrong_traces_are_pushed_down(self):
-        grad = self._grad(
-            objective_pointwise(self.ratios, self.mask, torch.tensor([0.0]), tau=0.1)
-        )
-        self.assertGreater(grad[3].item(), 0.0)  # the token the teacher likes most, pushed down
-
-    def test_padding_is_excluded(self):
-        ratios = torch.tensor([[-3.0, -1.0, 99.0]])
-        mask = torch.tensor([[1.0, 1.0, 0.0]])
-        with_pad = objective_pointwise(ratios, mask, torch.tensor([1.0]), tau=0.1)
-        without = objective_pointwise(ratios[:, :2], mask[:, :2], torch.tensor([1.0]), tau=0.1)
-        self.assertAlmostEqual(with_pad.item(), without.item(), places=5)
-
-    def test_rejects_unknown_loss(self):
-        with self.assertRaisesRegex(ValueError, "unknown pointwise loss"):
-            objective_pointwise(self.ratios, self.mask, self.reward, loss="hinge")
-
-
-class EndpointObjectiveTest(unittest.TestCase):
-    """(a). One constraint per trace, so per-token allocation stays free."""
-
-    def test_sequence_logit_is_the_masked_mean_ratio(self):
-        ratios = torch.tensor([[0.2, 0.4, 99.0]])
-        mask = torch.tensor([[1.0, 1.0, 0.0]])
-        bias = torch.tensor(0.5)
-        logit = sequence_logit(ratios, mask, beta=2.0, bias=bias, length_norm="mean")
-        self.assertAlmostEqual(logit.item(), 2.0 * (0.6 / 2) + 0.5, places=5)
-
-    def test_length_norms_agree_at_length_one(self):
-        ratios = torch.tensor([[0.3]])
-        mask = torch.ones(1, 1)
-        bias = torch.tensor(0.0)
-        values = [
-            sequence_logit(ratios, mask, 1.0, bias, norm).item()
-            for norm in ("mean", "sqrt", "none")
-        ]
-        self.assertTrue(all(abs(v - 0.3) < 1e-6 for v in values))
-
-    def test_sparse_and_uniform_allocations_are_equally_optimal(self):
-        # The property that preserves credit assignment: only the TOTAL is constrained, so ten
-        # tokens at 0.4 and four thousand at 0 score exactly the same as a uniform spread of the
-        # same total. Objective (c) cannot say this.
-        mask = torch.ones(1, 8)
-        reward = torch.tensor([1.0])
-        bias = torch.tensor(0.0)
-        sparse = torch.zeros(1, 8)
-        sparse[0, 2] = 1.6
-        uniform = torch.full((1, 8), 0.2)
-        self.assertAlmostEqual(
-            objective_endpoint(sparse, mask, reward, 1.0, bias, "mean").item(),
-            objective_endpoint(uniform, mask, reward, 1.0, bias, "mean").item(),
-            places=5,
-        )
-
-    def test_bias_absorbs_the_base_rate(self):
-        # With a zero ratio the prediction is entirely the bias, which is what lets the ratio stop
-        # encoding "this policy solves ~60% of problems".
-        ratios = torch.zeros(1, 4)
-        mask = torch.ones(1, 4)
-        logit = sequence_logit(ratios, mask, 1.0, torch.tensor(1.5), "mean")
-        self.assertAlmostEqual(logit.item(), 1.5, places=6)
-
-    def test_rejects_unknown_length_norm(self):
-        with self.assertRaisesRegex(ValueError, "unknown length_norm"):
-            sequence_logit(torch.zeros(1, 2), torch.ones(1, 2), 1.0, torch.tensor(0.0), "log")
-
-
 class AsymmetricObjectiveTest(unittest.TestCase):
     """Only successful, initially penalized tokens move; the complement stays anchored."""
+
+    def test_only_current_objective_names_are_public(self):
+        self.assertEqual(ASYMMETRIC_OBJECTIVES, ("asymmetric", "asymmetric_aggregate"))
 
     def test_lift_mask_is_fixed_and_target_is_finite(self):
         initial = torch.tensor([[-0.4, -0.1, 0.0, 0.2]])
@@ -465,18 +354,18 @@ class AsymmetricObjectiveTest(unittest.TestCase):
         )
         self.assertAlmostEqual(full_loss.item(), short_loss.item(), places=7)
 
-    def test_cumulative_lift_allows_token_residuals_to_compensate(self):
+    def test_aggregate_lift_allows_token_residuals_to_compensate(self):
         initial = torch.tensor([[-0.4, -0.2]])
         ratios = torch.tensor([[-0.1, 0.1]])
         args = (initial, torch.ones(1, 2), torch.ones(1), torch.ones(1))
 
-        pointwise = objective_asymmetric(ratios, *args, lift_reduction="pointwise")
-        cumulative = objective_asymmetric(ratios, *args, lift_reduction="cumulative")
+        per_token = objective_asymmetric(ratios, *args)
+        aggregate = objective_asymmetric(ratios, *args, aggregate=True)
 
-        self.assertGreater(pointwise.item(), 0.0)
-        self.assertAlmostEqual(cumulative.item(), 0.0, places=7)
+        self.assertGreater(per_token.item(), 0.0)
+        self.assertAlmostEqual(aggregate.item(), 0.0, places=7)
 
-    def test_cumulative_lift_has_equal_gradient_on_every_lift_token(self):
+    def test_aggregate_lift_has_equal_gradient_on_every_lift_token(self):
         initial = torch.tensor([[-0.4, -0.2]])
         ratios = initial.clone().requires_grad_(True)
         loss = objective_asymmetric(
@@ -485,63 +374,38 @@ class AsymmetricObjectiveTest(unittest.TestCase):
             torch.ones(1, 2),
             torch.ones(1),
             torch.ones(1),
-            lift_reduction="cumulative",
+            aggregate=True,
         )
         (grad,) = torch.autograd.grad(loss, ratios)
 
         self.assertLess(grad[0, 0].item(), 0.0)
         self.assertAlmostEqual(grad[0, 0].item(), grad[0, 1].item(), places=7)
 
-    def test_cumulative_matches_pointwise_for_one_lift_token(self):
+    def test_aggregate_matches_per_token_for_one_lift_token(self):
         initial = torch.tensor([[-0.4]])
         ratios = torch.tensor([[-0.1]])
         args = (initial, torch.ones(1, 1), torch.ones(1), torch.ones(1))
 
-        pointwise = objective_asymmetric(ratios, *args, lift_reduction="pointwise")
-        cumulative = objective_asymmetric(ratios, *args, lift_reduction="cumulative")
+        per_token = objective_asymmetric(ratios, *args)
+        aggregate = objective_asymmetric(ratios, *args, aggregate=True)
 
-        self.assertAlmostEqual(pointwise.item(), cumulative.item(), places=7)
+        self.assertAlmostEqual(per_token.item(), aggregate.item(), places=7)
 
-    def test_rejects_unknown_lift_reduction(self):
-        with self.assertRaisesRegex(ValueError, "unknown asymmetric lift reduction"):
-            objective_asymmetric(
-                torch.zeros(1, 1),
-                -torch.ones(1, 1),
-                torch.ones(1, 1),
-                torch.ones(1),
-                torch.ones(1),
-                lift_reduction="prefix",
-            )
 
-class CalibrationBiasOptimizerTest(unittest.TestCase):
-    def test_bias_grad_accumulates_within_step_and_clears_after_optimizer_step(self):
-        """The external bias is not reached by Trainer's `model.zero_grad()`."""
-        from transformers import Trainer
+class SampledLogpAnchorTest(unittest.TestCase):
+    def test_masks_padding_and_averages_sampled_token_drift(self):
+        current = torch.tensor([[-0.2, 0.4, 99.0]], requires_grad=True)
+        initial = torch.tensor([[-0.4, 0.1, -10.0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0]])
 
-        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+        loss = sampled_logp_anchor(current, initial, mask)
+        self.assertAlmostEqual(loss.item(), (0.2 ** 2 + 0.3 ** 2) / 2, places=7)
+        (grad,) = torch.autograd.grad(loss, current)
+        self.assertEqual(grad[0, 2].item(), 0.0)
 
-        policy_parameter = torch.nn.Parameter(torch.tensor(0.0))
-        base_optimizer = torch.optim.SGD([policy_parameter], lr=0.1)
-
-        # Exercise SelfTeacherTrainer.create_optimizer directly without constructing a full
-        # Accelerator/model stack. Patching only the parent implementation keeps this test focused
-        # on the extra parameter group and its post-step lifecycle.
-        trainer = object.__new__(SelfTeacherTrainer)
-        trainer.calibration_bias = torch.nn.Parameter(torch.tensor(0.0))
-        trainer.bias_learning_rate = 0.1
-        with mock.patch.object(Trainer, "create_optimizer", return_value=base_optimizer):
-            optimizer = SelfTeacherTrainer.create_optimizer(trainer)
-
-        (2.0 * trainer.calibration_bias).backward()
-        (3.0 * trainer.calibration_bias).backward()
-        self.assertAlmostEqual(trainer.calibration_bias.grad.item(), 5.0)
-
-        optimizer.step()
-        self.assertIsNone(trainer.calibration_bias.grad)
-
-        # A new optimizer step starts from a clean gradient rather than inheriting the previous 5.
-        (4.0 * trainer.calibration_bias).backward()
-        self.assertAlmostEqual(trainer.calibration_bias.grad.item(), 4.0)
+    def test_rejects_misaligned_inputs(self):
+        with self.assertRaisesRegex(ValueError, "identical shapes"):
+            sampled_logp_anchor(torch.zeros(1, 2), torch.zeros(1, 1), torch.ones(1, 2))
 
 
 class TrainerLoggingTest(unittest.TestCase):
@@ -552,7 +416,6 @@ class TrainerLoggingTest(unittest.TestCase):
         trainer._train_ratio_sum = None
         trainer._train_ratio_count = None
         trainer.accelerator = types.SimpleNamespace(reduce=lambda value, reduction: value)
-        trainer.calibration_bias = torch.nn.Parameter(torch.tensor(0.7))
         return trainer
 
     def test_ratio_mean_accumulates_by_trajectory_and_resets_at_log(self):
@@ -570,7 +433,6 @@ class TrainerLoggingTest(unittest.TestCase):
 
         metrics = SelfTeacherTrainer._pop_train_ratio_metrics(trainer)
         self.assertAlmostEqual(metrics["st/ratio_mean"], 3.0, places=6)
-        self.assertAlmostEqual(metrics["st/calibration_bias"], 0.7, places=6)
         self.assertIsNone(trainer._train_ratio_sum)
         self.assertIsNone(trainer._train_ratio_count)
         self.assertEqual(SelfTeacherTrainer._pop_train_ratio_metrics(trainer), {})
@@ -939,7 +801,7 @@ class StageThreeResumeTest(unittest.TestCase):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 
         args = self.make_args()
-        meta = build_run_meta(args, {"teacher_version": "logratio_v1", "objective": "pointwise"}, 100)
+        meta = build_run_meta(args, {"teacher_version": TEACHER_VERSION, "objective": "asymmetric"}, 100)
         legacy = {k: v for k, v in meta.items() if k != "teacher_version"}
         with tempfile.TemporaryDirectory() as tmp:
             ckpt = self.make_checkpoint(tmp, legacy)
@@ -950,18 +812,18 @@ class StageThreeResumeTest(unittest.TestCase):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 
         args = self.make_args()
-        pointwise = build_run_meta(args, {"teacher_version": "logratio_v1", "objective": "pointwise"}, 100)
-        endpoint = build_run_meta(args, {"teacher_version": "logratio_v1", "objective": "endpoint"}, 100)
+        per_token = build_run_meta(args, {"teacher_version": TEACHER_VERSION, "objective": "asymmetric"}, 100)
+        aggregate = build_run_meta(args, {"teacher_version": TEACHER_VERSION, "objective": "asymmetric_aggregate"}, 100)
         with tempfile.TemporaryDirectory() as tmp:
-            ckpt = self.make_checkpoint(tmp, pointwise)
+            ckpt = self.make_checkpoint(tmp, per_token)
             with self.assertRaisesRegex(ValueError, "teacher_objective"):
-                validate_resume(ckpt, endpoint, strict_keys=("teacher_version",))
+                validate_resume(ckpt, aggregate, strict_keys=("teacher_version",))
 
     def test_matching_run_resumes(self):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 
         args = self.make_args()
-        meta = build_run_meta(args, {"teacher_version": "logratio_v1", "objective": "pointwise"}, 100)
+        meta = build_run_meta(args, {"teacher_version": TEACHER_VERSION, "objective": "asymmetric"}, 100)
         with tempfile.TemporaryDirectory() as tmp:
             ckpt = self.make_checkpoint(tmp, dict(meta))
             validate_resume(ckpt, meta, strict_keys=("teacher_version",))
@@ -970,14 +832,17 @@ class StageThreeResumeTest(unittest.TestCase):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 
         meta = build_run_meta(
-            self.make_args(), {"teacher_version": "logratio_v1", "objective": "pointwise"}, 100
+            self.make_args(), {"teacher_version": TEACHER_VERSION, "objective": "asymmetric"}, 100
         )
         self.assertEqual(meta["per_device_train_batch_size"], 1)
 
     def test_none_mode_records_the_concatenating_template(self):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 
-        meta = build_run_meta(self.make_args("none"), {"teacher_version": "logratio_v1"}, 100)
+        meta = build_run_meta(
+            self.make_args("none"),
+            {"teacher_version": TEACHER_VERSION, "objective": "asymmetric"}, 100,
+        )
         self.assertEqual(meta["teacher_prompt_template"], "{prompt}{privileged_context}")
 
 

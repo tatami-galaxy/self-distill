@@ -29,11 +29,9 @@ un-informed student, so `sigmoid(S_t)` reads as "how teacher-like is this prefix
 onto the outcome is the direct statement of the goal: TEACHER-LIKENESS SHOULD MEAN
 SUCCESS-LIKENESS, NOT PI-CONFORMITY.
 
-Four CLI objectives, differing in how hard they constrain the teacher (see
-`objective_pointwise`, `objective_endpoint`, and `objective_asymmetric`). The asymmetric family
-has pointwise and cumulative lift reductions. Regressing every prefix `S_t` -- the full
-process-reward variant -- is deliberately not implemented yet; it is one extra target in
-`objective_endpoint`.
+Two CLI objectives use the same conservative asymmetric update. `asymmetric` regresses each
+targeted token separately, while `asymmetric_aggregate` constrains only the targeted tokens'
+mean residual and therefore allows compensating changes within a trace.
 
 THE STUDENT IS FROZEN throughout stages 1-2, which is what lets stage 1 cache `student_logps`
 and stage 2 hold only the teacher in memory. That shortcut encodes the probe's premise and goes
@@ -62,6 +60,8 @@ from utils import (
 # PI_* templates, so "hint" means the same string in every arm of the study.
 PI_MODES = ("hint", "answer", "full", "none")
 
+ASYMMETRIC_OBJECTIVES = ("asymmetric", "asymmetric_aggregate")
+
 # Every local bf16 scoring/training forward over ragged sequences is one sequence wide. Changing
 # the padded tensor shape can change finite-precision kernel selection/operation order; the
 # resulting logit shifts were locally large enough to contaminate the teacher/student ratio.
@@ -71,10 +71,7 @@ MODEL_FORWARD_BATCH_SIZE = 1
 # when a change alters what the trained teacher's weights MEAN (the objective family, the ratio
 # definition, the prompt convention) -- not for ordinary hyperparameters, which are recorded
 # individually. See utils.validate_resume's `strict_keys` for why absence must be disqualifying.
-TEACHER_VERSION = "logratio_v1"
-
-LENGTH_NORMS = ("mean", "sqrt", "none")
-ASYMMETRIC_LIFT_REDUCTIONS = ("pointwise", "cumulative")
+TEACHER_VERSION = "asymmetric_logratio_v2"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +316,7 @@ def _selective_logps_fp32(
     independent roundings put a noise floor of a few hundredths of a nat on rho. MEASURED on
     Qwen3-1.7B: the `--pi-mode none` control, where teacher and student are the same weights on
     the same tokens and rho is therefore ZERO analytically, had within-trace dispersion of 0.041
-    through the bf16 path -- a noise floor half the size of the default --tau of 0.1. Returning
+    through the bf16 path -- large enough to contaminate the lift mask near zero. Returning
     float32 halved it to 0.023; the remainder disappeared when the two inputs were evaluated as
     unpadded batch-one tensors (see `per_token_logps`). These numbers are local measurements, not
     general error bounds for Qwen or bfloat16.
@@ -489,104 +486,6 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
 
 
-def objective_pointwise(
-    ratios: torch.Tensor,
-    mask: torch.Tensor,
-    reward: torch.Tensor,
-    tau: float = 0.1,
-    loss: str = "squared",
-    beta: float = 1.0,
-) -> torch.Tensor:
-    """(c) Regress each token's rho_t towards the outcome.
-
-    With the squared form its gradient w.r.t. the teacher is
-
-        sum_t 2*(rho_t - target) * grad log pi_phi(y_t | x, c, y_<t)
-
-    i.e. WEIGHTED SFT of the teacher on the student's own trace, with per-token weight
-    (target - rho_t).
-
-    `squared` regresses the RAW ratio onto a bounded target +/- tau (nats per token). Two
-    deliberate choices:
-
-      * NOT squared-error-on-sigmoid. A sigmoid link contributes a sigma' factor that VANISHES in
-        the tail, so the most-penalized tokens -- the ones being targeted -- would receive the
-        LEAST pull. That inverts the mechanism. `tests/test_self_teacher.py` pins the ordering.
-      * A FINITE target. rho_t -> +/- tau is a reachable fixed point, so the degenerate limit of
-        over-training is "REINFORCE with reward tau*(2R-1)" rather than a blow-up. The flatness
-        is still real, which is what `ratio_dispersion_retained` detects -- but it is bounded.
-
-    `logistic` is the unbounded alternative: BCE(sigmoid(beta*rho_t), R), whose gradient saturates
-    at a constant beta instead of at zero, so it keeps pulling the tail tokens indefinitely. Use
-    it when the bounded target's fixed point is reached before the ratio becomes informative.
-    """
-    reward = reward.unsqueeze(1)  # (B, 1) -> broadcast over tokens
-    if loss == "squared":
-        # 2R - 1 makes the target symmetric around the meaningful baseline \(\rho=0\),
-        # while \(\tau\) limits how far the teacher moves away from the student
-        target = tau * (2.0 * reward - 1.0)
-        return _masked_mean((ratios - target) ** 2, mask)
-    if loss == "logistic":
-        per_token = F.binary_cross_entropy_with_logits(
-            beta * ratios, reward.expand_as(ratios), reduction="none"
-        )
-        return _masked_mean(per_token, mask)
-    raise ValueError(f"unknown pointwise loss {loss!r}; expected 'squared' or 'logistic'")
-
-
-def sequence_logit(
-    ratios: torch.Tensor,
-    mask: torch.Tensor,
-    beta: float,
-    bias: torch.Tensor,
-    length_norm: str = "mean",
-) -> torch.Tensor:
-    """beta * S_T / N + b -- the log-odds that a trace succeeds, from its total log-ratio.
-
-    Length normalization is not cosmetic. S_T accumulates over completions spanning ~2.5k-8.2k
-    tokens here, so with N=1 a fixed beta saturates the sigmoid on long traces and their gradient
-    vanishes -- the objective would silently train on short traces only. `mean` (N=L) makes beta
-    interpretable as "nats per token" and removes the length dependence entirely; `sqrt` is the
-    middle ground if per-token averaging washes out a genuinely accumulating signal.
-
-    `bias` is VPD's delta: a single learnable scalar that absorbs the outcome BASE RATE, so the
-    ratio does not have to encode "this policy solves ~60% of problems" and the degenerate
-    solution of shifting every rho_t by a constant is unavailable.
-    """
-    totals = (ratios * mask).sum(dim=1)  # (B,)
-    lengths = mask.sum(dim=1).clamp(min=1.0)
-    if length_norm == "mean":
-        totals = totals / lengths
-    elif length_norm == "sqrt":
-        totals = totals / lengths.sqrt()
-    elif length_norm != "none":
-        raise ValueError(f"unknown length_norm {length_norm!r}; expected one of {LENGTH_NORMS}")
-    return beta * totals + bias
-
-
-def objective_endpoint(
-    ratios: torch.Tensor,
-    mask: torch.Tensor,
-    reward: torch.Tensor,
-    beta: float,
-    bias: torch.Tensor,
-    length_norm: str = "mean",
-) -> torch.Tensor:
-    """(a) Regress only the TRACE TOTAL onto the outcome.
-
-    The minimal intervention: one constraint per trace instead of one per token. It says "the
-    teacher's overall preference for this trace should track whether it succeeded" and leaves the
-    per-token allocation completely free -- so a 5000-token correct trace can be explained by ten
-    tokens at +0.3 and 4990 at 0. That freedom to be SPARSE is what preserves credit assignment,
-    and it is why this variant cannot degenerate into a flat advantage the way (c) can.
-
-    Its gradient weights every token in a trace equally, so it is a gentler and less targeted
-    corrective than (c) -- the two are complements, not rivals, which is why the probe runs both.
-    """
-    return F.binary_cross_entropy_with_logits(
-        sequence_logit(ratios, mask, beta, bias, length_norm), reward
-    )
-
 
 def asymmetric_lift_mask(
     initial_ratios: torch.Tensor,
@@ -624,7 +523,7 @@ def objective_asymmetric(
     margin: float = 0.0,
     lift_alpha: float = 1.0,
     anchor_weight: float = 1.0,
-    lift_reduction: str = "pointwise",
+    aggregate: bool = False,
 ) -> torch.Tensor:
     """Lift only successful tokens the initial PI teacher penalized; preserve everything else.
 
@@ -636,11 +535,9 @@ def objective_asymmetric(
     equal across eligible questions. It must NOT be normalized inside the physical batch: model
     forwards are one row wide, where such normalization would cancel the balancing entirely.
 
-    With `lift_reduction="pointwise"`, every targeted token is regressed separately. With
-    `lift_reduction="cumulative"`, only the terminal masked aggregate is constrained: opposing
-    residuals may cancel, leaving the model free to allocate the required lift sparsely. The
-    aggregate is normalized by the number of lift tokens before squaring so rows with large masks
-    do not dominate merely because their residual sum has a larger scale.
+    By default, every targeted token is regressed separately. With `aggregate=True`, only the
+    targeted tokens' mean residual is constrained: opposing residuals may cancel, leaving the
+    model free to allocate the required lift sparsely.
 
     The anchor is the exact complement of the fixed lift mask over real completion tokens. Thus a
     token is never simultaneously pulled toward the lift target and back toward initialization.
@@ -649,11 +546,6 @@ def objective_asymmetric(
         raise ValueError("lift_alpha must be between 0 and 1")
     if anchor_weight < 0.0:
         raise ValueError("anchor_weight must be non-negative")
-    if lift_reduction not in ASYMMETRIC_LIFT_REDUCTIONS:
-        raise ValueError(
-            f"unknown asymmetric lift reduction {lift_reduction!r}; "
-            f"expected one of {ASYMMETRIC_LIFT_REDUCTIONS}"
-        )
     if ratios.shape != initial_ratios.shape or ratios.shape != mask.shape:
         raise ValueError("ratios, initial_ratios, and mask must have identical shapes")
     if lift_weight.numel() != ratios.size(0):
@@ -666,17 +558,31 @@ def objective_asymmetric(
 
     lift_target = initial_ratios + lift_alpha * (margin - initial_ratios)
     lift_residual = ratios - lift_target
-    if lift_reduction == "pointwise":
-        lift_per_row = _masked_row_mean(lift_residual ** 2, lift_mask)
-    else:
-        # Constraining every masked prefix would identify each increment separately and collapse
-        # back towards the pointwise objective; this constrains only the terminal aggregate.
+    if aggregate:
         lift_per_row = _masked_row_mean(lift_residual, lift_mask) ** 2
+    else:
+        lift_per_row = _masked_row_mean(lift_residual ** 2, lift_mask)
     lift_loss = (lift_weight.view(-1).to(lift_per_row) * lift_per_row).mean()
 
     anchor_per_row = _masked_row_mean((ratios - initial_ratios) ** 2, anchor_mask)
     anchor_loss = anchor_per_row.mean()
     return lift_loss + anchor_weight * anchor_loss
+
+
+def sampled_logp_anchor(
+    current_logps: torch.Tensor,
+    initial_logps: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mean squared sampled-token log-probability drift from the initial teacher.
+
+    Unlike the asymmetric objective's complement anchor, this optional global regularizer also
+    acts on lift tokens. Its coefficient therefore directly trades off lift against preserving
+    the teacher as a stage-3 imitation target.
+    """
+    if current_logps.shape != initial_logps.shape or current_logps.shape != mask.shape:
+        raise ValueError("current_logps, initial_logps, and mask must have identical shapes")
+    return _masked_mean((current_logps - initial_logps.detach()) ** 2, mask)
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +594,6 @@ def calibration_metrics(
     ratios: torch.Tensor,
     mask: torch.Tensor,
     reward: torch.Tensor,
-    length_norm: str = "mean",
     question_ids: list[str] | None = None,
     crossfit_folds: int = 5,
     initial_ratios: torch.Tensor | None = None,
@@ -696,7 +601,7 @@ def calibration_metrics(
     """Decision dashboard for a trained self-teacher.
 
     At prefix t the score is `S_t / N_t`, where S_t is the running sum of rho and N_t is the
-    configured prefix normalizer. Outcome Briers use QUESTION-GROUPED OUT-OF-FOLD Platt scaling,
+    prefix length. Outcome Briers use QUESTION-GROUPED OUT-OF-FOLD Platt scaling,
     which absorbs the raw score's scale and offset. The slope is constrained non-negative because
     a sign flip would conceal a ratio that trains SDFT in the wrong direction.
 
@@ -783,13 +688,7 @@ def calibration_metrics(
     positions = torch.arange(
         1, mask.size(1) + 1, device=mask.device, dtype=torch.float32
     ).unsqueeze(0)
-    if length_norm == "mean":
-        normalizer = positions
-    elif length_norm == "sqrt":
-        normalizer = positions.sqrt()
-    else:
-        normalizer = torch.ones_like(positions)
-    scores = cumulative / normalizer
+    scores = cumulative / positions
 
     if question_ids is not None and len(question_ids) != ratios.size(0):
         raise ValueError(
@@ -937,8 +836,8 @@ def rank_auc(scores: torch.Tensor, reward: torch.Tensor) -> float | None:
     this metric most needs to identify -- reads 0.0 rather than 0.5, i.e. looks perfectly
     ANTI-predictive instead of uninformative.
 
-    Scale-free and link-free by construction, so unlike the Brier scores it is unaffected by
-    `--beta`; it is the cheapest honest answer to "does the ratio order traces at all".
+    Scale-free and link-free by construction; it is the cheapest honest answer to "does the
+    ratio order traces at all".
     """
     scores = scores.detach().flatten()
     reward = reward.detach().flatten()

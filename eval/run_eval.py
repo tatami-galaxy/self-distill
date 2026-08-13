@@ -83,9 +83,9 @@ VARIANT_REQUIRED = {
     "sdft": "the privileged context, e.g. --variant hint",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
     "ppo_pi": "the critic's privileged context, e.g. --variant hint",
-    # For sdft_tt the variable is the pair (PI, E-step objective): the same PI trained under the
-    # pointwise and endpoint objectives yields two different teachers and two different students.
-    "sdft_tt": "the teacher's PI and objective, e.g. --variant hint-pointwise",
+    # For sdft_tt the variable is the pair (PI, E-step objective): the per-token and aggregate
+    # asymmetric variants yield different teachers and therefore different students.
+    "sdft_tt": "the teacher's PI and objective, e.g. --variant hint-asymmetric",
 }
 
 # What a checkpoint directory is called: `checkpoint-<N>`, TRL's end-of-training `final/`, or

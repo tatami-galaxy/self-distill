@@ -24,10 +24,8 @@
 - Train self-teacher in SDFT (analogous to ppo value-pretraining?)
   - [ ] SDFT with negative advantage clipped at high-entropy positions (or in general)
   - [ ] Train self-teacher with rollout outcome signal
-    - [x] Pointwise
-    - [x] Endpoint
     - [x] Asymmetric
-    - [x] Asymmetric cumulative
+    - [x] Asymmetric aggregate
     - [ ] Hyperparameter sweep
   - [ ] Train self-teacher for hint generation
     - [ ] Objective from self-teacher behavior (example : entropy)

@@ -21,10 +21,10 @@ PHYSICAL MODEL BATCH SIZE IS FIXED TO 1. TRL buffers generated samples and split
 per-device microbatches before the teacher/student forwards, so --num-generations remains an
 independent experiment knob. Use gradient accumulation for a larger effective training batch.
 
-# stage 3 against a hint-PI teacher trained with the pointwise objective
+# stage 3 against a hint-PI teacher trained with the per-token asymmetric objective
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.sdft_with_teacher \
     --model Qwen/Qwen3-4B --dataset deepmath --pi-mode hint \
-    --teacher-path /mnt/data/ujan/self-distill/outputs/self_teacher/Qwen3-4B/deepmath_hint_pointwise/final
+    --teacher-path /mnt/data/ujan/self-distill/outputs/self_teacher/Qwen3-4B/deepmath_hint_asymmetric/final
 
 # smoke
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.sdft_with_teacher \
@@ -42,6 +42,7 @@ from transformers import AutoModelForCausalLM
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from train.opsd.train_self_teacher.lib import (
+    ASYMMETRIC_OBJECTIVES,
     MODEL_FORWARD_BATCH_SIZE,
     PI_MODES,
     TEACHER_VERSION,
@@ -132,19 +133,17 @@ def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
         # Teacher-state identity, carried over from the stage-2 run. Strict key: a checkpoint that
         # never recorded it was trained against a differently-defined teacher, and its student
         # weights are mid-trajectory towards a different target.
-        "teacher_version": teacher_meta.get("teacher_version", TEACHER_VERSION),
+        "teacher_version": teacher_meta["teacher_version"],
         "teacher_path": args.teacher_path,
         # Which teacher, trained how. The objective and PI are the variables under study, so they
         # belong in this run's provenance even though they were chosen one stage earlier.
-        "teacher_objective": teacher_meta.get("objective"),
+        "teacher_objective": teacher_meta["objective"],
         "teacher_pi_mode": teacher_meta.get("pi_mode"),
-        "teacher_tau": teacher_meta.get("tau"),
-        "teacher_beta": teacher_meta.get("beta"),
+        "teacher_sampled_logp_anchor": teacher_meta.get("sampled_logp_anchor"),
         "teacher_asym_margin": teacher_meta.get("asym_margin"),
         "teacher_asym_lift_alpha": teacher_meta.get("asym_lift_alpha"),
         "teacher_asym_anchor_weight": teacher_meta.get("asym_anchor_weight"),
         "teacher_asym_weighting": teacher_meta.get("asym_weighting"),
-        "teacher_asym_lift_reduction": teacher_meta.get("asym_lift_reduction"),
         "teacher_prompt_template": teacher_prompt_template(args.pi_mode),
         "model": args.model,
         "pi_mode": args.pi_mode,
@@ -241,6 +240,16 @@ def main():
         p.error("--distillation-mode sampled_token requires --distillation-alpha 1.0 (reverse KL).")
 
     teacher_meta = load_teacher_meta(args.teacher_path)
+    if teacher_meta.get("teacher_version") != TEACHER_VERSION:
+        p.error(
+            f"Teacher version {teacher_meta.get('teacher_version')!r} is incompatible with "
+            f"the current {TEACHER_VERSION!r} objective semantics. Retrain stage 2."
+        )
+    if teacher_meta.get("objective") not in ASYMMETRIC_OBJECTIVES:
+        p.error(
+            f"Teacher objective {teacher_meta.get('objective')!r} is unsupported; expected one "
+            f"of {ASYMMETRIC_OBJECTIVES}. Retrain stage 2 with a current asymmetric objective."
+        )
     # The teacher was calibrated conditioned on one privileged context and stitched with one
     # template. Feeding it either of the others at M-step time puts it out of distribution in a
     # way nothing downstream would report.
@@ -250,29 +259,30 @@ def main():
             f"{teacher_meta.get('pi_mode')!r} (from {args.teacher_path}). The teacher's ratio is "
             "only calibrated under the context it was trained on."
         )
-    if teacher_meta.get("model") not in (None, args.model):
+    if teacher_meta.get("model") != args.model:
         p.error(
             f"--model {args.model!r} does not match the model the teacher was initialised from "
             f"({teacher_meta.get('model')!r}). The ratio is relative to THAT student."
         )
     expected_template = teacher_prompt_template(args.pi_mode)
-    if teacher_meta.get("teacher_prompt_template", expected_template) != expected_template:
+    if teacher_meta.get("teacher_prompt_template") != expected_template:
         p.error(
             "The teacher was trained with teacher_prompt_template "
-            f"{teacher_meta['teacher_prompt_template']!r} but this run would use "
+            f"{teacher_meta.get('teacher_prompt_template')!r} but this run would use "
             f"{expected_template!r}. The difference is invisible in the logs and changes the "
             "context the teacher scores under."
         )
 
     model_slug = args.model.rstrip("/").split("/")[-1]
-    teacher_objective = teacher_meta.get("objective") or "unknown"
+    teacher_objective = teacher_meta["objective"]
     output_dir = args.output_dir or os.path.join(
         args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}_{teacher_objective}"
     )
     print(f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  ->  {output_dir}")
     print(f"  teacher: {args.teacher_path}")
-    print(f"    objective={teacher_meta.get('objective')}  tau={teacher_meta.get('tau')}  "
-          f"beta={teacher_meta.get('beta')}  version={teacher_meta.get('teacher_version')}")
+    print(f"    objective={teacher_meta.get('objective')}  "
+          f"sampled_logp_anchor={teacher_meta.get('sampled_logp_anchor')}  "
+          f"version={teacher_meta.get('teacher_version')}")
 
     # `none` has no build path in train_sdft (its ladder is full/answer/hint), so its empty
     # privileged context is attached here. Combined with the concatenating template, the teacher
