@@ -26,7 +26,7 @@
   - [ ] Train self-teacher with rollout outcome signal
     - [x] Asymmetric
     - [x] Asymmetric aggregate
-    - [ ] Max Ent RL?
+    - [ ] Max Ent RL?/
     - [ ] Hyperparameter sweep
   - [ ] Train self-teacher for hint generation
     - [ ] Objective from self-teacher behavior (example : entropy)
