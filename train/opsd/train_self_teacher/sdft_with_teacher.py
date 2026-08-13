@@ -1,6 +1,6 @@
 r"""
 Stage 3 of the trained-self-teacher arm: ordinary SDFT, but the teacher's weights come from
-train/opsd/train_self_teacher/train.py instead of being a frozen copy of the student.
+train/opsd/train_self_teacher/train_logratio_teacher.py instead of being a frozen copy of the student.
 
 Everything about the student's objective is unchanged from train/opsd/train_sdft.py -- same
 SDFTTrainer, same dataset builder, same reverse-KL. The single difference is WHICH teacher scores
@@ -177,7 +177,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-4B",
                    help="Student to train. MUST be the model the teacher was initialised from.")
     p.add_argument("--teacher-path", required=True,
-                   help="A 'final' or 'checkpoint-<N>' dir from train/opsd/train_self_teacher/train.py. Its "
+                   help="A 'final' or 'checkpoint-<N>' dir from train/opsd/train_self_teacher/train_logratio_teacher.py. Its "
                         "run root must carry run_meta.json (the teacher's provenance).")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()))
     p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/sdft_tt",

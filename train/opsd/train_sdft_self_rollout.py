@@ -24,7 +24,7 @@ silently ignored (full rules in utils.validate_resume).
 # of the completion (one as PI, one as the scored target), so keep the 8K completion
 # and give its teacher prompt 16K. The combined forward remains below a 32K context.
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft_self_rollout \
-    --model Qwen/Qwen3-4B --dataset deepmath \
+    --model Qwen/Qwen3-1.7B --dataset deepmath \
     --max-prompt-length 16384 --max-completion-length 8192
 
 # multiple GPUs: data-parallel via accelerate, one process per GPU. In colocate

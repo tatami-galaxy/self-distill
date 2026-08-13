@@ -1,13 +1,17 @@
-"""
-Stage 2 of the trained-self-teacher arm: train a PI-conditioned teacher with a conservative
-asymmetric update to its teacher:student sampled-token log ratio.
+r"""
+Stage 2 of the log-ratio self-teacher arm: train a PI-conditioned language model with a
+conservative asymmetric update to its teacher:student sampled-token log ratio.
 
 It reads frozen-student rollouts from stage 1 and trains a copy of the student so
 
     rho_t = log pi_phi(y_t | x, c, y_<t) - log pi_theta(y_t | x, y_<t)
 
-becomes more favorable only on successful tokens the initial teacher penalized. Both supported
-objectives preserve every other completion token at its initial ratio:
+This trainer updates the teacher language model itself: its signal is coupled to normalized
+next-token probabilities and is not a freely parameterized advantage or value. A future
+head-based self-teacher trainer can reuse gen_rollouts.py while learning that separate signal.
+
+The log ratio becomes more favorable only on successful tokens the initial teacher penalized.
+Both supported objectives preserve every other completion token at its initial ratio:
 
   --objective asymmetric           regress each targeted token toward its finite lift target.
   --objective asymmetric_aggregate constrain the targeted tokens' mean residual, allowing
@@ -23,7 +27,7 @@ penalized successful traces, drift on failures, retained ratio dispersion, and c
 
 Example:
 
-    CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train \
+    CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.train_logratio_teacher \
         --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
         --objective asymmetric_aggregate --sampled-logp-anchor 0.1
 """
@@ -64,7 +68,7 @@ QUESTION_SPLIT_VERSION = "question_hash_v1"
 ASYMMETRIC_WEIGHTING_VERSION = "eligible_success_question_equal_v1"
 
 
-class SelfTeacherTrainer(Trainer):
+class LogRatioTeacherTrainer(Trainer):
     """HF Trainer for the conservative asymmetric teacher:student log-ratio update."""
 
     def __init__(self, *args, objective, sampled_logp_anchor_weight, asym_margin,
@@ -89,7 +93,7 @@ class SelfTeacherTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
-            raise ValueError("SelfTeacherTrainer does not support returning outputs")
+            raise ValueError("LogRatioTeacherTrainer does not support returning outputs")
 
         logps = teacher_token_logps(model, inputs)
         ratios = log_ratio(logps, inputs)
@@ -396,7 +400,7 @@ def build_run_meta(
     num_diag_questions: int = 0,
 ) -> dict:
     return {
-        "method": "self_teacher_estep",
+        "method": "logratio_teacher_estep",
         # Teacher-state identity. Changing the objective family or the ratio definition changes
         # what these weights MEAN, so an older checkpoint is not resumable into a newer one.
         # Passed to validate_resume's strict_keys, which is what makes a checkpoint that never
@@ -585,9 +589,6 @@ def main():
         rollouts, args.pi_mode, tokenizer,
         dataset=args.dataset, max_teacher_prompt_length=args.max_teacher_prompt_length,
     )
-    print(train_dataset)
-    print(train_dataset[0]['has_pi'])
-    quit()
     print(f"Loaded {len(train_dataset)} rollouts  "
           f"(pass rate {sum(train_dataset['reward']) / max(len(train_dataset), 1):.3f})")
     if args.pi_mode != "none" and not all(train_dataset["has_pi"]):
@@ -681,7 +682,7 @@ def main():
             json.dump(meta, f, indent=2)
         print(f"Wrote run metadata -> {os.path.join(output_dir, 'run_meta.json')}")
 
-    trainer = SelfTeacherTrainer(
+    trainer = LogRatioTeacherTrainer(
         model=teacher,
         args=training_args,
         train_dataset=train_dataset,

@@ -1,7 +1,7 @@
 r"""
 Shared machinery for the TRAINED SELF-TEACHER arm: the objectives, the prompt/tensor
 plumbing, and the diagnostics. No CLI -- see train/opsd/train_self_teacher/gen_rollouts.py (stage 1),
-train/opsd/train_self_teacher/train.py (stage 2) and train/opsd/train_self_teacher/sdft_with_teacher.py (stage 3).
+train/opsd/train_self_teacher/train_logratio_teacher.py (stage 2) and train/opsd/train_self_teacher/sdft_with_teacher.py (stage 3).
 
 SDFT's default objective in this repo (`distillation_mode="sampled_token"`, alpha=1.0) is
 mechanically a policy gradient whose per-token advantage is the teacher:student log ratio.

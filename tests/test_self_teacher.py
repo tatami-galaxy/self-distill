@@ -410,37 +410,37 @@ class SampledLogpAnchorTest(unittest.TestCase):
 
 class TrainerLoggingTest(unittest.TestCase):
     def make_trainer(self):
-        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+        from train.opsd.train_self_teacher.train_logratio_teacher import LogRatioTeacherTrainer
 
-        trainer = object.__new__(SelfTeacherTrainer)
+        trainer = object.__new__(LogRatioTeacherTrainer)
         trainer._train_ratio_sum = None
         trainer._train_ratio_count = None
         trainer.accelerator = types.SimpleNamespace(reduce=lambda value, reduction: value)
         return trainer
 
     def test_ratio_mean_accumulates_by_trajectory_and_resets_at_log(self):
-        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+        from train.opsd.train_self_teacher.train_logratio_teacher import LogRatioTeacherTrainer
 
         trainer = self.make_trainer()
-        SelfTeacherTrainer._accumulate_train_ratio(
+        LogRatioTeacherTrainer._accumulate_train_ratio(
             trainer,
             torch.tensor([[1.0, 1.0, 0.0], [3.0, 3.0, 3.0]]),
             torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]]),
         )
-        SelfTeacherTrainer._accumulate_train_ratio(
+        LogRatioTeacherTrainer._accumulate_train_ratio(
             trainer, torch.tensor([[5.0]]), torch.tensor([[1.0]])
         )
 
-        metrics = SelfTeacherTrainer._pop_train_ratio_metrics(trainer)
+        metrics = LogRatioTeacherTrainer._pop_train_ratio_metrics(trainer)
         self.assertAlmostEqual(metrics["st/ratio_mean"], 3.0, places=6)
         self.assertIsNone(trainer._train_ratio_sum)
         self.assertIsNone(trainer._train_ratio_count)
-        self.assertEqual(SelfTeacherTrainer._pop_train_ratio_metrics(trainer), {})
+        self.assertEqual(LogRatioTeacherTrainer._pop_train_ratio_metrics(trainer), {})
 
     def test_diagnostic_log_does_not_consume_parent_logging_trigger(self):
         from transformers import Trainer
 
-        from train.opsd.train_self_teacher.train import SelfTeacherTrainer
+        from train.opsd.train_self_teacher.train_logratio_teacher import LogRatioTeacherTrainer
 
         trainer = self.make_trainer()
         trainer.control = types.SimpleNamespace(should_log=True)
@@ -460,7 +460,7 @@ class TrainerLoggingTest(unittest.TestCase):
             return "parent-result"
 
         with mock.patch.object(Trainer, "_maybe_log_save_evaluate", side_effect=parent):
-            result = SelfTeacherTrainer._maybe_log_save_evaluate(trainer)
+            result = LogRatioTeacherTrainer._maybe_log_save_evaluate(trainer)
 
         self.assertEqual(result, "parent-result")
         self.assertEqual(parent_saw_should_log, [True])
@@ -712,7 +712,7 @@ class QuestionSplitTest(unittest.TestCase):
         ])
 
     def test_split_is_deterministic_disjoint_and_keeps_questions_whole(self):
-        from train.opsd.train_self_teacher.train import split_question_groups
+        from train.opsd.train_self_teacher.train_logratio_teacher import split_question_groups
 
         dataset = self.make_dataset()
         train, validation, held_out = split_question_groups(dataset, 0.2, seed=17)
@@ -729,7 +729,7 @@ class QuestionSplitTest(unittest.TestCase):
         self.assertEqual(validation["question"], validation_again["question"])
 
     def test_diagnostic_cap_never_splits_a_question(self):
-        from train.opsd.train_self_teacher.train import select_complete_diagnostic_questions
+        from train.opsd.train_self_teacher.train_logratio_teacher import select_complete_diagnostic_questions
 
         dataset = self.make_dataset()
         diagnostic, questions = select_complete_diagnostic_questions(dataset, max_rows=10, seed=3)
@@ -748,7 +748,7 @@ class AsymmetricQuestionWeightTest(unittest.TestCase):
         return Dataset.from_list(rows)
 
     def test_each_eligible_question_gets_equal_total_weight(self):
-        from train.opsd.train_self_teacher.train import (
+        from train.opsd.train_self_teacher.train_logratio_teacher import (
             add_asymmetric_lift_weights,
         )
 
@@ -767,7 +767,7 @@ class AsymmetricQuestionWeightTest(unittest.TestCase):
         self.assertAlmostEqual(sum(weights), len(dataset))
 
     def test_no_eligible_question_produces_zero_lift_weights(self):
-        from train.opsd.train_self_teacher.train import add_asymmetric_lift_weights
+        from train.opsd.train_self_teacher.train_logratio_teacher import add_asymmetric_lift_weights
 
         dataset = self.make_dataset(
             [
