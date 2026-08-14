@@ -102,7 +102,7 @@ BEHAVIORS = ("verification", "backtracking", "subgoal_setting", "backward_chaini
 # VALUE_PROMPT_VERSION for the critic's state. Ordinary knobs (chunk size, temperature) are
 # recorded individually and do not need a bump. `rubric_fingerprint` in the run meta catches
 # an edit that forgot to bump this one; the version string is what makes the bump intentional.
-BEHAVIOR_RUBRIC_VERSION = "gandhi_four_behaviors_v1"
+BEHAVIOR_RUBRIC_VERSION = "gandhi_four_behaviors_v2"
 
 
 # ---------------------------------------------------------------------------
@@ -117,29 +117,35 @@ BEHAVIOR_RUBRIC_VERSION = "gandhi_four_behaviors_v1"
 
 BEHAVIOR_DEFINITIONS = {
     "verification": (
-        "Systematic checking of an intermediate or final result against a criterion. The "
-        "segment must both restate a value AND test it -- substituting back into an equation, "
-        "comparing against a target, checking a boundary case, sanity-checking a magnitude or "
-        "sign. Merely recomputing or restating a quantity is NOT verification."
+        "Checking a result against a criterion. Any of these count: substituting a value back "
+        "into an equation, testing a candidate and comparing the outcome against what was "
+        "predicted or required, checking a boundary or special case, confirming a claim by "
+        "unfolding a definition, sanity-checking a magnitude or sign. It counts whether the "
+        "check confirms or refutes. Simply recomputing a quantity, with nothing tested against "
+        "anything, is not verification."
     ),
     "backtracking": (
-        "Explicit abandonment of an approach already taken, and replacement of it. The segment "
-        "must contradict or discard a previous step and move to a different one. Considering "
-        "two approaches side by side before committing is NOT backtracking; noticing an error "
-        "and then continuing down the same path is not either -- the approach must actually "
-        "be dropped."
+        "Abandoning an approach already taken and replacing it. The segment drops a line of "
+        "work and moves to a different one -- because it failed, or because it got unwieldy. "
+        "An option that is floated and never actually pursued has not been abandoned, and "
+        "correcting a slip while continuing down the same path is not a replacement."
     ),
     "subgoal_setting": (
-        "Explicitly proposing an intermediate target on the path to the final answer, thereby "
-        "decomposing the problem. 'First find the discriminant, then...' is subgoal setting. "
-        "'Let me compute 3 * 7' is not -- an ordinary next computation is not a subgoal unless "
-        "it is named as an intermediate objective."
+        "Naming an intermediate target on the way to the final answer, thereby decomposing the "
+        "problem. Both forms count: planning a sequence ('first find the discriminant, "
+        "then...'), and splitting a problem or expression into parts to be handled separately "
+        "('break this into two cases', 'this reduces to computing X'). An ordinary next "
+        "computation ('let me compute 3 * 7') is not a subgoal unless it is named as an "
+        "objective to reach."
     ),
     "backward_chaining": (
-        "Reasoning from the desired outcome back toward what is given: starting at the goal "
-        "state and deriving what would have to be true for it to hold. 'For the sum to be an "
-        "integer, the denominator must divide...' is backward chaining. Ordinary forward "
-        "derivation that happens to mention the goal is not."
+        "Reasoning from the desired outcome back toward what is given: starting from the goal, "
+        "or from a property the answer must have, and deriving what would then have to be "
+        "true. All of these count: 'for the sum to be an integer, the denominator must "
+        "divide...'; 'we want U*AU to be zero-diagonal, so the diagonal entries must "
+        "vanish, hence b = c = 0'; 'x^2 + x + 1 is always positive, so m must be positive'. "
+        "The test is the DIRECTION of inference -- from a requirement to a constraint. Forward "
+        "derivation that merely mentions the goal is not."
     ),
 }
 
@@ -148,8 +154,8 @@ COUNTING_RULES = (
     "verification even if it spans several lines.\n"
     "Count only what occurs inside the CURRENT segment. Text shown as preceding context is "
     "for disambiguation only and must never be counted.\n"
-    "A segment may contain several behaviors, one, or none. Zero is a common and correct "
-    "answer -- do not look for a behavior that is not there.\n"
+    "A segment may contain several behaviors at once. Score each behavior "
+    "independently.\n"
     "Judge the reasoning as written. Do not evaluate whether the mathematics is correct."
 )
 
@@ -489,46 +495,27 @@ _BY_ID: dict[str, RubricExample] = {
             "Score the reasoning move, never the vocabulary."
         ),
     ),
-    # DeepMath-103K row 102186, r1_solution_3 (pounds of veal converted to kilograms).
-    "neg_long_division": RubricExample(
+    # DeepMath-103K row 95889, r1_solution_3 -- the same trace as vf_counterexample.
+    "bc_digit_constraint": RubricExample(
         segment=(
-            "Let me calculate that. Hmm, 2.20 goes into 3 how many times? Let me do the "
-            "division. 2.20 * 1 = 2.20. Subtract that from 3: 3 - 2.20 = 0.80. Then bring down "
-            "a zero (if we're doing decimal division). 2.20 goes into 0.80 zero times, so we "
-            "add a decimal point and a zero."
+            "But then, if a is 7, then d would be 10, which is not a digit. Wait, hold on. If "
+            "a is a digit (0-9), but since abcd is a four-digit number, a must be from 1-9, "
+            "and d must also be from 1-9 (since dcba is a four-digit number). So if a, b, c, d "
+            "are consecutive digits in increasing order, then a can be at most 6, because a+3 "
+            "must be ≤9. So a can be 1-6."
         ),
         counts={
-            "verification": 0,
+            "verification": 1,
             "backtracking": 0,
             "subgoal_setting": 0,
-            "backward_chaining": 0,
+            "backward_chaining": 1,
         },
         note=(
-            "Also zero. Executing a long division is a computation, not a check: no result is "
-            "compared against any criterion. 'Let me do the division' announces the next "
-            "computation, not an intermediate target. (Immediately after this passage the "
-            "trace does abandon long division for a calculator, which WOULD be backtracking -- "
-            "but it is not in this segment, and you score only what is here.)"
-        ),
-    ),
-    # DeepMath-103K row 35046, r1_solution_3 (arc length along a parametric path).
-    "neg_symbolic_simplify": RubricExample(
-        segment=(
-            "Adding those up: 9t + 4 + 5 = 9t + 9. So the magnitude |v(t)| is sqrt(9t + 9). "
-            "Simplify that: sqrt(9(t + 1)) = 3sqrt(t + 1). Oh, that's nice. So the integrand "
-            "simplifies to 3sqrt(t + 1)."
-        ),
-        counts={
-            "verification": 0,
-            "backtracking": 0,
-            "subgoal_setting": 0,
-            "backward_chaining": 0,
-        },
-        note=(
-            "Zero again, and symbolic rather than numeric -- an empty segment is not "
-            "necessarily an arithmetic one. Simplifying an expression forward is none of the "
-            "four behaviors. 'Oh, that's nice' is an affective aside and carries no more "
-            "weight than 'Hmm'."
+            "Backward chaining does not need formal 'for X to hold, Y must' phrasing. Here a "
+            "requirement on the OUTPUT (d has to be a digit) is propagated back to a "
+            "constraint on the INPUT (a is at most 6) -- that is the same move, written "
+            "casually. Testing a=7 and finding it gives a non-digit is also a verification, so "
+            "both are counted."
         ),
     ),
 }
@@ -551,18 +538,17 @@ _BY_ID: dict[str, RubricExample] = {
 EXAMPLE_ORDER: tuple[str, ...] = (
     "vf_counterexample",       # verification, crisp
     "sg_plain_plan",           # subgoal setting, crisp
-    "neg_long_division",       # zero
-    "bt_too_convoluted",       # backtracking, crisp
     "bc_divisibility",         # backward chaining, crisp
+    "bt_too_convoluted",       # backtracking, crisp
+    "neg_busy_arithmetic",     # the one all-zero example
     "vf_definitional",         # verification need not be numeric
-    "neg_symbolic_simplify",   # zero, symbolic
+    "bc_digit_constraint",     # backward chaining written casually, not formally
     "sg_two_acts",             # counting: one act naming four steps, plus a second act
     "bt_invalid_setup",        # co-occurrence: backtracking with the check that caused it
-    "bc_pde_then_forward",     # backward then forward, in one segment, scoring one
     "vf_expand_identity",      # counting: a multi-part check is still one
-    "neg_busy_arithmetic",     # zero, but busy
-    "bc_three_roots",          # co-occurrence: backward chaining with subgoal setting
+    "bc_pde_then_forward",     # backward then forward, in one segment, scoring one
     "sg_split_expression",     # decomposing an expression, not a plan
+    "bc_three_roots",          # co-occurrence: backward chaining with subgoal setting
     "bt_floated_vs_pursued",   # counting: a floated-but-unpursued idea is not backtracking
 )
 
@@ -581,7 +567,7 @@ def render_system_prompt() -> str:
     free after the first segment.
     """
     parts = [
-        "You label excerpts of mathematical reasoning for four cognitive behaviors. For the "
+        "You are to label excerpts of mathematical reasoning for four cognitive behaviors. For the "
         "segment given, report how many times each behavior occurs.",
         "",
         "BEHAVIORS",
@@ -1147,15 +1133,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="The model card recommends 0.7 for non-thinking ")
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--max-output-tokens", type=int, default=None,
-                   help="Defaults to 64, or 640 with --evidence. A truncated response is a "
-                        "parse failure, not a zero.")
+                   help="Defaults to 1024, or 2048 with --evidence. A truncated response is a "
+                        "parse failure, not a zero -- and because one failed segment drops its "
+                        "whole trajectory, a budget set too low costs far more rows than it "
+                        "saves tokens.")
     p.add_argument("--seed", type=int, default=42,
                    help="Bounds run-to-run variation; vLLM's continuous batching is not "
                         "bitwise deterministic across batch compositions.")
     p.add_argument("--bootstrap-samples", type=int, default=10_000,
                    help="Question-clustered bootstrap replicates.")
     # vLLM
-    p.add_argument("--max-model-len", type=int, default=8192,
+    p.add_argument("--max-model-len", type=int, default=16384,
                    help="Rubric + one segment + the response fit far inside this. The model "
                         "supports 262k natively; asking for it here would spend the KV cache "
                         "on context no call uses.")
@@ -1163,6 +1151,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tensor-parallel-size", type=int, default=1,
                    help="27B in bf16 is ~54GB of weights; raise this if it does not fit "
                         "alongside the KV cache.")
+    p.add_argument("--max-num-seqs", type=int, default=256,
+                   help="Concurrent sequences. Qwen3.6-27B is a HYBRID model: its Gated "
+                        "DeltaNet layers need one Mamba cache block per running sequence, and "
+                        "vLLM refuses to capture CUDA graphs when max_num_seqs exceeds the "
+                        "block count it could fit (at 0.9 utilization on one 96GB card that is "
+                        "~570, against vLLM's default of 1024). 256 clears it with room to "
+                        "spare and still batches these short responses well. Not part of the "
+                        "cached run config -- it changes throughput, not the counts.")
     p.add_argument("--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True,
                    help="The rubric is a constant prefix on every call. Leaving this on is "
                         "most of why chunking is affordable.")
@@ -1182,7 +1178,7 @@ def main() -> None:
     if args.samples_per_problem is not None and args.samples_per_problem <= 0:
         args.samples_per_problem = None
     if args.max_output_tokens is None:
-        args.max_output_tokens = 640 if args.evidence else 64
+        args.max_output_tokens = 2048 if args.evidence else 1024
     if not examples_are_filled() and not args.allow_placeholder_examples:
         raise SystemExit(
             f"EXAMPLES still contains the placeholder sentinel ({EXAMPLE_PLACEHOLDER!r}).\n"
@@ -1277,6 +1273,25 @@ def main() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
             enable_prefix_caching=args.enable_prefix_caching,
+            max_num_seqs=args.max_num_seqs,
+            # NOT optional, and it has to be set HERE. A JSON grammar admits arbitrary
+            # whitespace between members, and this model exploits it: it emits the four
+            # counts correctly, then runs newlines and tabs until it hits
+            # --max-output-tokens, so the response is truncated before the closing brace and
+            # fails to parse. Measured at 110 of 138 segments before this was set.
+            #
+            # SamplingParams.structured_outputs also has a `disable_any_whitespace` field and
+            # it is IGNORED: vllm/v1/structured_output/backend_xgrammar.py reads
+            # `vllm_config.structured_outputs_config`, i.e. the engine-level config below,
+            # never the per-request one. Setting it per request looks right, changes nothing,
+            # and shows up as a parse-failure rate rather than an error.
+            # `backend` must be named explicitly: the validator rejects
+            # disable_any_whitespace while the backend is still "auto", even though auto
+            # resolves to xgrammar for this schema anyway.
+            structured_outputs_config={
+                "backend": "xgrammar",
+                "disable_any_whitespace": True,
+            },
             seed=args.seed,
             trust_remote_code=True,
         )

@@ -66,8 +66,51 @@ if os.path.isfile(os.path.join(_cuda_home, "bin", "nvcc")):
     os.environ.setdefault("CUDA_HOME", _cuda_home)
 ```
 
-**site-packages is gitignored, so this file does not survive `rm -rf .venv`.**
-Recreate it along with the pins above.
+**3. `ninja` on `PATH`.** The JIT shells out to `ninja`, which pip installs to
+`.venv/bin/ninja`. Running `.venv/bin/python` directly does **not** put `.venv/bin`
+on `PATH` — only `activate` does — so the build dies with:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+```
+
+`which ninja` returning nothing while `.venv/bin/ninja` exists is the tell. Fix it in
+the same `sitecustomize.py`, for the same reason as `CUDA_HOME`.
+
+**4. A `lib64` the linker can use.** `flashinfer/jit/cpp_ext.py` links with
+`-L$cuda_home/lib64 -L$cuda_home/lib64/stubs -lcudart -lcuda`, but the nvidia wheels
+install to `lib/` (no `lib64`), ship `libcudart.so.13` with no `.so` symlink for
+`-lcudart` to resolve, and ship no driver stub at all:
+
+```
+/usr/bin/ld: cannot find -lcudart
+```
+
+```bash
+cd .venv/lib/python3.13/site-packages/nvidia/cu13
+mkdir -p lib64/stubs
+ln -sf ../lib/libcudart.so.13 lib64/libcudart.so
+ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 lib64/stubs/libcuda.so
+```
+
+Linking `-lcuda` against the real driver rather than a stub is fine here: the result
+is dlopened into a process where `libcuda` is already resident.
+
+**site-packages is gitignored, so neither the file nor these symlinks survive
+`rm -rf .venv`.** Recreate all of it along with the pins above.
+
+### When this actually bites
+
+Items 3 and 4 stayed hidden for a long time because the dense Qwen3 models never
+reach a JIT path in normal use, and `VLLM_USE_FLASHINFER_SAMPLER=0` sidesteps the
+sampler. **Qwen3.6-27B (eval/teacher_behaviors.py) removes that escape hatch**: it is
+a hybrid model whose Gated DeltaNet layers call FlashInfer's `gdn_prefill` kernel on
+the core forward path, so the JIT toolchain has to work end to end. Two further
+symptoms specific to that model:
+
+* `max_num_seqs (1024) exceeds available Mamba cache blocks (572)` at engine init —
+  one Mamba block per running sequence. Pass `--max-num-seqs 256`.
+* ~54GB of bf16 weights, so it wants a GPU to itself at `--gpu-memory-utilization 0.9`.
 
 Verify with a cold FlashInfer cache and no env var set:
 

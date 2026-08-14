@@ -275,15 +275,18 @@ class RubricStructureTest(unittest.TestCase):
                 f"no example demonstrates {name}",
             )
 
-    def test_the_negative_examples_are_not_a_token_minority(self):
-        """Without all-zero instances the classifier finds a behavior in every segment, which
-        flattens precisely the between-arm differences this measurement exists to detect. One
-        is not enough either: an in-context learner reads a base rate off the example set, and
-        an over-firing classifier does its damage on short terse segments -- which is what the
-        `full` and `rollout` arms are made of, so the error would land on the arms whose low
-        rates the study is trying to measure."""
+    def test_there_is_exactly_one_all_zero_example(self):
+        """At least one, because without a negative instance the classifier finds a behavior in
+        every segment. But NOT more than one, which is a measured result rather than a guess.
+
+        v1 carried three all-zero examples plus a counting rule saying "zero can be a correct
+        answer; do not look for a behavior that is not there". Hand-labelling 14 segments the
+        classifier had scored all-zero found that 12 of them carried at least one behavior --
+        and 11 of 11 among full-length segments. The failure mode was ABSTENTION, not
+        over-firing, and the rubric's restraint was causing it. Adding negatives back is the
+        most likely way to reintroduce that, so the count is pinned in both directions."""
         zeros = [e for e in tb.EXAMPLES if all(v == 0 for v in e.counts.values())]
-        self.assertGreaterEqual(len(zeros), 3, "too few all-zero examples")
+        self.assertEqual(len(zeros), 1, "expected exactly one all-zero example")
 
     def test_every_example_scores_every_behavior(self):
         for example in tb.EXAMPLES:
@@ -352,17 +355,15 @@ class ExampleOrderingTest(unittest.TestCase):
         repeats = [(a, b) for a, b in zip(primaries, primaries[1:]) if a == b]
         self.assertEqual(repeats, [], f"adjacent examples share a primary: {repeats}")
 
-    def test_the_negatives_are_spread_and_none_is_last(self):
-        """Clustering the zeros, or burying one at the end where recency discounts it, would
-        push the implied base rate back towards 'something is always here'."""
+    def test_the_negative_is_neither_first_nor_last(self):
+        """Position matters for the one all-zero example. Last is where recency over-weights
+        it, and first is where it anchors -- either would push the classifier back towards the
+        abstention that v1 measured. Sitting mid-sequence, after each behavior has been
+        introduced, it reads as one case among many rather than as the default."""
         primaries = self.primaries()
         positions = [i for i, p in enumerate(primaries) if p == "neg"]
-        self.assertGreaterEqual(len(positions), 3)
-        self.assertNotEqual(primaries[-1], "neg")
-        self.assertTrue(
-            all(b - a > 1 for a, b in zip(positions, positions[1:])),
-            f"negative examples are adjacent: {positions}",
-        )
+        self.assertEqual(len(positions), 1)
+        self.assertNotIn(positions[0], (0, len(primaries) - 1))
 
     def test_every_behavior_is_introduced_before_any_co_occurrence(self):
         """The crisp single-behavior reading of each label should be established before the
