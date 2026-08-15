@@ -717,7 +717,7 @@ def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
 
 
 def score_phase(args: argparse.Namespace, run: dict, step: int) -> None:
-    """Score rollouts under the student and frozen teacher with no PI and the training PI."""
+    """Score one checkpoint's rollouts under the student and all teacher PIs."""
     import torch
     from transformers import AutoTokenizer
 
