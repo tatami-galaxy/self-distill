@@ -41,13 +41,6 @@ decoding constrains the FIRST generated token, so a `<think>` block is unreprese
 defensive strip in `_parse_response` exists only for the case where that is ever relaxed --
 utils/gen_hints.py documents what a thinking model does when it ignores the kwarg.
 
-SAMPLING DEVIATES FROM THE MODEL CARD ON PURPOSE. The card recommends temperature 0.7 /
-top_p 0.8 / presence_penalty 1.5 for non-thinking generation. This is classification, not
-generation: greedy is the reproducible choice and matches Gandhi's temperature 0. A presence
-penalty would additionally distort the digit distribution of a count. Both are overridable.
-vLLM's continuous batching is not bitwise deterministic across batch compositions, so
-`--seed` bounds the variation rather than eliminating it.
-
 WHAT IS REPORTED, and why all three:
   rate_per_1k          the headline. The only figure that separates "shorter" from
                        "behaviourally different" -- see the E/1k column above.
