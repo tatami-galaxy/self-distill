@@ -1,4 +1,4 @@
-"""Self-distillation pass@k on AIME24, best checkpoint per model and PI variant.
+"""Self-distillation pass@k on AIME, best checkpoint per model and PI variant.
 
 For each (model, arm, k) the best value across every checkpoint and run is taken.
 Note that the maximum is chosen independently per k, so pass@1 and pass@16 for the
@@ -6,7 +6,7 @@ same arm may come from different checkpoints; the stdout dump records which.
 This is an optimistic, selection-biased estimate -- there is no held-out split
 behind the checkpoint choice.
 
-Writes results/figures/sdft_passk_bars.png.
+Writes one figure per eval set: results/figures/sdft_passk_bars_<dataset>.png.
 
 Usage:
     .venv/bin/python eval/viz/sdft_passk_bars.py
@@ -39,9 +39,8 @@ def find_repo_root(start: Path | None = None) -> Path:
 ROOT = find_repo_root()
 RESULTS = ROOT / "results"
 FIGURES = RESULTS / "figures"  # generated output; not tracked by git
-OUT = FIGURES / "sdft_passk_bars.png"
 
-EVAL_DATASET = "aime24"
+EVAL_DATASETS = ["aime24", "aime25"]
 TRAIN_DATASET = "deepmath"
 
 # -------------------- style --------------------
@@ -93,20 +92,20 @@ def best_over_checkpoints(paths: list[Path]) -> dict:
     return best
 
 
-def load_arms() -> dict:
+def load_arms(eval_dataset: str) -> dict:
     """table[model][arm][k] -> {value, source}."""
     table: dict = {}
     for model in MODELS:
         table[model] = {}
 
-        base_dir = RESULTS / EVAL_DATASET / "base" / model
+        base_dir = RESULTS / eval_dataset / "base" / model
         base_paths = sorted(base_dir.rglob("summary.json"))
         if not base_paths:
             raise FileNotFoundError(f"No base summaries for {model} under {base_dir}")
         table[model]["base"] = best_over_checkpoints(base_paths)
 
         for arm, _, _ in ARMS[1:]:
-            variant_dir = RESULTS / EVAL_DATASET / TRAIN_DATASET / model / "sdft" / arm
+            variant_dir = RESULTS / eval_dataset / TRAIN_DATASET / model / "sdft" / arm
             if not variant_dir.is_dir():
                 print(f"  ! no sdft/{arm} for {model}; leaving it blank")
                 table[model][arm] = {}
@@ -174,7 +173,7 @@ def draw_panel(ax, model: str, arms: dict) -> None:
     ax.set_title(model, fontproperties=SANS, fontsize=17, fontweight="bold", color=INK, pad=14)
 
 
-def build_figure(table: dict):
+def build_figure(table: dict, eval_dataset: str):
     fig = plt.figure(figsize=(12.0, 11.0), dpi=200, facecolor=CANVAS)
     card = FancyBboxPatch(
         (0.012, 0.018), 0.976, 0.964,
@@ -184,7 +183,7 @@ def build_figure(table: dict):
     fig.patches.append(card)
 
     fig.text(
-        0.5, 0.960, "Self-distillation results on AIME24",
+        0.5, 0.960, f"Self-distillation results on {eval_dataset.upper()}",
         ha="center", va="center", fontproperties=SANS, fontsize=25,
         fontweight="bold", color=INK,
     )
@@ -228,19 +227,23 @@ def build_figure(table: dict):
 if __name__ == "__main__":
     mpl.rcParams["savefig.facecolor"] = CANVAS
     FIGURES.mkdir(parents=True, exist_ok=True)
-    table = load_arms()
-    for model in MODELS:
-        print(f"=== {model}")
-        for arm, label, _ in ARMS:
-            for k in KS:
-                entry = table[model].get(arm, {}).get(k)
-                if entry is None:
-                    print(f"  {label:14s} pass@{k:<2d}    --")
-                    continue
-                print(
-                    f"  {label:14s} pass@{k:<2d} {entry['value'] * 100:5.1f}   "
-                    f"{entry['source']}"
-                )
-    figure = build_figure(table)
-    figure.savefig(OUT, dpi=200, facecolor=CANVAS)
-    print(f"\nWrote {OUT.relative_to(ROOT)}")
+    for eval_dataset in EVAL_DATASETS:
+        print(f"########## {eval_dataset}")
+        table = load_arms(eval_dataset)
+        for model in MODELS:
+            print(f"=== {model}")
+            for arm, label, _ in ARMS:
+                for k in KS:
+                    entry = table[model].get(arm, {}).get(k)
+                    if entry is None:
+                        print(f"  {label:14s} pass@{k:<2d}    --")
+                        continue
+                    print(
+                        f"  {label:14s} pass@{k:<2d} {entry['value'] * 100:5.1f}   "
+                        f"{entry['source']}"
+                    )
+        out = FIGURES / f"sdft_passk_bars_{eval_dataset}.png"
+        figure = build_figure(table, eval_dataset)
+        figure.savefig(out, dpi=200, facecolor=CANVAS)
+        plt.close(figure)
+        print(f"  wrote {out.relative_to(ROOT)}\n")
