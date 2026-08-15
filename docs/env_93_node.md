@@ -103,10 +103,10 @@ is dlopened into a process where `libcuda` is already resident.
 
 Items 3 and 4 stayed hidden for a long time because the dense Qwen3 models never
 reach a JIT path in normal use, and `VLLM_USE_FLASHINFER_SAMPLER=0` sidesteps the
-sampler. **Qwen3.6-27B (eval/teacher_behaviors.py) removes that escape hatch**: it is
-a hybrid model whose Gated DeltaNet layers call FlashInfer's `gdn_prefill` kernel on
+sampler. **The Qwen3.x-27B judges (eval/teacher_behaviors.py) remove that escape hatch**: they
+are hybrid models whose Gated DeltaNet layers call FlashInfer's `gdn_prefill` kernel on
 the core forward path, so the JIT toolchain has to work end to end. Two further
-symptoms specific to that model:
+symptoms specific to those models:
 
 * `max_num_seqs (1024) exceeds available Mamba cache blocks (572)` at engine init —
   one Mamba block per running sequence. Pass `--max-num-seqs 256`.

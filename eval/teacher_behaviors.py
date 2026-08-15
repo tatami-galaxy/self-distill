@@ -35,8 +35,8 @@ remove. Segments are packed to `--chunk-tokens`, ALIGNED TO PARAGRAPH BREAKS (th
 carry 100+ of them, so packing is clean). The rubric is a constant prefix across every call,
 so `enable_prefix_caching` makes the per-call overhead close to the segment itself.
 
-THE GRAMMAR IS WHAT DISABLES THINKING. Qwen3.6-27B reasons by default. `enable_thinking=False`
-is passed via chat_template_kwargs, but the real guarantee is the JSON schema: structured
+THE GRAMMAR IS WHAT DISABLES THINKING. The Qwen3.x-27B judges reason by default.
+`enable_thinking=False` is passed via chat_template_kwargs, but the real guarantee is the JSON schema: structured
 decoding constrains the FIRST generated token, so a `<think>` block is unrepresentable. The
 defensive strip in `_parse_response` exists only for the case where that is ever relaxed --
 utils/gen_hints.py documents what a thinking model does when it ignores the kwarg.
@@ -1096,7 +1096,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-model", default="Qwen/Qwen3-1.7B",
                    help="Whose completions to classify. Names the input and output subdirs; "
                         "this model is never loaded.")
-    p.add_argument("--classifier-model", default="Qwen/Qwen3.6-27B",
+    p.add_argument("--classifier-model", default="Qwen/Qwen3.8-27B",
                    help="The labelling model. Hybrid reasoner: thinking is disabled via "
                         "chat_template_kwargs AND structurally by the JSON grammar.")
     p.add_argument("--completions-root", default="results/teacher_uncertainty_16k",
@@ -1152,7 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="27B in bf16 is ~54GB of weights; raise this if it does not fit "
                         "alongside the KV cache.")
     p.add_argument("--max-num-seqs", type=int, default=256,
-                   help="Concurrent sequences. Qwen3.6-27B is a HYBRID model: its Gated "
+                   help="Concurrent sequences. The Qwen3.x-27B judges are HYBRID models: their Gated "
                         "DeltaNet layers need one Mamba cache block per running sequence, and "
                         "vLLM refuses to capture CUDA graphs when max_num_seqs exceeds the "
                         "block count it could fit (at 0.9 utilization on one 96GB card that is "
