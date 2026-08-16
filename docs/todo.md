@@ -9,6 +9,8 @@
 
 
 ### Research
+
+
 - Leverage ICL ability of LLM value functions
   - [x] value function prompt
   - [ ] value pretraining
@@ -20,18 +22,22 @@
   - [ ] Analyze value function behaviours
   - [ ] Different LR for head and backbone
   - [ ] LoRA
+
+
 - PI conditioned value function
+
 - Train self-teacher in SDFT 
-  - [ ] SDFT with negative advantage clipped at high-entropy positions (or in general)
+
   - [ ] Train self-teacher with outcome signal
     - [x] Asymmetric
     - [x] Asymmetric aggregate
     - [ ] Hyperparameter sweep
+
   - [ ] Train self-teacher for hint generation
     - [ ] Objective from self-teacher behavior (example : entropy)
     - [ ] Objective from teacher-student log ratio
     - [ ] Hint generation with information bottleneck -> pass@k with generated hint -> RL (VAE/Autoencoder)
+
 - Train head on top of self-teacher
-    - [ ] Advantage head
-    - [ ] Value head
-- [x] Analyze PI conditioned self-teacher behavior
+
+  The self-teacher is a language model and we are trying to derive the training signal from its next token probabilities. Its also being instructed to solve the problem given some PI.
