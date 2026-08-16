@@ -450,7 +450,7 @@ def main():
                         "(paper) is the student's top-k; 'sampled_token' is the "
                         "single-sample MC estimator (requires alpha=1.0).")
     p.add_argument("--distillation-alpha", type=float, default=1.0,
-                   help="Divergence interpolation: 1.0 = reverse KL (paper), "
+                   help="Divergence interpolation: 1.0 = reverse KL (paper theory), "
                         "0.0 = forward KL, in between = a JS-like mixture.")
     p.add_argument("--distillation-topk", type=int, default=100,
                    help="Top-k support size for distillation-mode=topk_logits.")
