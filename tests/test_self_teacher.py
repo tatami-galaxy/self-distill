@@ -797,6 +797,77 @@ class StageThreeResumeTest(unittest.TestCase):
         os.makedirs(ckpt)
         return ckpt
 
+    def test_legacy_asymmetric_metadata_is_normalized_without_mutating_source(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import (
+            normalize_teacher_meta,
+            teacher_variant_name,
+        )
+
+        source = {
+            "teacher_version": "logratio_v1",
+            "objective": "asymmetric",
+            "kl_anchor": 0.25,
+        }
+        normalized = normalize_teacher_meta(source)
+
+        self.assertNotIn("objective_raw", source)
+        self.assertEqual(normalized["objective_raw"], "asymmetric")
+        self.assertEqual(normalized["objective"], "asymmetric")
+        self.assertEqual(normalized["sampled_logp_anchor"], 0.25)
+        self.assertEqual(teacher_variant_name(source), "asymmetric_logratio_v1")
+
+    def test_legacy_cumulative_metadata_maps_to_aggregate_and_keeps_raw_name(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import (
+            build_run_meta,
+            normalize_teacher_meta,
+            teacher_variant_name,
+        )
+
+        source = {
+            "teacher_version": "logratio_v1",
+            "objective": "asymmetric_cumulative",
+            "kl_anchor": 0.0,
+        }
+        normalized = normalize_teacher_meta(source)
+        meta = build_run_meta(self.make_args(), source, 100)
+
+        self.assertEqual(normalized["objective_raw"], "asymmetric_cumulative")
+        self.assertEqual(normalized["objective"], "asymmetric_aggregate")
+        self.assertEqual(meta["teacher_objective_raw"], "asymmetric_cumulative")
+        self.assertEqual(meta["teacher_objective"], "asymmetric_aggregate")
+        self.assertEqual(meta["teacher_sampled_logp_anchor"], 0.0)
+        self.assertEqual(
+            teacher_variant_name(source), "asymmetric_cumulative_logratio_v1"
+        )
+
+    def test_removed_legacy_objectives_remain_unsupported(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import normalize_teacher_meta
+
+        for objective in ("pointwise", "endpoint"):
+            with self.subTest(objective=objective):
+                with self.assertRaisesRegex(ValueError, "unsupported for version"):
+                    normalize_teacher_meta(
+                        {"teacher_version": "logratio_v1", "objective": objective}
+                    )
+
+    def test_unknown_teacher_version_remains_unsupported(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import normalize_teacher_meta
+
+        with self.assertRaisesRegex(ValueError, "Teacher version.*unsupported"):
+            normalize_teacher_meta(
+                {"teacher_version": "unknown", "objective": "asymmetric"}
+            )
+
+    def test_current_variant_name_stays_stable(self):
+        from train.opsd.train_self_teacher.sdft_with_teacher import teacher_variant_name
+
+        self.assertEqual(
+            teacher_variant_name(
+                {"teacher_version": TEACHER_VERSION, "objective": "asymmetric_aggregate"}
+            ),
+            "asymmetric_aggregate",
+        )
+
     def test_teacher_version_absence_is_disqualifying(self):
         from train.opsd.train_self_teacher.sdft_with_teacher import build_run_meta
 

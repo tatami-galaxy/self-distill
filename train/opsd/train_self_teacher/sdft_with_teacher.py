@@ -52,6 +52,50 @@ from train.opsd.train_sdft import build_sdft_dataset
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 
+TEACHER_COMPATIBILITY = {
+    "logratio_v1": {
+        "asymmetric": "asymmetric",
+        "asymmetric_cumulative": "asymmetric_aggregate",
+    },
+    TEACHER_VERSION: {objective: objective for objective in ASYMMETRIC_OBJECTIVES},
+}
+
+
+def normalize_teacher_meta(teacher_meta: dict) -> dict:
+    """Validate a known stage-2 schema and add canonical compatibility fields."""
+    version = teacher_meta.get("teacher_version")
+    raw_objective = teacher_meta.get("objective_raw", teacher_meta.get("objective"))
+    objective_map = TEACHER_COMPATIBILITY.get(version)
+    if objective_map is None:
+        raise ValueError(
+            f"Teacher version {version!r} is unsupported; expected one of "
+            f"{tuple(TEACHER_COMPATIBILITY)}."
+        )
+    if raw_objective not in objective_map:
+        raise ValueError(
+            f"Teacher objective {raw_objective!r} is unsupported for version {version!r}; "
+            f"expected one of {tuple(objective_map)}."
+        )
+
+    normalized = dict(teacher_meta)
+    normalized["objective_raw"] = raw_objective
+    normalized["objective"] = objective_map[raw_objective]
+    sampled_logp_anchor = teacher_meta.get("sampled_logp_anchor")
+    if sampled_logp_anchor is None:
+        sampled_logp_anchor = teacher_meta.get("kl_anchor", 0.0)
+    normalized["sampled_logp_anchor"] = sampled_logp_anchor
+    return normalized
+
+
+def teacher_variant_name(teacher_meta: dict) -> str:
+    """Collision-safe default variant name, retaining legacy objective provenance."""
+    teacher_meta = normalize_teacher_meta(teacher_meta)
+    raw_objective = teacher_meta["objective_raw"]
+    if teacher_meta["teacher_version"] == TEACHER_VERSION:
+        return raw_objective
+    return f"{raw_objective}_{teacher_meta['teacher_version']}"
+
+
 def load_teacher_meta(teacher_path: str) -> dict:
     """The stage-2 run_meta.json that sits at the teacher run's root.
 
@@ -64,7 +108,7 @@ def load_teacher_meta(teacher_path: str) -> dict:
     if not os.path.isfile(meta_path):
         raise FileNotFoundError(
             f"No run_meta.json beside the teacher at {meta_path}. --teacher-path should point at "
-            "a 'final' or 'checkpoint-<N>' dir inside a train_self_teacher.py run directory, "
+            "a 'final' or 'checkpoint-<N>' dir inside a train_logratio_teacher.py run directory, "
             "whose root carries the metadata describing how that teacher was trained."
         )
     with open(meta_path) as f:
@@ -128,6 +172,7 @@ class TrainedTeacherSDFTTrainer(SDFTTrainer):
 
 
 def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
+    teacher_meta = normalize_teacher_meta(teacher_meta)
     return {
         "method": "sdft_trained_teacher",
         # Teacher-state identity, carried over from the stage-2 run. Strict key: a checkpoint that
@@ -137,6 +182,7 @@ def build_run_meta(args, teacher_meta: dict, num_train_examples: int) -> dict:
         "teacher_path": args.teacher_path,
         # Which teacher, trained how. The objective and PI are the variables under study, so they
         # belong in this run's provenance even though they were chosen one stage earlier.
+        "teacher_objective_raw": teacher_meta["objective_raw"],
         "teacher_objective": teacher_meta["objective"],
         "teacher_pi_mode": teacher_meta.get("pi_mode"),
         "teacher_sampled_logp_anchor": teacher_meta.get("sampled_logp_anchor"),
@@ -184,7 +230,8 @@ def main():
                    help="Distinct from outputs/sdft: run_meta.json lives at the run root, so "
                         "sharing a root would have the two arms overwrite each other's provenance.")
     p.add_argument("--output-dir", default=None,
-                   help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>_<teacher-objective>")
+                   help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>_<teacher-variant>. "
+                        "Reviewed legacy variants include their original schema version.")
     p.add_argument("--max-samples", type=int, default=None)
     # privileged context -- must match the teacher's
     p.add_argument("--pi-mode", default="hint", choices=list(PI_MODES),
@@ -239,16 +286,14 @@ def main():
     if args.distillation_mode == "sampled_token" and args.distillation_alpha != 1.0:
         p.error("--distillation-mode sampled_token requires --distillation-alpha 1.0 (reverse KL).")
 
-    teacher_meta = load_teacher_meta(args.teacher_path)
-    if teacher_meta.get("teacher_version") != TEACHER_VERSION:
-        p.error(
-            f"Teacher version {teacher_meta.get('teacher_version')!r} is incompatible with "
-            f"the current {TEACHER_VERSION!r} objective semantics. Retrain stage 2."
-        )
-    if teacher_meta.get("objective") not in ASYMMETRIC_OBJECTIVES:
-        p.error(
-            f"Teacher objective {teacher_meta.get('objective')!r} is unsupported; expected one "
-            f"of {ASYMMETRIC_OBJECTIVES}. Retrain stage 2 with a current asymmetric objective."
+    try:
+        teacher_meta = normalize_teacher_meta(load_teacher_meta(args.teacher_path))
+    except ValueError as exc:
+        p.error(str(exc))
+    if teacher_meta["teacher_version"] != TEACHER_VERSION:
+        print(
+            f"  using reviewed legacy teacher schema {teacher_meta['teacher_version']!r}: "
+            f"{teacher_meta['objective_raw']} -> {teacher_meta['objective']}"
         )
     # The teacher was calibrated conditioned on one privileged context and stitched with one
     # template. Feeding it either of the others at M-step time puts it out of distribution in a
@@ -274,13 +319,13 @@ def main():
         )
 
     model_slug = args.model.rstrip("/").split("/")[-1]
-    teacher_objective = teacher_meta["objective"]
+    teacher_variant = teacher_variant_name(teacher_meta)
     output_dir = args.output_dir or os.path.join(
-        args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}_{teacher_objective}"
+        args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}_{teacher_variant}"
     )
     print(f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  ->  {output_dir}")
     print(f"  teacher: {args.teacher_path}")
-    print(f"    objective={teacher_meta.get('objective')}  "
+    print(f"    objective={teacher_meta['objective_raw']} -> {teacher_meta['objective']}  "
           f"sampled_logp_anchor={teacher_meta.get('sampled_logp_anchor')}  "
           f"version={teacher_meta.get('teacher_version')}")
 
