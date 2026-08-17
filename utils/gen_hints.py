@@ -45,7 +45,7 @@ HINT_USER = (
     "In a few lines mention key ideas and concepts "
     "that might be relevant for solving the problem. "
     "Output only the key ideas. "
-    "Be as brief as possible."
+    "Be as brief as possible. "
     "Do NOT state or compute the final answer under any circumstances. "
 )
 
