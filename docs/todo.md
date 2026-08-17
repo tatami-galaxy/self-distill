@@ -1,4 +1,5 @@
 ### Baselines
+
 - [x] train on deepscaleR
 - [ ] base models, sft-ed models, instruct models
 - [ ] beyondaime
@@ -9,7 +10,6 @@
 
 
 ### Research
-
 
 - Leverage ICL ability of LLM value functions
   - [x] value function prompt
@@ -22,7 +22,6 @@
   - [ ] Analyze value function behaviours
   - [ ] Different LR for head and backbone
   - [ ] LoRA
-
 
 - PI conditioned value function
 
