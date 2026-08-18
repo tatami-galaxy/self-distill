@@ -505,4 +505,3 @@ def make_reward_function(config: HintRewardConfig, tokenizer):
         return reward(**kwargs)
 
     return hint_composite_reward
-

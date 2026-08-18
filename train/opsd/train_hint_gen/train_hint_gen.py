@@ -49,7 +49,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default=None)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--mixed-only", action="store_true")
-
     # Composite reward.
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--gamma", type=float, default=1.0)
@@ -74,7 +73,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Clamp the rollout-averaged Monte Carlo KL estimate at zero.",
     )
-
     # GRPO generation and optimization.
     p.add_argument("--num-generations", type=int, default=4)
     p.add_argument("--generator-temperature", type=float, default=1.0)
@@ -85,10 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr-scheduler-type", default="constant")
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--optim", default="adamw_bnb_8bit")
-    p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=4)
-
     # Colocated vLLM. A generation batch is fixed to one complete hint group.
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.2)
@@ -97,10 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--vllm-enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True
     )
-
     # Bookkeeping.
-    p.add_argument("--logging-steps", type=int, default=1)
-    p.add_argument("--save-steps", type=int, default=20)
+    p.add_argument("--logging-steps", type=int, default=5)
+    p.add_argument("--save-steps", type=int, default=10)
     p.add_argument("--log-completions", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--num-completions-to-print", type=int, default=1)
     p.add_argument("--report-to", default="tensorboard")
@@ -187,6 +183,7 @@ def main() -> None:
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, default_name)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # prompt, question, final_answer
     train_dataset = build_hint_grpo_dataset(
         model=args.model,
         dataset=args.dataset,
@@ -286,4 +283,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
