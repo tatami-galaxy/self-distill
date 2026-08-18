@@ -12,6 +12,9 @@ training loop. Traced against the pinned libraries, not from memory:
 **Legend** — `HF` = `transformers.Trainer`, `TRL` = `GRPOTrainer`, **`★`** = ours
 (`PPOTrainer` in `train_ppo.py`, or `PPOValTrainer` in `train_ppo_val.py` where noted).
 
+See [GRPO/PPO loss scaling under gradient accumulation](grpo_ppo_loss_scaling.md) for the
+full explanation of TRL's `compute_loss_func` safeguard and the normalization invariants.
+
 This traces the **verifier-prompt arm**, because it is the one with an extra moving part.
 `train_ppo.py` on its own is the same trace with Phase A's value-prompt construction removed:
 its `_value_inputs` reads the policy's already-tokenized `prompt_ids` straight out of the
@@ -115,9 +118,8 @@ Trainer.train()                                                          trainer
    │        │     │  │     real work only at i == 0; i = 1..15 read the buffer
    │        │     │  ├─ HF  compute_loss() → TRL compute_loss()
    │        │     │  │     └─ ★ PPOTrainer._compute_loss()  ────────  PHASE B
-   │        │     │  ├─ HF  loss = loss / current_gradient_accumulation_steps  1936
-   │        │     │  │        ⚠ extra ÷16 on top of the loss_type's own
-   │        │     │  │          normalization                       (note 2)
+   │        │     │  ├─ HF  gradient-accumulation scaling guard: SKIPPED
+   │        │     │  │        TRL set compute_loss_func non-None     (note 2)
    │        │     │  └─ HF  accelerator.backward(loss)
    │        │     └─ TRL self._step += 1  ; log step_time every 16 calls
    │        │
@@ -331,12 +333,14 @@ if do_sync_step (i == 15):                                              trainer.
    `_generate` (total completion tokens across the generation batch). Same name, different
    object, different scope.
 
-2. **`training_step` divides the returned loss by `current_gradient_accumulation_steps` again**
-   (`trainer.py:1936`), because that `None` makes the condition true. So `dapo`'s token-mean
-   gets an extra ÷16, and `bnpo` gets ÷16 twice. It is a uniform scale on
-   `pg_loss + vf_coef·vf_loss`, so both the pg:vf ratio and the token-uniform weighting are
-   intact — and the GRPO baseline eats the identical factor, so the PPO-vs-GRPO comparison
-   holds. But the *effective* learning rate is 16× smaller than the flag reads.
+2. **TRL disables `Trainer`'s second accumulation division.** `GRPOTrainer.__init__` passes
+   a dummy non-None `compute_loss_func` to `Trainer` specifically to make the scaling guard
+   in `training_step` false. The dummy is never called because GRPO overrides `compute_loss`.
+   Therefore only TRL's own loss-type normalization applies: `dapo` divides by the accumulated
+   batch's global completion-token count, while `bnpo` divides its micro-batch token mean by
+   `current_gradient_accumulation_steps`. `PPOTrainer` inherits that safeguard unchanged,
+   and its value loss mirrors the selected policy normalizer, so neither loss receives an
+   extra division.
 
 3. **The critic's rollout-time forward is unchunked.** TRL calls
    `_get_per_token_logps_and_entropies(..., batch_size=per_device_train_batch_size)`, i.e. 16
