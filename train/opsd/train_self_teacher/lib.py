@@ -56,8 +56,8 @@ from utils import (
 )
 
 
-# Same ladder as train_ppo_pi.PI_MODES, and the wording of each rung comes from train_sdft's
-# PI_* templates, so "hint" means the same string in every arm of the study.
+# The wording of each rung comes from train_sdft's PI_* templates, so "hint" means the same
+# string in every arm of the study.
 PI_MODES = ("hint", "answer", "full", "none")
 
 ASYMMETRIC_OBJECTIVES = ("asymmetric", "asymmetric_aggregate")
@@ -96,7 +96,7 @@ def privileged_context(row: dict, pi_mode: str) -> str:
     Empty for `none`, which is the matched control: with no PI the teacher is an identical copy
     of the student reading an identical context, so rho_t == 0 at every position and the whole
     signal has to come from the E-step. That makes `none` the cleanest test of the log-ratio
-    parameterization itself, against train_ppo_pi.py's randomly-initialised `.score` head.
+    parameterization itself.
     """
     if pi_mode == "hint":
         return PI_HINT.format(hint=row["hint"])
@@ -140,7 +140,7 @@ def render_teacher_prompt_ids(tokenizer, conversations: list[list[dict]]) -> lis
     so left-truncation removes the QUESTION and the template's opening header first and keeps
     the demo -- the teacher would score a completion against a headerless fragment. Rows that do
     not fit are DROPPED by `build_teacher_dataset` instead, the same choice
-    `build_ppo_pi_dataset` and `build_sdft_dataset` make for the same reason.
+    `build_sdft_dataset` makes for the same reason.
     """
     return tokenizer.apply_chat_template(
         conversations, add_generation_prompt=True, tokenize=True, return_dict=True

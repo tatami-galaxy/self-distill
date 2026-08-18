@@ -1,9 +1,8 @@
 """Shared fixtures for the trainer tests.
 
-Lives here rather than in one test module because every arm that gives the critic its own
-prompt (train_ppo_val.py today, train_ppo_pi.py whenever it grows coverage) needs the same
-two things: a chat tokenizer whose generation header is identifiable, and a stub carrying
-exactly the attributes TRL's prompt rendering reads.
+Lives here rather than in one test module because trainer arms that give the critic its own
+prompt need the same two things: a chat tokenizer whose generation header is identifiable,
+and a stub carrying exactly the attributes TRL's prompt rendering reads.
 """
 
 import types

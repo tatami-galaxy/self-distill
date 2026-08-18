@@ -276,7 +276,6 @@ ALGO_COLORS = {
     "sdft": "#e45756",
     "ppo": "#7a5195",
     "ppo_val": "#9c755f",
-    "ppo_pi": "#e377c2",
     "sdft_tt": "#79706e",
 }
 LINESTYLES = ["-", "--", "-.", ":"]

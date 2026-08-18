@@ -15,9 +15,8 @@ training loop. Traced against the pinned libraries, not from memory:
 This traces the **verifier-prompt arm**, because it is the one with an extra moving part.
 `train_ppo.py` on its own is the same trace with Phase A's value-prompt construction removed:
 its `_value_inputs` reads the policy's already-tokenized `prompt_ids` straight out of the
-rollout dict, so there is nothing to compose, render, cache or stash. `train_ppo_pi.py` is
-this trace with `compose_value_messages` replaced by `compose_pi_messages`. Our references
-below name symbols rather than line numbers — the numbers have gone stale twice.
+rollout dict, so there is nothing to compose, render, cache or stash. Our references below
+name symbols rather than line numbers — the numbers have gone stale twice.
 
 **Config assumed throughout** (the script's defaults):
 
@@ -214,8 +213,7 @@ TRL _prepare_inputs(generation_batch)                            grpo_trainer.py
  │  │  │      │   └─ ★ _build_value_prompts(self._value_rows)      train_ppo_val.py
  │  │  │      │      ├─ compose_value_messages: swap the SOLVER system turn for
  │  │  │      │      │     VALUE_SYSTEM_PROMPT, keep the question verbatim
- │  │  │      │      │     ⟵ THE ONLY THING THIS ARM CHANGES. train_ppo_pi.py
- │  │  │      │      │        substitutes compose_pi_messages right here.
+ │  │  │      │      │     ⟵ THE ONLY THING THE VERIFIER-PROMPT ARM CHANGES.
  │  │  │      │      └─ ★ _render_value_prompts(conversations)      train_ppo.py
  │  │  │      │         ├─ apply_chat_template(add_generation_prompt=True, same
  │  │  │      │         │     chat_template/kwargs/tools as TRL _tokenize_prompts)

@@ -62,12 +62,12 @@ from utils import (
 # completions -- the corpus becomes the variable under study and `sft` should join
 # VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
 #
-# `ppo_pi` and `sdft_tt` follow the same reasoning as `ppo_val`: each is a separate trainer file
-# writing its own `method` stamp, so filing them under a neighbour would leave an arm and its own
-# control distinguished only by a --run label. `sdft_tt` is
+# `sdft_tt` follows the same reasoning as `ppo_val`: it is a separate trainer file writing its
+# own `method` stamp, so filing it under a neighbour would leave an arm and its own control
+# distinguished only by a --run label. `sdft_tt` is
 # train/opsd/train_self_teacher/sdft_with_teacher.py -- SDFT whose teacher was trained by the
 # E-step in that same package.
-ALGOS = ("base", "grpo", "ppo", "ppo_val", "ppo_pi", "gold", "sdft", "sdft_tt", "sft")
+ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft", "sdft_tt", "sft")
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
 # existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones
@@ -82,7 +82,6 @@ SUMMARY_SCHEMA_VERSION = 2
 VARIANT_REQUIRED = {
     "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
-    "ppo_pi": "the critic's privileged context, e.g. --variant hint",
     # For sdft_tt the variable is the pair (PI, E-step objective): the per-token and aggregate
     # asymmetric variants yield different teachers and therefore different students.
     "sdft_tt": "the teacher's PI and objective, e.g. --variant hint-asymmetric",
@@ -411,9 +410,8 @@ def main():
     parser.add_argument(
         "--variant", default=None,
         help="What distinguishes this arm within its algorithm: the privileged context for "
-             "sdft (full/answer/hint/rollout/self_rollout), the teacher slug for gold, "
-             "or the critic PI for ppo_pi. Required where the algorithm has multiple "
-             "experiment arms; optional elsewhere.",
+             "sdft (full/answer/hint/rollout/self_rollout) or the teacher slug for gold. "
+             "Required where the algorithm has multiple experiment arms; optional elsewhere.",
     )
     parser.add_argument(
         "--run", default=None,

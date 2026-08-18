@@ -55,8 +55,7 @@ def validate_resume(
     (e.g. train_ppo's `value_prompt_version`: the critic's state representation), not for
     ordinary hyperparameters. `force` still downgrades these to a warning, as everywhere else.
 
-    Shared by train_sdft / train_grpo / train_gold / train_ppo / train_ppo_pi; each passes its
-    own build_run_meta.
+    Shared by the training entrypoints in this repository; each passes its own build_run_meta.
 
     What resume does NOT let you change, even though the CLI happily accepts it:
       * LEARNING RATES come from the checkpoint. Trainer calls optimizer.load_state_dict AFTER

@@ -90,9 +90,8 @@ PI_ROLLOUT = (
 )
 
 # How SDFTTrainer stitches the student prompt and privileged context into the teacher's
-# user turn: imported from utils (train_ppo_pi builds the same prompt for its critic, and
-# utils.compose_pi_messages applies it) and passed to SDFTConfig below, so the length
-# filter here tokenizes the exact teacher prompt the trainer will build.
+# user turn: imported from utils and passed to SDFTConfig below, so the length filter here
+# tokenizes the exact teacher prompt the trainer will build.
 
 
 # ---------------------------------------------------------------------------

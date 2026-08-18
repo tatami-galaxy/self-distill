@@ -23,18 +23,9 @@ What we override on GRPOTrainer:
                             (MSE) loss over the critic's fresh predictions vs returns.
   * `create_optimizer`    -- add the value model's parameters so the critic trains.
 
-GAE: gamma=1.0 (no discounting over a single reasoning episode), lam=1.0. lam is the
-PPO-vs-GRPO dial -- lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline;
-                    lam<1 leans on the critic's bootstrap.
-At the default lam=1.0 nothing bootstraps, so a wrong critic cannot bias the advantages and
-its regression target is the realized 0/1 outcome at every real position -- a clean
-calibration problem. train_ppo_val.py and train_ppo_pi.py default the same way.
-
-The critic's prompt is this trainer's one extension point. Here the critic reads exactly what
-the POLICY reads; the sibling arms swap only that, via `_value_inputs` (+ the shared
-`_render_value_prompts` renderer below):
-  train_ppo_val.py -- the same question under a VERIFIER instruction.
-  train_ppo_pi.py  -- the same question plus PRIVILEGED information.
+GAE: gamma=1.0 (no discounting over a single reasoning episode)
+lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline,
+lam<1 leans on the critic's bootstrap.
 
 Loss aggregation (--loss-type) only sets the DENOMINATOR that turns per-token losses into a
 scalar, i.e. how tokens are weighted against each other. It matters more here than in GRPO:
@@ -56,13 +47,10 @@ per-token credit the critic exists to produce:
              realized token count -- so the pg:vf ratio, i.e. the effective vf_coef, would drift
              as completions get shorter during training.
 vf_loss uses the bnpo-style masked_mean -- what classic PPO uses for its value loss too. Since
-both surviving loss types share that normalizer (exactly for bnpo, and ~= for dapo, whose global
-token count ~= accum * micro-batch count), vf_coef keeps its textbook meaning under either.
+both surviving loss types share that normalizer, vf_coef keeps its textbook meaning under either.
 
 Resume (--resume-from-checkpoint) restores the policy/optimizer/scheduler/RNG, skips seen
-data, and restores the CRITIC too: its optimizer state rides in the standard optimizer.pt
-(the value params share the policy's optimizer), and its weights are saved alongside each
-checkpoint as value_model.pt. Resuming a checkpoint that lacks that file is a hard error.
+data, and restores the CRITIC too.
 
 What resume does and does not let you change:
   * --max-steps IS free to change --
@@ -71,19 +59,7 @@ What resume does and does not let you change:
   * Changing --max-steps is only safe with lr_scheduler_type=constant (the default).
   * Extending far enough re-enters the dataset.
 
-Scope (v1): single-GPU (like the 1.7B student baseline).
-Todo : Multi-GPU DDP wrapping of the separate value model + cross-process grad sync.
-
-Generation backend (--vllm-mode):
-  colocate (default) -- the engine runs in-process on the training GPU. Simplest, and nothing
-                        idles (generation and training timeshare the GPU), but its KV cache
-                        competes with the policy + critic for memory: OOMs from ~4B up.
-  server             -- talk to a standalone `trl vllm-serve` on its OWN GPU, freeing that
-                        memory and giving generation a full GPU of KV cache. Costs a GPU that
-                        idles during forward/backward, so it buys memory, not throughput.
-
-!!  SERVER MODE + ANY bitsandbytes 8-bit OPTIMIZER CORRUPTS THE POLICY.  Use adafactor.  !!
-`paged_adamw_8bit` was the documented workaround, and IT NO LONGER WORKS.
+!! vLLM SERVER MODE + ANY bitsandbytes 8-bit OPTIMIZER CORRUPTS THE POLICY.  Use adafactor.  !!
 Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param
 `_assert_policy_finite` (below) now catches this at the step it happens.
 
@@ -96,7 +72,6 @@ CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve --model Qwen/Qwen3-4B --gpu-memory-
 CUDA_VISIBLE_DEVICES=6 uv run python -m train.ppo.train_ppo \
     --model Qwen/Qwen3-4B --dataset deepmath --vllm-mode server --vllm-server-port 8000
 
-aside :  GRPOTrainer also supports custom rollout logic, in case we want to use that later
 """
 
 import argparse
@@ -116,14 +91,11 @@ from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 
 # ---------------------------------------------------------------------------
-# Small masked reducers (defined here rather than imported from trl's experimental
-# PPO internals, to avoid depending on that module's private surface).
+# Small masked reducers
 # ---------------------------------------------------------------------------
 
 
-# Critic weights inside each `checkpoint-<step>` dir. A bare state_dict (not save_pretrained):
-# one file regardless of model size, no sharding to reassemble, and no shared-tensor errors.
-# The critic's config is reconstructible from --model + num_labels=1 (see main()).
+# Critic weights inside each `checkpoint-<step>` dir
 VALUE_MODEL_FILE = "value_model.pt"
 
 
@@ -160,11 +132,8 @@ def compute_gae(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Token-level GAE over right-padded completions.
 
-    `rewards`, `values`, `mask` are all (B, T) aligned to completion tokens; the terminal
-    reward sits at each row's last real token and `values`/`rewards` are zero on padding.
-    Because padding tails carry zero reward and zero value, GAE decays to 0 there and the
-    bootstrap at the terminal token uses next-value = 0 (episode end). Returns
-    (advantages, returns) with returns = advantages + values (the value-fn targets),
+    `rewards`, `values`, `mask` are all (B, T) aligned to completion tokens.
+    Returns (advantages, returns) with returns = advantages + values (the value-fn targets),
     both computed from un-whitened advantages.
     """
     values = values * mask
@@ -192,9 +161,6 @@ class PPOConfig(GRPOConfig):
     and scale_rewards to 'none' (advantages come from GAE, not group normalization)."""
 
     gamma: float = field(default=1.0, metadata={"help": "GAE discount (1.0 = no discounting)."})
-    # Matches the --lam CLI default. main() always passes args.lam, so this field default is
-    # only reachable when PPOConfig is built directly (tests); keeping the two in agreement
-    # stops the docstring's "lam=1.0" from being contradicted by the dataclass.
     lam: float = field(default=1.0, metadata={"help": "GAE lambda."})
     vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
     critic_learning_rate: float | None = field(
@@ -272,14 +238,11 @@ class PPOTrainer(GRPOTrainer):
     # -- critic parameters into the optimizer -------------------------------
 
     def create_optimizer(self, *args, **kwargs):
-        # Appending the critic's params here (rather than giving it its own optimizer) is also
-        # what makes the critic's optimizer STATE checkpoint for free: it lands in the same
-        # `optimizer.pt` file as the policy's, so it gets loaded automatically by Trainer.
+        # Appending the critic's params here is also
+        # what makes the critic's optimizer STATE checkpoint for free.
         optimizer = super().create_optimizer(*args, **kwargs)  # built over the policy (self.model)
         value_params = [p for p in self.value_model.parameters() if p.requires_grad]
-        # The lr is set HERE rather than patched onto param_groups[-1] afterwards, so the
-        # scheduler (built right after this, and which records each group's `initial_lr`)
-        # schedules the critic from its own base rate rather than the policy's.
+        # The lr is set here.
         group = {"params": value_params}
         if self.args.critic_learning_rate is not None:
             group["lr"] = self.args.critic_learning_rate
@@ -295,20 +258,12 @@ class PPOTrainer(GRPOTrainer):
         Trainer only ever clips `self.model`, and the critic deliberately lives outside it
         (see __init__), so without this the policy is bounded and the critic is not.
 
-        SEPARATE rather than one joint norm over both: a joint norm would let a critic spike
-        shrink the policy's update, making the policy's effective step size a function of
-        critic noise -- PPO-vs-GRPO would then differ by more than the critic, which is the
-        same reason the 'grpo'/'dr_grpo' loss types are excluded (see module docstring).
-        Separate clipping leaves the policy's gradients byte-identical to the GRPO baseline.
-
         Adam already normalizes per-parameter, so the clip is not what bounds the step size;
         it exists to stop an outlier spike from polluting the second-moment estimate and
         distorting the update direction for many steps after. `critic_max_grad_norm=0`
         measures without clipping, so the two can be compared.
 
         Trainer calls this only when max_grad_norm > 0; this script never sets it otherwise.
-        torch's clip_grad_norm_ rather than accelerate's because the critic is not
-        accelerator.prepare'd -- consistent with the single-GPU scope.
         """
         policy_grad_norm = super()._clip_grad_norm(model)
 
@@ -316,7 +271,7 @@ class PPOTrainer(GRPOTrainer):
         if params:
             limit = self.args.critic_max_grad_norm
             # clip_grad_norm_ returns the norm from BEFORE any scaling, so the metric is the
-            # true pre-clip norm either way; an inf limit scales nothing and only measures.
+            # true pre-clip norm either way
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 params, limit if limit and limit > 0 else float("inf")
             )
@@ -327,8 +282,7 @@ class PPOTrainer(GRPOTrainer):
     # -- critic checkpointing -----------------------------------------------
     #
     # Trainer only saves `self.model`, so the critic's WEIGHTS need handling here; its
-    # optimizer state already rides along (see create_optimizer). `final/` stays policy-only
-    # -- eval loads a plain causal LM and never needs the critic.
+    # optimizer state already rides along (see create_optimizer).
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)  # GRPO's override (model card) -> HF's
@@ -345,14 +299,11 @@ class PPOTrainer(GRPOTrainer):
             raise FileNotFoundError(
                 f"No critic weights ({VALUE_MODEL_FILE}) in {resume_from_checkpoint}. Resuming "
                 "would restart the value function from its random init while the policy carries "
-                "on, so every GAE advantage would be measured against a meaningless baseline -- "
-                "silently, since training would still look healthy. Was this checkpoint written "
-                "before critic checkpointing existed?"
+                "on. Was this checkpoint written before critic checkpointing existed?"
             )
         state = torch.load(path, map_location="cpu", weights_only=True)
         # Load IN-PLACE. The optimizer holds references to these exact tensors, so the module
-        # must not be reassigned: that would leave the optimizer updating orphaned parameters
-        # while the forward pass used new ones, and the critic would never learn.
+        # must not be reassigned.
         self.value_model.load_state_dict(state)
         print(f"Restored critic weights <- {path}")
 
@@ -361,28 +312,11 @@ class PPOTrainer(GRPOTrainer):
     def _maybe_log_save_evaluate(self, *args, **kwargs):
         """Trainer calls this immediately after `optimizer.step()` and `model.zero_grad()`, which
         is both where the server-mode optimizer corruption is born (module docstring) and the only
-        seam at which the critic's gradients can be cleared. Do both here.
-
-        Without this the failure is SILENT for a full step and then surfaces somewhere else
-        entirely: the NaN policy is broadcast to vLLM, generation returns NaN logprobs, TRL maps
-        those to None, and the run dies in `torch.tensor(logps)` with "Could not infer dtype of
-        NoneType" -- a message that points at TRL's tokenization and says nothing about the
-        optimizer. Diagnosing that cost a full instrumented reproduction; this turns it into one
-        line naming the actual cause.
-
+        seam at which the critic's gradients can be cleared.
         Cost is ~one small kernel per parameter per optimizer step, negligible against a step
         that spends tens of seconds in generation.
         """
         self._assert_policy_finite()
-        # Trainer's `model.zero_grad()` clears the POLICY only, and the critic deliberately lives
-        # outside self.model (see __init__), so without this it enters the next step still holding
-        # the last one's gradient: G_k = clip(G_{k-1}) + sum(step k grads). The clip bounds the
-        # carry-over to a unit-norm vector, but it is largely ALIGNED with the fresh gradient, so
-        # it acts as an undocumented momentum term: measured at 1.7B, removing it moved the
-        # critic's clip-time norm 9.09 -> 8.54 (~6%). Under --critic-max-grad-norm 0 nothing
-        # clips, and the carry-over is an unbounded running sum. It also inflated
-        # ppo/critic_grad_norm, which is measured at clip time. Here rather than in
-        # _clip_grad_norm, which runs BEFORE optimizer.step().
         self.value_model.zero_grad(set_to_none=True)
         return super()._maybe_log_save_evaluate(*args, **kwargs)
 
@@ -402,18 +336,7 @@ class PPOTrainer(GRPOTrainer):
     # -- per-token value predictions ----------------------------------------
 
     def _value_inputs(self, batch):
-        """What the critic reads: (input_ids, attention_mask, logits_to_keep).
-
-        Here that is exactly what the POLICY reads -- the same prompt, the same completion,
-        one tensor shared by both models. It is a method, and takes the whole `batch`, so
-        that a subclass can give the critic a DIFFERENT prompt (train_ppo_pi.py conditions
-        it on privileged info) without touching either call site.
-
-        `batch` is the rollout dict during `_generate_and_score_completions` and the
-        micro-batch dict during `_compute_loss`; both carry these four keys, and both must
-        resolve to the same sequence for a row, or `cliprange_value` would be clipping
-        `vpred` against an `old_values` computed from a different state.
-        """
+        """What the critic reads: (input_ids, attention_mask, logits_to_keep)."""
         input_ids = torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1)
         attention_mask = torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1)
         return input_ids, attention_mask, batch["completion_ids"].size(1)
@@ -422,24 +345,17 @@ class PPOTrainer(GRPOTrainer):
         """Tokenize critic-only conversations exactly as GRPO tokenizes policy prompts.
 
         Unused by this trainer -- its critic reads the policy's already-tokenized
-        `prompt_ids` -- but it is the shared half of every arm that DOES give the critic its
-        own prompt (train_ppo_val.py, and available to train_ppo_pi.py), so those arms differ
-        from each other only in how they compose `conversations`, never in how the result is
-        rendered. Kept here, on the base class, for two reasons:
+        `prompt_ids` -- but it is shared with train_ppo_val.py, whose critic has its own
+        prompt.
+        Kept here, on the base class, for two reasons:
 
           * It mirrors GRPOTrainer._tokenize_prompts (same chat_template, chat_template_kwargs,
             tools, add_generation_prompt=True) so the critic's prompt ends on the IDENTICAL
-            assistant/<think> header the completion was sampled after. That is a CROSS-LIBRARY
-            invariant -- it holds only while TRL renders prompts this way -- so it is pinned by
-            a test against TRL's real method. One home means one such test, not one per arm.
+            assistant/<think> header the completion was sampled after.
           * LEFT padding is not a style choice. `_get_per_token_values` reads values[:, 0] from
-            the position just before the first completion token; right-padding would put PADs
-            between prompt and completion and offset every row's value curve by its own pad
-            count.
+            the position just before the first completion token.
 
-        `max_length` left-truncates (a BACKSTOP for arms whose PI can be long -- the dataset
-        builder is expected to drop those rows first); it returns the truncated count so the
-        caller can log it. Returns (ids, mask, n_truncated).
+        `max_length` left-truncates. Returns (ids, mask, n_truncated).
         """
         tokenized = self.processing_class.apply_chat_template(
             conversation=conversations,
@@ -567,8 +483,8 @@ class PPOTrainer(GRPOTrainer):
         advantages, returns = compute_gae(
             token_rewards, old_values, completion_mask, self.args.gamma, self.args.lam
         )
-        # Drop unscorable rows from the whitening statistics too (they carry a fabricated
-        # reward of 0), then zero them so they yield no policy gradient.
+        # Drop unscorable rows from the whitening statistics
+        # then zero them so they yield no policy gradient.
         loss_mask = completion_mask * scorable  # (B, C)
         if self.args.whiten_advantages:
             advantages = masked_whiten(advantages, loss_mask)
@@ -578,15 +494,10 @@ class PPOTrainer(GRPOTrainer):
         output["returns"] = returns
         output["old_values"] = old_values
         output["scorable"] = scorable  # (B, 1) -- masks the value loss in _compute_loss
-        # The per-rollout outcome the critic is regressing towards, kept so subclasses can
-        # score the critic against it (train_ppo_pi.py's calibration metrics) without
-        # re-deriving it from the reward stash.
+        # The per-rollout outcome the critic is regressing towards
         output["terminal_reward"] = rewards.unsqueeze(1)  # (B, 1)
 
-        # Log critic-side stats. value/returns use loss_mask so the reported means describe
-        # the rollouts that actually train the critic. unscorable_rate is expected to be ~0
-        # (our golds come from build_grpo_dataset's \boxed{} wrap over answer-bearing rows);
-        # a non-zero reading means rollouts are being dropped -- worth investigating.
+        # Log critic-side stats
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["ppo/value_mean"].append(masked_mean(old_values, loss_mask).item())
         self._metrics[mode]["ppo/returns_mean"].append(masked_mean(returns, loss_mask).item())
@@ -601,8 +512,8 @@ class PPOTrainer(GRPOTrainer):
         completion_mask = inputs["completion_mask"]
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
         # Unscorable rollouts carry a fabricated reward of 0, so their `returns` are not a
-        # real target -- keep them out of the critic's regression (their advantages were
-        # already zeroed, so the policy loss ignores them too).
+        # real target -- keep them out of the critic's regression.
+        # Their advantages were already zeroed, so the policy loss ignores them too.
         if "scorable" in inputs:
             mask = mask * inputs["scorable"]
 
@@ -719,37 +630,33 @@ def main():
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
     p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
     p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
-                   help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
-                        "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping "
-                        "while still logging ppo/critic_grad_norm, so the two can be compared.")
+                   help="Clip the critic's gradients to this norm separately from the policy "
+                        "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping")
     p.add_argument("--no-whiten-advantages", dest="whiten_advantages",
                    action="store_false", help="Disable GAE advantage whitening.")
     p.add_argument("--missing-eos-penalty", type=float, default=0.0,
                    help="Subtract from a completion's terminal reward if it did not end in EOS. "
                         "0.0 disables (matches the GRPO baseline).")
     p.add_argument("--num-ppo-epochs", type=int, default=1,
-                   help="Gradient passes reusing each rollout (maps to GRPO num_iterations; "
-                        ">1 enables PPO's clip-and-reuse via stored old logprobs).")
+                   help=">1 enables PPO's clip-and-reuse via stored old logprobs.")
     p.add_argument("--loss-type", default="dapo", choices=["dapo", "bnpo"],
                    help="Token-loss aggregation for the clipped policy surrogate (see module "
                         "docstring). 'dapo' matches the GRPO baseline; 'bnpo' is TRL classic PPO's "
                         "exact aggregation. Both are token-uniform and share vf_loss's normalizer. "
-                        "GRPO's 'grpo' and 'dr_grpo' are excluded: they would rescale or destabilize "
-                        "the per-token GAE credit.")
+                        "GRPO's 'grpo' and 'dr_grpo' are excluded.")
     p.add_argument("--epsilon", type=float, default=0.2, help="PPO clip range (policy).")
     p.add_argument("--temperature", type=float, default=1.0, help="Rollout sampling temperature.")
     # generation
     p.add_argument("--max-completion-length", type=int, default=8192)
     p.add_argument("--num-generations", type=int, default=1,
-                   help="Rollouts per prompt. PPO uses the critic (not a group) as the "
+                   help="Rollouts per prompt. PPO uses the critic as the "
                         "baseline, so grouping is unused -- each rollout gets its own GAE. ")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--critic-learning-rate", type=float, default=None,
                    help="Learning rate for the critic. Omit to inherit --learning-rate. That "
-                        "default (1e-6) suits a pretrained policy but is very slow for the "
-                        "critic's RANDOMLY INITIALISED scalar head, which has to learn "
-                        "P(correct|prefix) from scratch within --max-steps.")
+                        "default (1e-6) suits a pretrained policy but might be very slow for the "
+                        "critic's scalar head")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
@@ -758,7 +665,7 @@ def main():
                    help="Optimizer. The 8-bit default keeps the memory footprint of the GRPO "
                         "baseline and is fine in COLOCATE mode. In --vllm-mode server EVERY "
                         "bitsandbytes 8-bit optimizer corrupts the policy; "
-                        "pass --optim adafactor there. See the module docstring.")
+                        "pass --optim adafactor there.")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
@@ -766,16 +673,12 @@ def main():
     # vLLM
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--vllm-mode", default="colocate", choices=["colocate", "server"],
-                   help="'colocate': run the engine in-process on the training GPU (simplest, "
-                        "nothing idles, but its KV cache competes with policy+critic -- OOMs from "
-                        "~4B). 'server': talk to a standalone `trl vllm-serve` on its own GPU. "
-                        "See the module docstring for the launch recipe.")
+                   help="'colocate': run the engine in-process on the same GPU, OOMs from ~4B."
+                        "'server': talk to a standalone `trl vllm-serve` on its own GPU.")
     # Colocate-only. Defaults are None so we can tell "user set it" from "left alone" and
     # reject it in server mode, where it is the SERVER's property (see main()).
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
-                   help="COLOCATE ONLY (default 0.25): fraction of the training GPU vLLM may "
-                        "reserve. Keep modest -- policy + critic + engine share it. In server mode "
-                        "pass --gpu-memory-utilization to `trl vllm-serve` instead.")
+                   help="COLOCATE ONLY (default 0.25)")
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=None,
                    help="COLOCATE ONLY (default 1). In server mode pass --tensor-parallel-size to "
                         "`trl vllm-serve` instead.")
@@ -784,9 +687,7 @@ def main():
     p.add_argument("--vllm-server-timeout", type=float, default=240.0,
                    help="SERVER MODE: seconds to wait for the server to be reachable.")
     p.add_argument("--vllm-group-port", type=int, default=51216,
-                   help="SERVER MODE: port for the NCCL weight-sync group the trainer joins as the "
-                        "last rank. Weights cross GPU->GPU over this group; HTTP carries only "
-                        "metadata.")
+                   help="SERVER MODE: port for the NCCL weight-sync group.")
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=20)
@@ -797,8 +698,7 @@ def main():
                    help="Resume dir ('checkpoint-<step>'). Restores policy, critic (weights + "
                         "optimizer state), scheduler and RNG, and skips already-seen examples. "
                         "Pass the SAME --model, --dataset, --max-samples, --seed and batch config "
-                        "as the original run (verified against its run_meta.json). --max-steps is "
-                        "the TOTAL budget: training continues up to it.")
+                        "as the original run. --max-steps is the TOTAL budget: training continues up to it.")
     p.add_argument("--force-resume", action="store_true")
     args = p.parse_args()
 
@@ -806,11 +706,7 @@ def main():
 # ---------------------------------------------------------------------------
 # Verify CLI options
 # ---------------------------------------------------------------------------
-
-
-    # In server mode the engine's memory/TP are the SERVER's properties, configured when it is
-    # launched; TRL ignores these config fields entirely. Accepting them here would silently do
-    # nothing -- exactly the flag you'd reach for after an OOM -- so reject them instead.
+#
     if args.vllm_mode == "server":
         misplaced = [
             f"{flag} (use `trl vllm-serve {serve_flag}`)"
@@ -827,17 +723,13 @@ def main():
                 "these only apply to --vllm-mode colocate and would be silently ignored in server "
                 "mode, where they are the server's properties: " + "; ".join(misplaced)
             )
-    # Refuse the one combination that trains silently and wrong: the non-paged bnb 8-bit AdamW
-    # NaNs the policy inside the optimizer step once the NCCL weight-sync group exists (module
-    # docstring). It surfaces two steps later as an unrelated-looking dtype error in TRL, so a
-    # hard stop here is worth more than the flexibility.
+    # Refuse the combination that corrupts training
     if args.vllm_mode == "server" and is_bitsandbytes_optim(args.optim):
         p.error(
             f"--optim {args.optim} corrupts the policy under --vllm-mode server: finite "
-            "gradients, NaN params straight out of optimizer.step(), which surfaces two steps "
-            "later as an unrelated-looking dtype error inside TRL. Use --optim adafactor "
+            "gradients, NaN params out of optimizer.step(), Use --optim adafactor "
             "(recommended -- adamw_torch is also clean but its fp32 moments cost ~64GB across "
-            "policy + critic at 4B). See the module docstring."
+            "policy + critic at 4B)."
         )
 
     vllm_gpu_mem = 0.25 if args.vllm_gpu_memory_utilization is None else args.vllm_gpu_memory_utilization
@@ -915,8 +807,7 @@ def main():
     )
 
     # Critic: policy arch + a scalar value head, initialised from --model.
-    # The `.score` head is the one weight in this script with no pretrained values
-    # to load, so it is randomly initialised here
+    # The `.score` head is randomly initialised
     set_seed(args.seed)
     value_model = AutoModelForSequenceClassification.from_pretrained(
         args.model, num_labels=1, dtype=torch.bfloat16, trust_remote_code=True
