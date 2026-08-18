@@ -185,7 +185,12 @@ class SummaryTest(unittest.TestCase):
             hints,
             {"h1": {"n_samples": 1, "n_correct": 1, "n_truncated": 0}},
             {"q1": {"n_samples": 1, "n_correct": 0}},
-            {"h1": [{"raw_transfer": -0.25}]},
+            {
+                "h1": [{"raw_transfer": -0.25}],
+                # An estimate from another generator arm must not enter this arm's
+                # negative-hint fraction.
+                "other-arm-hint": [{"raw_transfer": 0.5}],
+            },
             ks=[1],
             bootstrap_samples=10,
             seed=1,
@@ -193,6 +198,7 @@ class SummaryTest(unittest.TestCase):
         self.assertFalse(summary["validity_observable"])
         self.assertIsNone(summary["invalid_fraction"])
         self.assertEqual(summary["transfer"]["mean_clamped_nats_per_token"], 0.0)
+        self.assertEqual(summary["transfer"]["negative_hint_fraction"], 1.0)
 
     def test_paired_difference_bootstraps_questions(self):
         comparison = hint_gen_compare.paired_question_difference(

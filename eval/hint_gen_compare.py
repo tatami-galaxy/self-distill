@@ -1160,9 +1160,11 @@ def summarize_generator_subset(
         ),
     )
 
+    subset_hint_ids = {row["hint_id"] for row in hints}
     per_hint_transfer = {
-        hint_id: sum(float(row["raw_transfer"]) for row in rows) / len(rows)
-        for hint_id, rows in transfer_by_hint.items()
+        hint_id: sum(float(row["raw_transfer"]) for row in transfer_by_hint[hint_id])
+        / len(transfer_by_hint[hint_id])
+        for hint_id in subset_hint_ids
     }
     transfer_question_means = question_means(
         hints, lambda row: per_hint_transfer[row["hint_id"]]
