@@ -1,29 +1,24 @@
 ### Baselines
 
-- [x] train on deepscaleR
+- [x] deepscaleR
+- [ ] Reasoning Gym
 - [ ] base models, sft-ed models, instruct models
 - [ ] beyondaime
 - [ ] hmmt
-- [ ] qwen 8B as student, teacher
+- [ ] OPD from qwen 8B
 - [ ] coding, knowledge tasks
 - [ ] hyperparameter sweep
 
 
 ### Research
 
-- Leverage ICL ability of LLM value functions
-  - [x] value function prompt
-  - [ ] value pretraining
-  - [ ] decoupled gae (VC-PPO)
-  - [ ] sweep, anneal lambda (currently 1) with modified value functions
-  - [ ] `value(h_t) = ⟨h_t, e_Yes − e_No⟩ = logit(Yes) − logit(No)`
-  - [ ] Model value = σ(margin) with a 0/1 target -> make the output a calibrated probability
-  - [ ] sweep, anneal lambda with modified value functions
-  - [ ] Analyze value function behaviours
-  - [ ] Different LR for head and backbone
-  - [ ] LoRA
-
 - PI conditioned value function
+  - [ ] $A^{\mathrm{actor}}_{t,k}=(1-\rho_k)A^{\mathrm{SD}}_{0,t}+\rho_k A^{R,\mathrm{GAE}}_{t},\qquad\rho_k\in[0,1]$
+  - [ ] value pre-training
+
+- PI conditioned Q function
+
+  jbjbj
 
 - Train self-teacher in SDFT 
 
@@ -33,10 +28,4 @@
     - [ ] Hyperparameter sweep
 
   - [ ] Train self-teacher for hint generation
-    - [ ] Objective from self-teacher behavior (example : entropy)
-    - [ ] Objective from teacher-student log ratio
-    - [ ] Hint generation with information bottleneck -> pass@k with generated hint -> RL (VAE/Autoencoder)
-
-- Train head on top of self-teacher
-
-  The self-teacher is a language model and we are trying to derive the training signal from its next token probabilities. Its also being instructed to solve the problem given some PI.
+    - [x] $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad S(h)\ge \tau$
