@@ -92,6 +92,7 @@ class CrossArmResumeTest(unittest.TestCase):
         return types.SimpleNamespace(
             model="Qwen/Qwen3-1.7B", dataset="deepmath", max_samples=None,
             gamma=1.0, lam=1.0, vf_coef=0.1, cliprange_value=0.2, critic_max_grad_norm=1.0,
+            critic_warmup_steps=0,
             loss_type="dapo", vllm_mode="colocate", optim="paged_adamw_8bit",
             learning_rate=1e-6, critic_learning_rate=None, seed=42,
             per_device_train_batch_size=1, gradient_accumulation_steps=16, num_generations=1,

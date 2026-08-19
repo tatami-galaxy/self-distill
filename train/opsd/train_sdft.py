@@ -6,9 +6,11 @@ Train SDFT -- on-policy self-distillation from a privileged teacher, following
 Privileged context (`--pi-mode`):
   full   -- the reference r1 solution (reasoning + worked answer) as a worked example
   answer -- only the gold final answer as a hint
-  hint   -- a small set of concepts/results the model itself distilled from the
-            full solution; precompute with `python -m utils.gen_hints` first
-            (same --model). Sits between `full` and `answer`.
+  hint   -- a small set of concepts/results distilled from the full solution;
+            precompute with `python -m utils.gen_hints` first. By default the
+            student writes its own hints; pass `--hint-generator-model` and
+            optionally `--hint-cache` to use a trained hint generator instead.
+            Sits between `full` and `answer`.
   rollout -- one fixed, unverified solution attempt sampled from the same base model;
              precompute with `train.opsd.train_self_teacher.gen_rollouts` first
 
@@ -19,14 +21,18 @@ from the base model id, so resume can't corrupt it). For `ema` the EMA teacher s
 held in a callback and is NOT in the checkpoint, so resuming resets it to the base weights
 and silently loses the accumulated EMA -- don't resume `ema` runs without accounting for this.
 --max-steps is the TOTAL budget and is free to raise, but the LEARNING RATE comes from the
-checkpoint rather than the command line, so a changed --learning-rate is refused rather than
-silently ignored (full rules in utils.validate_resume). Watch the data here: at the defaults
-(num_generations 1 -> 16 prompts per step) one epoch is only ~1,219 steps on a 19.5k hint cache
-and ~248 on a 4k one, so a long `hint` run can quietly start revisiting prompts.
+checkpoint rather than the command line, so a changed --learning-rate is refused. 
 
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
     --model Qwen/Qwen3-4B --pi-mode full --dataset deepmath
+
+# learned hint-generator PI: generate the cache with utils.gen_hints first,
+# using this exact checkpoint string as --model and the same --output-dir.
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
+    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
+    --hint-generator-model /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_a1_g1/checkpoint-100 \
+    --hint-cache data/pi/hint/deepmath/Qwen3-1.7B-a1g1-checkpoint-100
 
 # rollout PI: generate the attempted-solution cache first (see gen_rollouts.py).
 # The larger prompt budget keeps the 8K attempt plus the question/instructions intact.
@@ -85,6 +91,8 @@ def build_sdft_dataset(
     max_prompt_length: int | None = None,
     rollout_pi_root: str = "data/pi/attempted_solution_8k",
     rollout_pi_sample_idx: int = 0,
+    hint_generator_model: str | None = None,
+    hint_cache: str | None = None,
 ):
     """
     `prompt`             -- conversational [system, user] messages, identical to
@@ -94,7 +102,7 @@ def build_sdft_dataset(
                             by `pi_mode`. SDFTTrainer requires exactly these two
                             columns; everything else is dropped.
 
-    `pi_mode="hint"` loads precomputed self-hints from disk (see build_hint_dataset);
+    `pi_mode="hint"` loads precomputed hints from disk (see build_hint_dataset);
     `rollout` loads one fixed, unverified attempt per question from
     gen_rollouts.py (see build_rollout_dataset); `full`/`answer` are built
     inline from the dataset (question, final_answer, solution). `full` requires
@@ -108,7 +116,13 @@ def build_sdft_dataset(
     `max_samples`, so the result may hold fewer rows.
     """
     if pi_mode == "hint":
-        return build_hint_dataset(model, dataset, max_samples)
+        return build_hint_dataset(
+            model,
+            dataset,
+            max_samples,
+            hint_generator_model=hint_generator_model,
+            hint_cache=hint_cache,
+        )
     if pi_mode == "rollout":
         ds = build_rollout_dataset(
             model,
@@ -300,30 +314,67 @@ def build_rollout_dataset(
     return questions.map(_map, with_indices=True, remove_columns=questions.column_names)
 
 
-def build_hint_dataset(model: str | None, dataset: str, max_samples: int | None):
-    """Load precomputed self-hints (utils/gen_hints.py) and wrap them as PI.
-
-    The hint cache is keyed by dataset + model slug and stamped with `gen_model`
-    (and `dataset` for newer caches); we assert they match `model`/`dataset` so
-    training only ever uses hints the trained model itself wrote from the same
-    dataset (the "hint-self" arm). Hints are short, so no teacher-prompt length
-    filter is needed here.
-    """
+def resolve_hint_source(
+    model: str | None,
+    dataset: str,
+    hint_generator_model: str | None = None,
+    hint_cache: str | None = None,
+) -> tuple[str, str]:
+    """Return the exact generator identity and cache path for a hint-PI run."""
     if model is None:
-        raise ValueError("pi_mode='hint' needs --model to locate its hint cache.")
-    path = hint_path(model, dataset)
+        raise ValueError("pi_mode='hint' needs --model for the student model.")
+    generator = hint_generator_model or model
+    path = hint_cache or hint_path(generator, dataset)
+    return generator, path
+
+
+def hint_generator_run_slug(generator: str) -> str:
+    """Short, readable suffix for a learned-generator SDFT output directory."""
+    parts = [part for part in generator.rstrip("/").split("/") if part]
+    tail = parts[-2:] if len(parts) >= 2 else parts
+    return "_".join(tail)
+
+
+def build_hint_dataset(
+    model: str | None,
+    dataset: str,
+    max_samples: int | None,
+    hint_generator_model: str | None = None,
+    hint_cache: str | None = None,
+):
+    """Load precomputed hints (utils/gen_hints.py) and wrap them as PI.
+
+    By default the generator is `model`, preserving the original "hint-self"
+    arm. `hint_generator_model` allows a separately trained generator, while
+    `hint_cache` can point at an explicitly named cache. The cache's provenance
+    must match the selected generator and dataset exactly. Hints are short, so
+    no teacher-prompt length filter is needed here.
+    """
+    generator, path = resolve_hint_source(
+        model, dataset, hint_generator_model, hint_cache
+    )
     if not os.path.isdir(path):
         raise FileNotFoundError(
-            f"No hint cache for {model} on {dataset} at {path}. Generate it first:\n"
-            f"  python -m utils.gen_hints --model {model} --dataset {dataset} --max-samples <N>"
+            f"No hint cache from {generator} on {dataset} at {path}. Generate it first:\n"
+            "  python -m utils.gen_hints "
+            f"--model {generator} --dataset {dataset} --max-samples <N> "
+            f"--output-dir {path}"
         )
 
     ds = load_from_disk(path)
-    gen_models = set(ds.unique("gen_model"))
-    if gen_models != {model}:
+    required = {"question", "hint", "gen_model"}
+    missing = required.difference(ds.column_names)
+    if missing:
         raise ValueError(
-            f"Hint cache at {path} was generated by {gen_models}, not {model!r}. "
-            f"Regenerate with `python -m utils.gen_hints --model {model} --dataset {dataset}`."
+            f"Hint cache at {path} is missing required columns {sorted(missing)}. "
+            "Regenerate it with the current utils/gen_hints.py."
+        )
+    gen_models = set(ds.unique("gen_model"))
+    if gen_models != {generator}:
+        raise ValueError(
+            f"Hint cache at {path} was generated by {gen_models}, not {generator!r}. "
+            "Pass the exact generator string used by utils.gen_hints.py as "
+            "--hint-generator-model."
         )
     # `dataset` column is present on newer caches (path-keyed for older ones).
     if "dataset" in ds.column_names and set(ds.unique("dataset")) != {dataset}:
@@ -356,10 +407,32 @@ def build_hint_dataset(model: str | None, dataset: str, max_samples: int | None)
 def build_run_meta(args, num_train_examples: int) -> dict:
     """Provenance + resume-critical config for run_meta.json. The second block must
     match on resume for the seeded data-skip to land on the same examples."""
+    hint_generator_model = None
+    hint_cache_path = None
+    hint_source = None
+    if args.pi_mode == "hint":
+        hint_generator_model, hint_cache_path = resolve_hint_source(
+            args.model,
+            args.dataset,
+            getattr(args, "hint_generator_model", None),
+            getattr(args, "hint_cache", None),
+        )
+        hint_cache_path = os.path.abspath(hint_cache_path)
+        hint_source = (
+            "self" if hint_generator_model == args.model else "trained_generator"
+        )
+    elif args.pi_mode == "rollout":
+        hint_generator_model = args.model
+
     return {
         "model": args.model,
         "pi_mode": args.pi_mode,
-        "gen_model": args.model if args.pi_mode in ("hint", "rollout") else None,
+        "gen_model": hint_generator_model,
+        "hint_generator_model": (
+            hint_generator_model if args.pi_mode == "hint" else None
+        ),
+        "hint_cache": hint_cache_path,
+        "hint_source": hint_source,
         "dataset": args.dataset,
         "max_samples": args.max_samples,
         "rollout_pi_root": (
@@ -400,9 +473,9 @@ def main():
     )
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
-                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). 'hint' and "
-                        "'rollout' use the model's hint-cache question order; 'full' uses "
-                        "the solution-bearing subset.")
+                   help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). 'hint' uses "
+                        "the selected hint cache; 'rollout' uses the student's self-hint "
+                        "question order; 'full' uses the solution-bearing subset.")
     p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/sdft")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>")
@@ -412,9 +485,15 @@ def main():
     p.add_argument("--pi-mode", default="full",
                    choices=["full", "answer", "hint", "rollout"],
                    help="Teacher-only privileged context: 'full' worked demo (paper "
-                        "default), 'answer' boxed value, or 'hint' precomputed "
-                        "self-hints (run utils.gen_hints first), or 'rollout' one fixed "
-                        "unverified attempt from the same model.")
+                        "default), 'answer' boxed value, 'hint' precomputed hints "
+                        "(run utils.gen_hints first), or 'rollout' one fixed unverified "
+                        "attempt from the same model.")
+    p.add_argument("--hint-generator-model", default=None,
+                   help="Model/checkpoint that generated --hint-cache. Defaults to --model, "
+                        "which preserves the original self-hint behavior.")
+    p.add_argument("--hint-cache", default=None,
+                   help="Explicit on-disk HF hint dataset. If omitted, resolve it from "
+                        "--hint-generator-model using data/pi/hint/<dataset>/<model-slug>.")
     p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
                    help="Root passed as --output-root to gen_rollouts.py for rollout PI.")
     p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
@@ -500,12 +579,32 @@ def main():
     args = p.parse_args()
     if args.rollout_pi_sample_idx < 0:
         p.error("--rollout-pi-sample-idx must be >= 0")
+    if args.pi_mode != "hint" and (
+        args.hint_generator_model is not None or args.hint_cache is not None
+    ):
+        p.error("--hint-generator-model and --hint-cache require --pi-mode hint")
+
+    hint_generator = None
+    selected_hint_cache = None
+    pi_output_slug = args.pi_mode
+    if args.pi_mode == "hint":
+        hint_generator, selected_hint_cache = resolve_hint_source(
+            args.model, args.dataset, args.hint_generator_model, args.hint_cache
+        )
+        if hint_generator != args.model:
+            pi_output_slug = f"hint_{hint_generator_run_slug(hint_generator)}"
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(
-        args.output_root, model_slug, f"{args.dataset}_{args.pi_mode}"
+        args.output_root, model_slug, f"{args.dataset}_{pi_output_slug}"
     )
-    print(f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  ->  output: {output_dir}")
+    print(
+        f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}"
+        f"  ->  output: {output_dir}"
+    )
+    if args.pi_mode == "hint":
+        print(f"  hint generator: {hint_generator}")
+        print(f"  hint cache: {selected_hint_cache}")
 
     train_dataset = build_sdft_dataset(
         args.pi_mode,
@@ -515,6 +614,8 @@ def main():
         max_prompt_length=args.max_prompt_length,
         rollout_pi_root=args.rollout_pi_root,
         rollout_pi_sample_idx=args.rollout_pi_sample_idx,
+        hint_generator_model=args.hint_generator_model,
+        hint_cache=args.hint_cache,
     )
     if len(train_dataset) == 0:
         raise RuntimeError(

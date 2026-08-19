@@ -170,6 +170,10 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "vf_coef": args.vf_coef,
         "cliprange_value": args.cliprange_value,
         "critic_max_grad_norm": args.critic_max_grad_norm,
+        # resume-critical: warmup is keyed on the RESTORED global_step, so a resumed run
+        # silently trains jointly if it finished warmup -- recording it makes a changed
+        # value an error rather than an invisible difference between the two halves.
+        "critic_warmup_steps": args.critic_warmup_steps,
         "loss_type": args.loss_type,
         "vllm_mode": args.vllm_mode,
         # See train_ppo.build_run_meta: optim x vllm_mode decides whether the policy NaNs.
@@ -218,6 +222,11 @@ def main():
                    help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
                         "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping "
                         "while still logging ppo/critic_grad_norm, so the two can be compared.")
+    p.add_argument("--critic-warmup-steps", type=int, default=0,
+                   help="Freeze the policy for this many optimizer steps at the start of "
+                        "training so the randomly-initialised value head can fit against a "
+                        "FIXED policy before its advantages start steering one. Counted "
+                        "against --max-steps. 0 = joint training from step 0.")
     p.add_argument("--no-whiten-advantages", dest="whiten_advantages",
                    action="store_false", help="Disable GAE advantage whitening.")
     p.add_argument("--missing-eos-penalty", type=float, default=0.0,
@@ -347,6 +356,7 @@ def main():
         vf_coef=args.vf_coef,
         cliprange_value=args.cliprange_value,
         critic_max_grad_norm=args.critic_max_grad_norm,
+        critic_warmup_steps=args.critic_warmup_steps,
         whiten_advantages=args.whiten_advantages,
         missing_eos_penalty=args.missing_eos_penalty,
         # policy surrogate (inherited GRPO machinery)

@@ -15,8 +15,9 @@ from train.ppo.train_ppo_pi import (
     PPOPITrainer,
     build_ppo_pi_dataset,
     build_run_meta,
+    filter_long_full_value_prompts,
 )
-from utils import PI_ANSWER, format_prompt_math
+from utils import PI_ANSWER, PI_FULL, PI_HINT, format_prompt_math
 
 
 class PPIPIDatasetTest(unittest.TestCase):
@@ -49,7 +50,129 @@ class PPIPIDatasetTest(unittest.TestCase):
 
     def test_rejects_unknown_pi_mode(self):
         with self.assertRaisesRegex(ValueError, "unknown pi_mode"):
-            build_ppo_pi_dataset("deepmath", pi_mode="full")
+            build_ppo_pi_dataset("deepmath", pi_mode="rollout")
+
+    def test_full_uses_solution_bearing_deepmath_rows_and_sdft_wording(self):
+        loader = Mock(return_value=self.source_dataset())
+        with patch("train.ppo.train_ppo_pi.load_train_dataset", loader):
+            full = build_ppo_pi_dataset(
+                "deepmath",
+                pi_mode="full",
+                model="student",
+                max_value_prompt_length=None,
+            )
+
+        loader.assert_called_once_with(
+            "deepmath", max_samples=None, require_solution=True
+        )
+        self.assertEqual(full[0]["solution"], "\\boxed{73}")
+        self.assertEqual(
+            full[0]["privileged_context"],
+            PI_FULL.format(demo="unused demo 1"),
+        )
+        self.assertEqual(full[0]["prompt"][-1]["content"], "What is 40 + 33?")
+        self.assertNotIn("unused demo", full[0]["prompt"][-1]["content"])
+
+    def test_hint_uses_cache_order_answers_and_sdft_wording(self):
+        cache = Dataset.from_dict(
+            {
+                "question": ["cached q1", "cached q0"],
+                "final_answer": ["11", "7"],
+                "hint": ["use parity", "factor first"],
+                "gen_model": ["student", "student"],
+                "dataset": ["deepmath", "deepmath"],
+            }
+        )
+        loader = Mock(return_value=cache)
+        with patch("train.ppo.train_ppo_pi.load_hint_cache", loader):
+            hint = build_ppo_pi_dataset(
+                "deepmath", max_samples=2, pi_mode="hint", model="student"
+            )
+
+        loader.assert_called_once_with("student", "deepmath", max_samples=2)
+        self.assertEqual(
+            [row["prompt"][-1]["content"] for row in hint],
+            ["cached q1", "cached q0"],
+        )
+        self.assertEqual(hint["solution"], ["\\boxed{11}", "\\boxed{7}"])
+        self.assertEqual(
+            hint[0]["privileged_context"], PI_HINT.format(hint="use parity")
+        )
+        self.assertNotIn("use parity", hint[0]["prompt"][-1]["content"])
+
+    def test_full_and_hint_are_currently_deepmath_only(self):
+        for pi_mode in ("full", "hint"):
+            with self.subTest(pi_mode=pi_mode), self.assertRaisesRegex(
+                ValueError, "only.*deepmath"
+            ):
+                build_ppo_pi_dataset(
+                    "deepscaler", pi_mode=pi_mode, model="student"
+                )
+
+    def test_full_and_hint_require_model_identity(self):
+        for pi_mode in ("full", "hint"):
+            with self.subTest(pi_mode=pi_mode), self.assertRaisesRegex(
+                ValueError, "needs --model"
+            ):
+                build_ppo_pi_dataset("deepmath", pi_mode=pi_mode)
+
+
+class PPIFullPromptFilterTest(unittest.TestCase):
+    def test_filters_on_exact_composed_critic_prompt(self):
+        class Tokenizer:
+            @staticmethod
+            def apply_chat_template(conversations, **_kwargs):
+                user_text = conversations[0][-1]["content"]
+                length = 20 if "LONG DEMO" in user_text else 5
+                return {"input_ids": [list(range(length))]}
+
+        ds = Dataset.from_list(
+            [
+                {
+                    "prompt": [{"role": "user", "content": "q0"}],
+                    "solution": "\\boxed{0}",
+                    "privileged_context": PI_FULL.format(demo="short demo"),
+                },
+                {
+                    "prompt": [{"role": "user", "content": "q1"}],
+                    "solution": "\\boxed{1}",
+                    "privileged_context": PI_FULL.format(demo="LONG DEMO"),
+                },
+            ]
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()
+        ):
+            filtered = filter_long_full_value_prompts(
+                ds,
+                pi_mode="full",
+                model="student",
+                max_value_prompt_length=10,
+            )
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["prompt"][-1]["content"], "q0")
+
+    def test_hint_is_not_length_filtered(self):
+        ds = Dataset.from_list(
+            [
+                {
+                    "prompt": [{"role": "user", "content": "q"}],
+                    "solution": "\\boxed{0}",
+                    "privileged_context": PI_HINT.format(hint="hint"),
+                }
+            ]
+        )
+        with patch("transformers.AutoTokenizer.from_pretrained") as tokenizer:
+            unchanged = filter_long_full_value_prompts(
+                ds,
+                pi_mode="hint",
+                model="student",
+                max_value_prompt_length=1,
+            )
+
+        self.assertIs(unchanged, ds)
+        tokenizer.assert_not_called()
 
 
 class PPOPIValueInputTest(unittest.TestCase):
@@ -240,6 +363,7 @@ class PPOPIMetadataTest(unittest.TestCase):
             vf_coef=0.1,
             cliprange_value=0.2,
             critic_max_grad_norm=1.0,
+            critic_warmup_steps=0,
             loss_type="dapo",
             vllm_mode="colocate",
             optim="paged_adamw_8bit",
@@ -249,6 +373,7 @@ class PPOPIMetadataTest(unittest.TestCase):
             per_device_train_batch_size=1,
             gradient_accumulation_steps=16,
             num_generations=1,
+            max_value_prompt_length=8192,
         )
 
     def test_pi_arms_have_distinct_strict_critic_identity(self):
@@ -263,6 +388,29 @@ class PPOPIMetadataTest(unittest.TestCase):
         self.assertNotEqual(
             control["value_prompt_version"], answer["value_prompt_version"]
         )
+
+    def test_all_pi_modes_have_distinct_critic_identity(self):
+        versions = {
+            build_run_meta(self.args(pi_mode), 100)["value_prompt_version"]
+            for pi_mode in ("none", "answer", "full", "hint")
+        }
+        self.assertEqual(len(versions), 4)
+
+    def test_hint_cache_provenance_is_recorded(self):
+        meta = build_run_meta(self.args("hint"), 100)
+
+        self.assertEqual(meta["gen_model"], "Qwen/Qwen3-1.7B")
+        self.assertEqual(
+            meta["hint_cache_path"], "data/pi/hint/deepmath/Qwen3-1.7B"
+        )
+        self.assertIsNone(meta["max_value_prompt_length"])
+
+    def test_full_prompt_limit_is_recorded_only_when_it_affects_selection(self):
+        full = build_run_meta(self.args("full"), 100)
+        answer = build_run_meta(self.args("answer"), 100)
+
+        self.assertEqual(full["max_value_prompt_length"], 8192)
+        self.assertIsNone(answer["max_value_prompt_length"])
 
 
 if __name__ == "__main__":

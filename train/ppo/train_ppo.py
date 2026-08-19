@@ -23,6 +23,13 @@ What we override on GRPOTrainer:
                             (MSE) loss over the critic's fresh predictions vs returns.
   * `create_optimizer`    -- add the value model's parameters so the critic trains.
 
+Critic warmup (--critic-warmup-steps, default 0 = off) freezes the policy for the first N
+optimizer steps so the randomly-initialised `.score` head can fit P(correct|prefix) against
+rollouts from a FIXED policy before its predictions start steering that policy. Without it the
+first updates hand the actor advantages from a critic that is still near its random init.
+Warmup steps are counted against --max-steps, so `--critic-warmup-steps 20 --max-steps 200`
+leaves the policy 180 updates.
+
 GAE: gamma=1.0 (no discounting over a single reasoning episode)
 lam->1 makes advantages ~ Monte-Carlo return minus the critic baseline,
 lam<1 leans on the critic's bootstrap.
@@ -177,6 +184,12 @@ class PPOConfig(GRPOConfig):
                           "max_grad_norm. 0.0 measures the norm without clipping."},
     )
     whiten_advantages: bool = field(default=True, metadata={"help": "Whiten GAE advantages over the mask."})
+    critic_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Optimizer steps at the start of training during which the policy is "
+                          "frozen and only the critic trains. Counted against max_steps. 0 "
+                          "disables (joint training from step 0)."},
+    )
     missing_eos_penalty: float = field(
         default=0.0,
         metadata={"help": "Subtract from a completion's terminal reward if it did not end in EOS "
@@ -187,6 +200,11 @@ class PPOConfig(GRPOConfig):
         # Reference-free objective; advantages are GAE, so no group-normalization.
         self.beta = 0.0
         self.scale_rewards = "none"
+
+        if self.critic_warmup_steps < 0:
+            raise ValueError(
+                f"critic_warmup_steps must be >= 0; got {self.critic_warmup_steps}."
+            )
 
         requested_num_generations = self.num_generations
         if requested_num_generations < 1:
@@ -331,6 +349,23 @@ class PPOTrainer(GRPOTrainer):
             f"optimizer, not the loss. Known cause: a bitsandbytes 8-bit optimizer "
             f"(--optim {self.args.optim}) while --vllm-mode server holds an NCCL weight-sync "
             f"group. Use --optim adafactor. See the module docstring."
+        )
+
+    # -- critic warmup -------------------------------------------------------
+
+    @property
+    def in_critic_warmup(self) -> bool:
+        """True while only the critic trains (see `_compute_loss`).
+
+        `state.global_step` counts COMPLETED optimizer steps and is incremented after
+        `optimizer.step()`, so it holds k throughout every micro-batch of optimizer step k:
+        `< critic_warmup_steps` therefore covers exactly that many steps. It is also restored
+        by `--resume-from-checkpoint`, so a resumed run does not repeat a warmup it finished.
+        """
+        return (
+            self.args.critic_warmup_steps > 0
+            and self.model.training
+            and self.state.global_step < self.args.critic_warmup_steps
         )
 
     # -- per-token value predictions ----------------------------------------
@@ -509,9 +544,20 @@ class PPOTrainer(GRPOTrainer):
     def _compute_loss(self, model, inputs):
         pg_loss = super()._compute_loss(model, inputs)  # policy loss (already normalized)
 
+        # Warmup: keep the surrogate in the graph but scale it to zero, so the policy receives
+        # exactly-zero gradients while the rollout, reward, GAE and logging paths stay identical
+        # to a normal step. GRPO's own metrics (clip ratio, entropy) are recorded by the super()
+        # call above and therefore still report what the policy WOULD have done.
+        # This does not skip the policy's backward pass -- it costs the same as a real step. The
+        # optimizer still steps on zero grads, which is a no-op for adafactor/Adam at the default
+        # weight_decay=0; a nonzero weight decay would still shrink the frozen policy.
+        warmup = self.in_critic_warmup
+        if warmup:
+            pg_loss = pg_loss * 0.0
+
         completion_mask = inputs["completion_mask"]
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
-        # Unscorable rollouts carry a fabricated reward of 0, so their `returns` are not a
+        # Unscorable rollouts carry a reward of 0, so their `returns` are not a
         # real target -- keep them out of the critic's regression.
         # Their advantages were already zeroed, so the policy loss ignores them too.
         if "scorable" in inputs:
@@ -552,6 +598,9 @@ class PPOTrainer(GRPOTrainer):
             vf_loss = vf_loss / (self.current_gradient_accumulation_steps if mode == "train" else 1.0)
 
         clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), mask)
+        # Logged every step (not just during warmup) so the transition is visible as an edge in
+        # TensorBoard rather than a gap, and so runs with warmup disabled still plot a flat 0.
+        self._metrics[mode]["ppo/critic_warmup"].append(1.0 if warmup else 0.0)
         self._metrics[mode]["ppo/vf_loss"].append(self.accelerator.gather(vf_loss.detach()).mean().item())
         self._metrics[mode]["ppo/vf_clipfrac"].append(self.accelerator.gather(clipfrac.detach()).mean().item())
 
@@ -584,6 +633,10 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "vf_coef": args.vf_coef,
         "cliprange_value": args.cliprange_value,
         "critic_max_grad_norm": args.critic_max_grad_norm,
+        # resume-critical: warmup is keyed on the RESTORED global_step, so a resumed run
+        # silently trains jointly if it finished warmup -- recording it makes a changed
+        # value an error rather than an invisible difference between the two halves.
+        "critic_warmup_steps": args.critic_warmup_steps,
         "loss_type": args.loss_type,
         "vllm_mode": args.vllm_mode,
         # Recorded because the optimizer x vllm_mode combination decides whether the policy
@@ -632,6 +685,11 @@ def main():
     p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
                    help="Clip the critic's gradients to this norm separately from the policy "
                         "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping")
+    p.add_argument("--critic-warmup-steps", type=int, default=0,
+                   help="Freeze the policy for this many optimizer steps at the start of "
+                        "training so the randomly-initialised value head can fit against a "
+                        "FIXED policy before its advantages start steering one. Counted "
+                        "against --max-steps. 0 = joint training from step 0.")
     p.add_argument("--no-whiten-advantages", dest="whiten_advantages",
                    action="store_false", help="Disable GAE advantage whitening.")
     p.add_argument("--missing-eos-penalty", type=float, default=0.0,
@@ -767,6 +825,7 @@ def main():
         vf_coef=args.vf_coef,
         cliprange_value=args.cliprange_value,
         critic_max_grad_norm=args.critic_max_grad_norm,
+        critic_warmup_steps=args.critic_warmup_steps,
         whiten_advantages=args.whiten_advantages,
         missing_eos_penalty=args.missing_eos_penalty,
         # policy surrogate (inherited GRPO machinery)

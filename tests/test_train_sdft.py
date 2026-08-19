@@ -34,6 +34,76 @@ def hint_cache():
     })
 
 
+def generated_hint_cache(generator: str):
+    return Dataset.from_dict({
+        "question": ["q0", "q1"],
+        "hint": ["learned h0", "learned h1"],
+        "gen_model": [generator] * 2,
+        "dataset": ["deepmath"] * 2,
+    })
+
+
+class HintSdftDatasetTest(unittest.TestCase):
+    def test_explicit_learned_generator_cache_is_loaded_and_wrapped(self):
+        generator = "/models/hint-run/checkpoint-100"
+        with (
+            mock.patch.object(train_sdft.os.path, "isdir", return_value=True),
+            mock.patch.object(
+                train_sdft,
+                "load_from_disk",
+                return_value=generated_hint_cache(generator),
+            ) as loader,
+        ):
+            ds = train_sdft.build_sdft_dataset(
+                "hint",
+                dataset="deepmath",
+                max_samples=1,
+                model="student",
+                hint_generator_model=generator,
+                hint_cache="cache/learned",
+            )
+
+        loader.assert_called_once_with("cache/learned")
+        self.assertEqual(len(ds), 1)
+        self.assertEqual(ds[0]["prompt"][-1]["content"], "q0")
+        self.assertIn("learned h0", ds[0]["privileged_context"])
+
+    def test_generator_provenance_mismatch_is_rejected(self):
+        with (
+            mock.patch.object(train_sdft.os.path, "isdir", return_value=True),
+            mock.patch.object(
+                train_sdft,
+                "load_from_disk",
+                return_value=generated_hint_cache("different-generator"),
+            ),
+            self.assertRaisesRegex(ValueError, "exact generator string"),
+        ):
+            train_sdft.build_hint_dataset(
+                "student",
+                "deepmath",
+                None,
+                hint_generator_model="expected-generator",
+                hint_cache="cache/learned",
+            )
+
+    def test_omitted_generator_and_cache_preserve_self_hint_lookup(self):
+        with (
+            mock.patch.object(
+                train_sdft, "hint_path", return_value="legacy/self-cache"
+            ) as path_builder,
+            mock.patch.object(train_sdft.os.path, "isdir", return_value=True),
+            mock.patch.object(
+                train_sdft,
+                "load_from_disk",
+                return_value=generated_hint_cache("student"),
+            ) as loader,
+        ):
+            ds = train_sdft.build_hint_dataset("student", "deepmath", max_samples=2)
+
+        path_builder.assert_called_once_with("student", "deepmath")
+        loader.assert_called_once_with("legacy/self-cache")
+        self.assertEqual(len(ds), 2)
+
 class RolloutSdftDatasetTest(unittest.TestCase):
     def build(self, cache=None, sample_idx=1):
         with (
@@ -144,6 +214,40 @@ class RolloutRunMetadataTest(unittest.TestCase):
             meta["rollout_pi_selection_policy"], "fixed_sample_idx_without_reward"
         )
 
+    def test_learned_hint_source_and_cache_are_recorded(self):
+        generator = "/models/hint-run/checkpoint-100"
+        args = types.SimpleNamespace(
+            model="student",
+            pi_mode="hint",
+            dataset="deepmath",
+            max_samples=128,
+            hint_generator_model=generator,
+            hint_cache="cache/learned",
+            rollout_pi_root="unused",
+            rollout_pi_sample_idx=0,
+            distillation_mode="sampled_token",
+            distillation_alpha=1.0,
+            teacher_model_kind="base",
+            learning_rate=1e-5,
+            seed=42,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=16,
+            num_generations=1,
+            max_prompt_length=8192,
+        )
+
+        meta = train_sdft.build_run_meta(args, num_train_examples=100)
+
+        self.assertEqual(meta["gen_model"], generator)
+        self.assertEqual(meta["hint_generator_model"], generator)
+        self.assertEqual(
+            meta["hint_cache"], train_sdft.os.path.abspath("cache/learned")
+        )
+        self.assertEqual(meta["hint_source"], "trained_generator")
+        self.assertEqual(
+            train_sdft.hint_generator_run_slug(generator),
+            "hint-run_checkpoint-100",
+        )
 
 if __name__ == "__main__":
     unittest.main()

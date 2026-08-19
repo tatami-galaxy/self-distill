@@ -1,27 +1,36 @@
 """
-Generate self-hints for SDFT's `--pi-mode hint` (the "hint-self" PI arm).
+Generate hint caches for SDFT's `--pi-mode hint`.
 
 The model reads each DeepMath problem together with its reference solution and
 compresses it into a SMALL set of useful concepts and intermediate results --
 NOT the final answer. This is summarization of a solution the model can see, so
-even a small student produces good hints; the point is that the hint is phrased
-in the student's own terms and carries no answer, sitting between the `full`
-(whole solution) and `answer` (boxed value) privileged contexts.
+the resulting context carries no answer and sits between the `full` (whole
+solution) and `answer` (boxed value) privileged contexts. The original
+"hint-self" arm uses the student itself as `--model`; a separately trained hint
+generator can be used by passing its model/checkpoint here instead.
 
-Run ONCE per model, before training. The model here MUST be the model you train
-with (`train_sdft.py --model`): the hint is only "self" if the same weights wrote
-it. That is enforced structurally -- the cache is keyed by model slug and stamped
-with a `gen_model` column that train_sdft asserts against its `--model`.
+Every cache is stamped with the exact `--model` string in `gen_model`.
+train_sdft.py validates that against `--hint-generator-model`, so use the same
+string in both commands.
 
 Anti-leak: DeepMath solutions end in \\boxed{answer}; a hint that restates the
 answer would collapse this PI into the `answer` PI and confound the experiment.
 Rows whose hint contains \\boxed or the gold final answer are dropped.
 
-Output: an on-disk HF dataset at data/pi/hint/<dataset>/<model-slug>/ with columns
-question, final_answer, hint, gen_model, dataset.
+Output: an on-disk HF dataset with columns question, final_answer, hint,
+gen_model, dataset. The default path is data/pi/hint/<dataset>/<model-slug>/;
+use `--output-dir` for trained checkpoints so different runs cannot share the
+same generic checkpoint slug.
 
+# Original self-hint cache
 CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_hints \
     --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 20000
+
+# Cache from a trained hint generator
+CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_hints \
+    --model /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_a1_g1/checkpoint-100 \
+    --dataset deepmath --max-samples 20000 \
+    --output-dir data/pi/hint/deepmath/Qwen3-1.7B-a1g1-checkpoint-100
 """
 
 import argparse
@@ -32,7 +41,6 @@ from datasets import Dataset, load_from_disk
 from vllm import LLM, SamplingParams
 
 from utils import DATASET_REGISTRY_TRAIN, hint_path, load_train_dataset
-
 
 HINT_SYSTEM = (
     "You are given a math problem and a full worked solution. Extract a "
@@ -70,9 +78,9 @@ def leaks_answer(hint: str, gold: str) -> bool:
     if "\\boxed" in hint:
         return True
     g = str(gold).strip()
-    if len(g) >= 2 and re.search(rf"(?<![\w.]){re.escape(g)}(?![\w.])", hint):
-        return True
-    return False
+    return len(g) >= 2 and re.search(
+        rf"(?<![\w.]){re.escape(g)}(?![\w.])", hint
+    ) is not None
 
 
 def strip_thinking(text: str) -> str | None:
@@ -98,7 +106,8 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--model", default="Qwen/Qwen3-1.7B",
-                   help="MUST match the model you train with (self-hint purity).")
+                   help="Hint generator model or local checkpoint. For self-hints this is "
+                        "the student model; otherwise pass it to train_sdft.py as well.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
                    help="Source dataset (see utils.DATASET_REGISTRY_TRAIN); only its "
                         "solution-bearing rows are used. MUST match the training --dataset.")
@@ -106,6 +115,8 @@ def main():
                    help="How many solution-bearing rows to generate hints for. Generate "
                         "for the largest N you will train on; training takes a prefix.")
     p.add_argument("--output-root", default="data/pi/hint")
+    p.add_argument("--output-dir", default=None,
+                   help="Exact cache directory; overrides --output-root path construction.")
     p.add_argument("--force", action="store_true",
                    help="Regenerate even if a large-enough cache already exists.")
     # generation
@@ -120,7 +131,7 @@ def main():
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     args = p.parse_args()
 
-    out_dir = hint_path(args.model, args.dataset, args.output_root)
+    out_dir = args.output_dir or hint_path(args.model, args.dataset, args.output_root)
 
     # Reuse guard: skip if a compatible cache (same model, >= requested rows) exists.
     if not args.force and os.path.isdir(out_dir):
