@@ -127,11 +127,9 @@ def hint_path(model: str, dataset: str, root: str = "data/pi/hint") -> str:
 # ---------------------------------------------------------------------------
 # Privileged context (PI)
 #
-# The PI *content* templates (PI_FULL / PI_ANSWER / PI_HINT) live in
-# train/opsd/train_sdft.py, next to the trainer whose vocabulary they are. What lives
-# here is how a PI string is STITCHED into a prompt -- shared by SDFT (where the
-# teacher scores under it) and PPO-PI (where the critic values under it), and
-# needed by utils itself, so it cannot live in train_sdft without a cycle.
+# The PI content templates live in utils/pi.py. What lives here is how a PI string is
+# STITCHED into a prompt -- shared by SDFT (where the teacher scores under it) and PPO-PI
+# (where the critic values under it).
 # ---------------------------------------------------------------------------
 
 # How the privileged context is folded into the teacher/critic's user turn.

@@ -275,6 +275,7 @@ ALGO_COLORS = {
     "gold": "#54a24b",
     "sdft": "#e45756",
     "ppo": "#7a5195",
+    "ppo_pi": "#b279a2",
     "ppo_val": "#9c755f",
     "sdft_tt": "#79706e",
 }

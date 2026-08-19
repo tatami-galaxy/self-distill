@@ -67,7 +67,9 @@ from utils import (
 # distinguished only by a --run label. `sdft_tt` is
 # train/opsd/train_self_teacher/sdft_with_teacher.py -- SDFT whose teacher was trained by the
 # E-step in that same package.
-ALGOS = ("base", "grpo", "ppo", "ppo_val", "gold", "sdft", "sdft_tt", "sft")
+ALGOS = (
+    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sdft_tt", "sft"
+)
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
 # existed have no `schema_version` at all: v1 summaries carry `arm`, and the earliest ones
@@ -80,6 +82,7 @@ SUMMARY_SCHEMA_VERSION = 2
 # for GOLD the teacher ARE the independent variable under study, so filing two of them under
 # a bare `sdft/` or `gold/` would merge runs that the experiment exists to tell apart.
 VARIANT_REQUIRED = {
+    "ppo_pi": "the critic's privileged context, e.g. --variant answer or --variant none",
     "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
     # For sdft_tt the variable is the pair (PI, E-step objective): the per-token and aggregate

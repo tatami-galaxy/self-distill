@@ -54,6 +54,10 @@ from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from utils import (
     DATASET_REGISTRY_TRAIN,
+    PI_ANSWER,
+    PI_FULL,
+    PI_HINT,
+    PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
     compose_pi_messages,
     format_prompt_math,
@@ -61,32 +65,6 @@ from utils import (
     load_hint_cache,
     load_train_dataset,
     validate_resume,
-)
-
-
-# ---------------------------------------------------------------------------
-# Privileged context ("c"): a self-contained string appended to the teacher's
-# user turn by SDFTTrainer via teacher_prompt_template ("{prompt}\n\n{privileged_context}").
-# ---------------------------------------------------------------------------
-
-PI_FULL = (
-    "This is an example of a correct, worked solution to the question above:\n\n"
-    "{demo}\n\n"
-    "Now write a complete solution of your own, including the reasoning."
-)
-PI_ANSWER = (
-    "Hint: the correct final answer to the question above is \\boxed{{{answer}}}. "
-    "Reach it with your own complete reasoning."
-)
-PI_HINT = (
-    "Here are some useful concepts for the question above:\n\n"
-    "{hint}\n\n"
-    "Use them for your own complete solution if needed."
-)
-PI_ROLLOUT = (
-    "Here is an attempted solution to the question above. It may or may not be correct:\n\n"
-    "{attempt}\n\n"
-    "Now write a complete solution of your own, including the reasoning."
 )
 
 # How SDFTTrainer stitches the student prompt and privileged context into the teacher's

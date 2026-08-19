@@ -10,45 +10,50 @@ here would drag an inference engine into every `import utils`. Run it as `python
 utils.gen_hints`.
 """
 
+from utils.pi import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT
 from utils.utils import (
-    # prompts
-    MATH_SYSTEM_PROMPT,
-    format_prompt_math,
-    # resume validation
-    validate_resume,
-    # privileged context (PI)
-    TEACHER_PROMPT_TEMPLATE,
-    compose_pi_messages,
-    hint_path,
-    load_hint_cache,
-    # answer extraction / grading
-    extract_answer,
-    grade,
-    grade_answer,
     # dataset registries and loaders
     DATASET_REGISTRY_EVAL,
     DATASET_REGISTRY_TRAIN,
+    # prompts
+    MATH_SYSTEM_PROMPT,
+    # privileged context (PI)
+    TEACHER_PROMPT_TEMPLATE,
+    compose_pi_messages,
+    # answer extraction / grading
+    extract_answer,
+    format_prompt_math,
+    grade,
+    grade_answer,
+    has_solution,
+    hint_path,
+    load_hint_cache,
+    load_train_dataset,
     register_dataset_eval,
     register_dataset_train,
-    has_solution,
-    load_train_dataset,
+    # resume validation
+    validate_resume,
 )
 
 __all__ = [
-    "MATH_SYSTEM_PROMPT",
-    "format_prompt_math",
-    "validate_resume",
-    "TEACHER_PROMPT_TEMPLATE",
-    "compose_pi_messages",
-    "hint_path",
-    "load_hint_cache",
-    "extract_answer",
-    "grade",
-    "grade_answer",
     "DATASET_REGISTRY_EVAL",
     "DATASET_REGISTRY_TRAIN",
+    "MATH_SYSTEM_PROMPT",
+    "PI_ANSWER",
+    "PI_FULL",
+    "PI_HINT",
+    "PI_ROLLOUT",
+    "TEACHER_PROMPT_TEMPLATE",
+    "compose_pi_messages",
+    "extract_answer",
+    "format_prompt_math",
+    "grade",
+    "grade_answer",
+    "has_solution",
+    "hint_path",
+    "load_hint_cache",
+    "load_train_dataset",
     "register_dataset_eval",
     "register_dataset_train",
-    "has_solution",
-    "load_train_dataset",
+    "validate_resume",
 ]
