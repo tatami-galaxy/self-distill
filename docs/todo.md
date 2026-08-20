@@ -15,6 +15,7 @@
 - PI conditioned value function
   - [ ] $A^{\mathrm{actor}}_{t,k}=(1-\rho_k)A^{\mathrm{SD}}_{0,t}+\rho_k A^{R,\mathrm{GAE}}_{t},\qquad\rho_k\in[0,1]$
   - [ ] value pre-training
+  - PVF analysis, comparison with SDFT
 
 - PI conditioned Q function
 
