@@ -112,7 +112,7 @@ def main():
                    help="Source dataset (see utils.DATASET_REGISTRY_TRAIN); only its "
                         "solution-bearing rows are used. MUST match the training --dataset.")
     p.add_argument("--max-samples", type=int, default=20000,
-                   help="How many solution-bearing rows to generate hints for. Generate "
+                   help="How many rows to generate hints for. Generate "
                         "for the largest N you will train on; training takes a prefix.")
     p.add_argument("--output-root", default="data/pi/hint")
     p.add_argument("--output-dir", default=None,

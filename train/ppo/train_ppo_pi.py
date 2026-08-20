@@ -412,8 +412,13 @@ def main():
                    help="GAE lambda. 1.0 = Monte-Carlo return minus critic baseline.")
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
     p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
-    p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
-                   help="Clip critic gradients separately from policy gradients; 0 disables.")
+    p.add_argument("--critic-max-grad-norm", type=float, default=10.0,
+                   help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
+                        "(which Trainer clips to max_grad_norm=1.0). Looser than the policy's "
+                        "because the critic's raw norms run ~10-40 early on, so a clip of 1.0 "
+                        "fires every step and becomes a step-size control instead of a spike "
+                        "guard. Pass 0 to disable clipping while still logging "
+                        "ppo/critic_grad_norm, so the two can be compared.")
     p.add_argument("--critic-warmup-steps", type=int, default=0,
                    help="Freeze the policy for this many optimizer steps at the start of "
                         "training so the randomly-initialised value head can fit against a "
@@ -436,8 +441,8 @@ def main():
                    help="Rollouts per prompt; PPO uses the critic rather than a group baseline.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
-    p.add_argument("--critic-learning-rate", type=float, default=None,
-                   help="Critic LR; omit to inherit --learning-rate.")
+    p.add_argument("--critic-learning-rate", type=float, default=1e-5,
+                   help="Learning rate for the critic. Defaults to 10x the policy's 1e-6")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts", "polynomial",
                             "constant", "constant_with_warmup", "inverse_sqrt"])

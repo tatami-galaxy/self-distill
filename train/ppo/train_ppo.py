@@ -65,6 +65,11 @@ What resume does and does not let you change:
     new run.
   * Changing --max-steps is only safe with lr_scheduler_type=constant (the default).
   * Extending far enough re-enters the dataset.
+  * A checkpoint written while --critic-learning-rate still defaulted to None recorded null in
+    run_meta.json, which no longer matches the 1e-5 default and so fails validate_resume. That
+    is the intended signal, not a bug: its optimizer state carries the OLD 1e-6 critic rate and
+    resuming would silently keep it. Continue such a run with --force-resume (accepting 1e-6),
+    or start fresh to actually get 1e-5.
 
 !! vLLM SERVER MODE + ANY bitsandbytes 8-bit OPTIMIZER CORRUPTS THE POLICY.  Use adafactor.  !!
 Prefer adafactor for 4B+: adamw_torch's fp32 moments cost ~8 bytes/param
@@ -171,17 +176,23 @@ class PPOConfig(GRPOConfig):
     lam: float = field(default=1.0, metadata={"help": "GAE lambda."})
     vf_coef: float = field(default=0.1, metadata={"help": "Value-loss weight."})
     critic_learning_rate: float | None = field(
-        default=None,
-        metadata={"help": "Learning rate for the critic's parameter group. None inherits the "
-                          "policy's `learning_rate` -- which is the RLVR-appropriate 1e-6, far "
-                          "below what the randomly-initialised `.score` head needs to converge "
-                          "inside a 200-step run."},
+        default=1e-5,
+        metadata={"help": "Learning rate for the critic's parameter group. Defaults to 10x the "
+                          "policy's 1e-6: the policy is pretrained and needs the small RLVR rate "
+                          "to avoid destroying it, whereas the `.score` head starts from a random "
+                          "init and has to learn P(correct|prefix) from scratch inside a few "
+                          "hundred steps. Explicit None inherits `learning_rate` instead (the "
+                          "old behaviour)."},
     )
     cliprange_value: float = field(default=0.2, metadata={"help": "Value-clipping range."})
     critic_max_grad_norm: float = field(
-        default=1.0,
+        default=10.0,
         metadata={"help": "Grad-norm clip for the critic, applied SEPARATELY from the policy's "
-                          "max_grad_norm. 0.0 measures the norm without clipping."},
+                          "max_grad_norm. Looser than the policy's 1.0 because the critic's "
+                          "raw norms start an order of magnitude higher (a random `.score` head "
+                          "regressing 0/1 outcomes): at 1.0 the clip fired on every step, which "
+                          "makes it a step-size control rather than the spike guard it is meant "
+                          "to be. 0.0 measures the norm without clipping."},
     )
     whiten_advantages: bool = field(default=True, metadata={"help": "Whiten GAE advantages over the mask."})
     critic_warmup_steps: int = field(
@@ -682,9 +693,13 @@ def main():
                         "<1.0 leans on the critic bootstrap.")
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
     p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
-    p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
-                   help="Clip the critic's gradients to this norm separately from the policy "
-                        "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping")
+    p.add_argument("--critic-max-grad-norm", type=float, default=10.0,
+                   help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
+                        "(which Trainer clips to max_grad_norm=1.0). Looser than the policy's "
+                        "because the critic's raw norms run ~10-40 early on, so a clip of 1.0 "
+                        "fires every step and becomes a step-size control instead of a spike "
+                        "guard. Pass 0 to disable clipping while still logging "
+                        "ppo/critic_grad_norm, so the two can be compared.")
     p.add_argument("--critic-warmup-steps", type=int, default=0,
                    help="Freeze the policy for this many optimizer steps at the start of "
                         "training so the randomly-initialised value head can fit against a "
@@ -711,10 +726,12 @@ def main():
                         "baseline, so grouping is unused -- each rollout gets its own GAE. ")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
-    p.add_argument("--critic-learning-rate", type=float, default=None,
-                   help="Learning rate for the critic. Omit to inherit --learning-rate. That "
-                        "default (1e-6) suits a pretrained policy but might be very slow for the "
-                        "critic's scalar head")
+    p.add_argument("--critic-learning-rate", type=float, default=1e-5,
+                   help="Learning rate for the critic. Defaults to 10x the policy's 1e-6: the "
+                        "policy is pretrained and needs the small RLVR rate, while the critic's "
+                        "RANDOMLY INITIALISED scalar head has to learn P(correct|prefix) from "
+                        "scratch within --max-steps. Ignored on resume (the rate comes from the "
+                        "checkpoint's optimizer state).")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])

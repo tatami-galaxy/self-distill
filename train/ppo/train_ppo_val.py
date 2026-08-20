@@ -218,10 +218,13 @@ def main():
                         "<1.0 leans on the critic bootstrap.")
     p.add_argument("--vf-coef", type=float, default=0.1, help="Value-loss weight.")
     p.add_argument("--cliprange-value", type=float, default=0.2, help="Value-clipping range.")
-    p.add_argument("--critic-max-grad-norm", type=float, default=1.0,
+    p.add_argument("--critic-max-grad-norm", type=float, default=10.0,
                    help="Clip the critic's gradients to this norm, SEPARATELY from the policy "
-                        "(which Trainer clips to max_grad_norm=1.0). Pass 0 to disable clipping "
-                        "while still logging ppo/critic_grad_norm, so the two can be compared.")
+                        "(which Trainer clips to max_grad_norm=1.0). Looser than the policy's "
+                        "because the critic's raw norms run ~10-40 early on, so a clip of 1.0 "
+                        "fires every step and becomes a step-size control instead of a spike "
+                        "guard. Pass 0 to disable clipping while still logging "
+                        "ppo/critic_grad_norm, so the two can be compared.")
     p.add_argument("--critic-warmup-steps", type=int, default=0,
                    help="Freeze the policy for this many optimizer steps at the start of "
                         "training so the randomly-initialised value head can fit against a "
@@ -249,11 +252,12 @@ def main():
                         "baseline, so grouping is unused -- each rollout gets its own GAE.")
     # optimization
     p.add_argument("--learning-rate", type=float, default=1e-6)
-    p.add_argument("--critic-learning-rate", type=float, default=None,
-                   help="Learning rate for the critic. Omit to inherit --learning-rate. That "
-                        "default (1e-6) suits a pretrained policy but is very slow for the "
-                        "critic's RANDOMLY INITIALISED scalar head, which has to learn "
-                        "P(correct|prefix) from scratch within --max-steps.")
+    p.add_argument("--critic-learning-rate", type=float, default=1e-5,
+                   help="Learning rate for the critic. Defaults to 10x the policy's 1e-6: the "
+                        "policy is pretrained and needs the small RLVR rate, while the critic's "
+                        "RANDOMLY INITIALISED scalar head has to learn P(correct|prefix) from "
+                        "scratch within --max-steps. Ignored on resume (the rate comes from the "
+                        "checkpoint's optimizer state).")
     p.add_argument("--lr-scheduler-type", default="constant",
                    choices=["linear", "cosine", "cosine_with_restarts",
                             "polynomial", "constant", "constant_with_warmup", "inverse_sqrt"])
