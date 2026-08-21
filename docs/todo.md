@@ -1,13 +1,22 @@
-### Baselines
+### Training data
 
 - [x] deepscaleR
-- [ ] Reasoning Gym
-- [ ] base models, sft-ed models, instruct models
-- [ ] beyondaime
-- [ ] hmmt
-- [ ] OPD from qwen 8B
-- [ ] coding, knowledge tasks
-- [ ] hyperparameter sweep
+- [ ] L3 reasoning subset of SciKnowEval
+- [ ] Countdown-CoT-20k
+
+### Benchmarks
+- [x] Aime
+- [ ] Beyondaime
+- [ ] HMMT
+- [ ] Countdown heldout
+- [ ] SciKnowEval
+
+### Models
+
+- [x] think models
+- [ ] base models
+- [ ] sft-ed models
+- [ ] instruct models
 
 
 ### Research
