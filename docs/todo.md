@@ -6,7 +6,7 @@
 
 ### Benchmarks
 
-- [x] Aime
+- [x] Aime 24, 25
 - [ ] Beyondaime
 - [ ] HMMT
 - [ ] Countdown heldout
@@ -23,12 +23,12 @@
 
 - PI conditioned value function
   - [ ] $A^{\mathrm{actor}}_{t,k}=(1-\rho_k)A^{\mathrm{SD}}_{0,t}+\rho_k A^{R,\mathrm{GAE}}_{t},\qquad\rho_k\in[0,1]$
-  - [ ] value pre-training
+  - [ ] value warmup
   - PVF analysis, comparison with SDFT
 
 - PI conditioned Q function
 
-  jbjbj
+  placeholder
 
 - Train self-teacher in SDFT 
 
@@ -39,3 +39,5 @@
 
   - [ ] Train self-teacher for hint generation
     - [x] $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad S(h)\ge \tau$
+    - [ ] Tune hyperparameters
+    - [ ] Dual objective
