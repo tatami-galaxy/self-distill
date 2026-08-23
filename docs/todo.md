@@ -1,6 +1,7 @@
 ### Training data
 
 - [x] deepscaleR
+- [ ] Reasoning Gym
 - [ ] L3 reasoning subset of SciKnowEval
 - [ ] Countdown-CoT-20k
 
@@ -8,7 +9,7 @@
 
 - [x] Aime 24, 25
 - [ ] Beyondaime
-- [ ] HMMT
+- [ ] Reasoning Gym
 - [ ] Countdown heldout
 - [ ] SciKnowEval
 
@@ -40,4 +41,5 @@
   - [ ] Train self-teacher for hint generation
     - [x] $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad S(h)\ge \tau$
     - [ ] Tune hyperparameters
+    - [ ] Other cost functions
     - [ ] Dual objective
