@@ -16,8 +16,14 @@
 ### Models
 
 - [x] think models
-- [-] sft-ed models
+- [ ] sft-ed models
 - [-] instruct models
+
+### SD Objective
+
+- [x] Reverse KL
+- [ ] JSD
+- [ ] Forward CE
 
 ### Research
 
@@ -41,3 +47,4 @@
     - [ ] Tune hyperparameters
     - [ ] Other cost functions
     - [ ] Dual objective
+    - [ ] LoRA on top of self-teacher 
