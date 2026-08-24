@@ -23,7 +23,8 @@ dict.  It therefore stays aligned through TRL's shuffle/split buffering and PPO 
 
 # single GPU, colocate vLLM
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.ppo.train_ppo_pi \
-    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode answer --max-steps 400
+    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode answer \
+    --max-steps 200 --critic-warmup-steps 20
 
 # 4B+: vLLM on its own GPU, policy + critic on another
 CUDA_VISIBLE_DEVICES=7 uv run trl vllm-serve \
