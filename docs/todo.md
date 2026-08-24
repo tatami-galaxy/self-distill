@@ -43,8 +43,8 @@
     - [x] Asymmetric aggregate
 
   - [ ] Train self-teacher for hint generation
-    - [x] $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad S(h)\ge \tau$
+    - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
     - [ ] Tune hyperparameters
     - [ ] Other cost functions
-    - [ ] Dual objective
+    - [ ] Dual objective : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad S(h)\ge \tau$
     - [ ] LoRA on top of self-teacher 
