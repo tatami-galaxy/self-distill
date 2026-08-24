@@ -23,6 +23,7 @@ Example (run separately for each base-model size):
 
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.hint_gen_compare \
       --run-dir /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_a1_g1 \
+      --output-dir results/hint_gen_compare/Qwen3-1.7B/deepmath_a1_g1 \
       --num-problems 64 --hints-per-problem 4 \
       --teacher-rollouts 4 --k 1 4
 
