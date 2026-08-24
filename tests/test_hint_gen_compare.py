@@ -122,6 +122,19 @@ class CheckpointSpecTest(unittest.TestCase):
                 [label for label, _ in variants],
                 ["fresh_base", "checkpoint-3", "checkpoint-20"],
             )
+            self.assertEqual(
+                hint_gen_compare.expected_generator_ids(args),
+                ["fresh_base", "checkpoint-3", "checkpoint-20"],
+            )
+
+    def test_cheaper_defaults_are_valid_and_explicit(self):
+        parser = hint_gen_compare.build_parser()
+        args = parser.parse_args([])
+        hint_gen_compare.validate_args(args, parser)
+
+        self.assertEqual(args.num_problems, 64)
+        self.assertEqual(args.teacher_rollouts, 4)
+        self.assertEqual(args.k, [1, 4])
 
 
 class SummaryTest(unittest.TestCase):
@@ -178,7 +191,7 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(summary["invalid_fraction"], 1 / 3)
         self.assertEqual(summary["invalid_counts"], {"answer_leak": 1})
 
-    def test_legacy_validity_rate_is_reported_as_unobservable(self):
+    def test_unobservable_validity_rate_is_reported_as_unknown(self):
         hints = [self.hint("h1", "q1", 10)]
         hints[0]["validity_observable"] = False
         summary = hint_gen_compare.summarize_generator_subset(

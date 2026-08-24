@@ -10,10 +10,9 @@ separate properties:
 * transfer: the raw sampled reverse-KL estimate ``log p - log q_hint`` averaged
   over the same unhinted-student rollouts used by hint-generator training.
 
-The existing ``data/pi/hint`` cache is included as ``legacy_base``.  It is marked
-as validity-unobservable because ``utils/gen_hints.py`` discarded invalid samples
-before saving it.  ``fresh_base`` is regenerated with exactly the same budget and
-sampling settings as the checkpoints and is therefore the primary control.
+``fresh_base`` is regenerated with exactly the same budget and sampling settings
+as the checkpoints and is the sole base-model control.  The existing
+``data/pi/hint`` cache is used only to define the paired question cohort.
 
 Generation, vLLM teacher sampling, and Hugging Face log-probability scoring run in
 separate spawned processes.  This is a correctness boundary: initializing a vLLM
@@ -24,8 +23,8 @@ Example (run separately for each base-model size):
 
     CUDA_VISIBLE_DEVICES=0 uv run python -m eval.hint_gen_compare \
       --run-dir /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_a1_g1 \
-      --num-problems 128 --hints-per-problem 4 \
-      --teacher-rollouts 8 --k 1 4 8
+      --num-problems 64 --hints-per-problem 4 \
+      --teacher-rollouts 4 --k 1 4
 
 The default ``--phase sweep`` prepares the fixed cohort, generates hints, scores
 sufficiency and transfer, and writes ``summary.json``.  Every expensive stage is
@@ -60,7 +59,6 @@ from utils import (
     compose_pi_messages,
     format_prompt_math,
     grade,
-    hint_path,
     load_hint_cache,
     load_train_dataset,
 )
@@ -68,7 +66,7 @@ from utils.gen_hints import build_messages as build_hint_generator_messages
 
 SCHEMA_VERSION = 1
 METHOD = "hint_generator_comparison"
-GENERATOR_IDS_RESERVED = {"legacy_base", "fresh_base", "no_hint"}
+GENERATOR_IDS_RESERVED = {"fresh_base", "no_hint"}
 PHASES = ("sweep", "prepare", "generate", "sufficiency", "transfer", "summarize")
 
 
@@ -82,7 +80,7 @@ def _sha256_text(text: str) -> str:
 
 
 def stable_question_id(question_idx: int, question: str, final_answer: str) -> str:
-    """Identify a row of the legacy cache even if question text is duplicated."""
+    """Identify a source-cache row even if question text is duplicated."""
     return _sha256_text(f"{question_idx}\0{question}\0{final_answer}")[:24]
 
 
@@ -334,11 +332,11 @@ def generator_variants(args: argparse.Namespace) -> list[tuple[str, str]]:
 
 
 def expected_generator_ids(args: argparse.Namespace) -> list[str]:
-    return ["legacy_base"] + [label for label, _ in generator_variants(args)]
+    return [label for label, _ in generator_variants(args)]
 
 
 # ---------------------------------------------------------------------------
-# Fixed paired cohort and legacy-cache arm
+# Fixed paired cohort
 # ---------------------------------------------------------------------------
 
 
@@ -364,16 +362,9 @@ def prepare_config(args: argparse.Namespace) -> dict:
 
 
 def prepare_phase(args: argparse.Namespace) -> None:
-    from transformers import AutoTokenizer
-
     cohort_path, meta_path = cohort_paths(args)
-    legacy_path, legacy_meta_path = hint_paths(args, "legacy_base")
     config = prepare_config(args)
     if cache_matches(cohort_path, meta_path, config, args.force):
-        if not legacy_path.is_dir() or not legacy_meta_path.is_file():
-            raise FileNotFoundError(
-                "The cohort exists but its legacy-base hint arm is missing."
-            )
         return
 
     hints = load_hint_cache(args.model, args.dataset, root=args.hint_root)
@@ -432,7 +423,6 @@ def prepare_phase(args: argparse.Namespace) -> None:
                 "question": question,
                 "final_answer": str(row["final_answer"]),
                 "solution": solutions[question],
-                "legacy_hint": str(row["hint"]),
                 "student_rollout_successes": successes,
                 "student_rollout_count": len(selected),
                 "difficulty": (
@@ -442,7 +432,7 @@ def prepare_phase(args: argparse.Namespace) -> None:
         )
     if not eligible:
         raise RuntimeError(
-            "No legacy-hint questions have both a solution and enough rollouts."
+            "No hint-cache questions have both a solution and enough rollouts."
         )
     n = min(args.num_problems, len(eligible))
     selected_positions = sorted(
@@ -451,35 +441,7 @@ def prepare_phase(args: argparse.Namespace) -> None:
     cohort_rows = [eligible[index] for index in selected_positions]
     cohort = Dataset.from_list(cohort_rows)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    legacy_rows = []
-    for problem in cohort_rows:
-        hint = problem["legacy_hint"]
-        reason = invalid_hint_reason(hint, problem["final_answer"])
-        token_ids = tokenizer.encode(hint, add_special_tokens=False)
-        legacy_rows.append(
-            {
-                "hint_id": stable_hint_id("legacy_base", problem["question_id"], 0),
-                "question_id": problem["question_id"],
-                "question_idx": int(problem["question_idx"]),
-                "generator_id": "legacy_base",
-                "generator_model": args.model,
-                "generator_kind": "filtered_legacy_cache",
-                "hint_sample_idx": 0,
-                "generation_seed": -1,
-                "hint": hint,
-                "hint_token_ids": list(token_ids),
-                "num_hint_tokens": len(token_ids),
-                "length_source": "retokenized_text",
-                "truncated": False,
-                "invalid_reason": reason or "",
-                "validity_observable": False,
-            }
-        )
-    legacy = Dataset.from_list(legacy_rows)
-
     save_dataset_atomic(cohort, cohort_path)
-    save_dataset_atomic(legacy, legacy_path)
     cohort_fp = cohort_fingerprint(cohort)
     write_json_atomic(
         meta_path,
@@ -489,26 +451,8 @@ def prepare_phase(args: argparse.Namespace) -> None:
             "config": config,
             "cohort_fingerprint": cohort_fp,
             "num_problems": len(cohort),
-            "selection": "random_subset_of_legacy_hint_cache_intersected_with_rollouts",
+            "selection": "random_subset_of_hint_cache_intersected_with_rollouts",
             "difficulty_definition": "hard=0/L, easy=L/L, intermediate=otherwise",
-        },
-    )
-    write_json_atomic(
-        legacy_meta_path,
-        {
-            "status": "complete",
-            "method": METHOD,
-            "config": {
-                "generator_id": "legacy_base",
-                "generator_model": args.model,
-                "cohort_fingerprint": cohort_fp,
-                "source": str(
-                    Path(hint_path(args.model, args.dataset, args.hint_root)).resolve()
-                ),
-                "validity_observable": False,
-            },
-            "num_hints": len(legacy),
-            "hint_fingerprint": hint_fingerprint(legacy),
         },
     )
     print(f"Prepared {len(cohort)} paired problems -> {cohort_path}")
@@ -1302,35 +1246,27 @@ def summarize_phase(args: argparse.Namespace) -> dict:
         )
 
     paired = {}
-    references = [
-        generator_id
-        for generator_id in ("fresh_base", "legacy_base")
-        if generator_id in metric_maps_by_generator
-    ]
+    reference = "fresh_base"
     for candidate_index, candidate in enumerate(expected_generator_ids(args)):
-        for reference_index, reference in enumerate(references):
-            if candidate == reference:
-                continue
-            label = f"{candidate}_minus_{reference}"
-            paired[label] = {
-                "candidate": candidate,
-                "reference": reference,
-                "sign": "candidate_minus_reference",
-                "metrics": {
-                    metric: paired_question_difference(
-                        metric_maps_by_generator[candidate][metric],
-                        metric_maps_by_generator[reference][metric],
-                        args.bootstrap_samples,
-                        args.seed
-                        + candidate_index * 10_000
-                        + reference_index * 100
-                        + metric_index,
-                    )
-                    for metric_index, metric in enumerate(
-                        metric_maps_by_generator[candidate]
-                    )
-                },
-            }
+        if candidate == reference:
+            continue
+        label = f"{candidate}_minus_{reference}"
+        paired[label] = {
+            "candidate": candidate,
+            "reference": reference,
+            "sign": "candidate_minus_reference",
+            "metrics": {
+                metric: paired_question_difference(
+                    metric_maps_by_generator[candidate][metric],
+                    metric_maps_by_generator[reference][metric],
+                    args.bootstrap_samples,
+                    args.seed + candidate_index * 10_000 + metric_index,
+                )
+                for metric_index, metric in enumerate(
+                    metric_maps_by_generator[candidate]
+                )
+            },
+        }
 
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -1349,7 +1285,6 @@ def summarize_phase(args: argparse.Namespace) -> dict:
             "transfer": transfer_meta,
         },
         "notes": {
-            "legacy_base": "Filtered historical cache; invalid-output rate is not observable.",
             "primary_control": "fresh_base",
             "transfer_sign": "positive means hinted teacher is farther from the student",
             "uncertainty_unit": "paired question-level bootstrap",
@@ -1468,13 +1403,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--hint-root", default="data/pi/hint")
     parser.add_argument("--rollout-root", default="data/rollouts")
-    parser.add_argument("--num-problems", type=int, default=128)
+    parser.add_argument("--num-problems", type=int, default=64)
     parser.add_argument("--hints-per-problem", type=int, default=4)
     parser.add_argument("--hint-max-tokens", type=int, default=128)
     parser.add_argument("--generator-temperature", type=float, default=1.0)
     parser.add_argument("--generator-top-p", type=float, default=1.0)
-    parser.add_argument("--teacher-rollouts", type=int, default=8)
-    parser.add_argument("--k", type=int, nargs="+", default=[1, 4, 8])
+    parser.add_argument("--teacher-rollouts", type=int, default=4)
+    parser.add_argument("--k", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--teacher-max-tokens", type=int, default=8192)
     parser.add_argument("--teacher-temperature", type=float, default=1.0)
     parser.add_argument("--teacher-top-p", type=float, default=1.0)
