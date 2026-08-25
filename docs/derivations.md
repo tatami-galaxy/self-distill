@@ -1,4 +1,4 @@
-### SDPO gradient 
+Lets derive the SDPO gradient from the SDPO objective :
 
 $$
 \begin{aligned}
@@ -29,4 +29,16 @@ $$
 \end{aligned}
 $$
 
-This means minimzing $\mathcal{L}_{SD}$ is the same as using $\sum_{t=i}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t]$ as the policy gradient.
+This means minimzing $\mathcal{L}_{SD}$ is the same as using $\sum_{t=i}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t]$ as the policy gradient. Now lets write the SDPO objective in a slightly different way : 
+
+$$
+\begin{aligned}
+
+\mathcal{L}_{SD}&=\sum_{t=i}^TKL(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})||sg(\pi_T(\hat{y_{t}}|x,f,y_{<t}) \\
+
+&=\sum_{t=i}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\frac{\pi_{\theta}(\hat{y_{t}}|x,y_{<t})}{sg(\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))} \\
+
+&=\sum_{t=i}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\pi_{\theta}(\hat{y_{t}}|x,y_{<t})sg(\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))
+
+\end{aligned}
+$$
