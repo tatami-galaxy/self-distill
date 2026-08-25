@@ -42,7 +42,8 @@ Upload new and changed files:
 ```sh
 HF_XET_HIGH_PERFORMANCE=1 hf buckets sync \
   /mnt/data/ujan/self-distill \
-  hf://buckets/Ujan/self-distill-checkpoints
+  hf://buckets/Ujan/self-distill-checkpoints \
+  --delete
 ```
 
 The command compares the local and remote trees, skips unchanged files, and
