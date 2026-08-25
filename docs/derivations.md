@@ -43,9 +43,9 @@ $$
 
 &=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - sg(\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\
 
-\text{Let } &\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t|x,f,y_{<t}).\text{ Then,} \\
+\text{Let } &\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t,s_t).\text{ Then,} \\
 
-\mathcal{L}_{SD}&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})), \\
+\mathcal{L}_{SD}&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y}_t,s_t), \\
 
 &\text{we can remove the stopgrad since we optimize w.r.t }\theta.
 \end{aligned}
@@ -54,7 +54,7 @@ $$
 Minimizing $\mathcal{L}_{SD}$ is the same as :
 
 $$
-\underset{\theta}{\operatorname{argmax}} \sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\lambda=1
+\underset{\theta}{\operatorname{argmax}} \sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y}_t,s_t) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\lambda=1
 $$
 
 This is the maximum entropy RL objective. Lets call it MaxEnt.
@@ -62,7 +62,41 @@ This is the maximum entropy RL objective. Lets call it MaxEnt.
 $$
 \begin{aligned}
 
-\nabla_\theta\text{MaxEnt}&=\nabla_\theta\sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\lambda=1
+\nabla_\theta\text{MaxEnt}&=\nabla_\theta\sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y}_t,s_t) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) \\
+
+&=\sum_{t=1}^T\nabla_\theta\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t)+\lambda\nabla_\theta H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) \\\\
+
+&\text{Lets exclude the outer summation for now. Then the first term is : } \\
+
+&\nabla_\theta\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t) \\
+
+&=\sum_{\hat{y_{t}}}\nabla_\theta\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t) \\
+
+&=\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t) \\
+
+&=\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t)] \\\\
+
+&\text{The the second term is :} \\
+&-\lambda\nabla_\theta\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+
+&=-\lambda\sum_{\hat{y_{t}}}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\lambda\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+
+&=-\lambda\sum_{\hat{y_{t}}}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+
+&=-\lambda\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+
+&=-\lambda\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})]. \\\\
+\text{ Therefore,}  \\
+
+\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t)]-\\
+&\quad\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\lambda\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})] \\
+
+&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_{ent}], \text{where }A_{ent}=Q_\phi(\hat{y}_t, s_t)-\lambda\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+
+\text{If }\lambda=1, \\
+A_{ent}&=Q_\phi(\hat{y}_t, s_t)-\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+&=\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))-\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+&=A_t, \text{ the SDPO advantage}
 
 \end{aligned}
 $$
