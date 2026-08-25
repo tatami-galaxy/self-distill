@@ -43,13 +43,9 @@ $$
 
 &=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - sg(\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\
 
-\text{Now }\\
-&\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))=\text{logit}_T(\hat{y_{t}}|x,f,y_{<t}))-\text{log}Z_T, \\
-&\text{where } Z_t \text{ is the softmax normalizer which is a constant w.r.t }\hat{y}_t \\
+\text{Let } &\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t|x,f,y_{<t}).\text{ Then,} \\
 
-\text{Let } &\text{logit}_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t|x,f,y_{<t}).\text{ Therefore,} \\\\
-
-\mathcal{L}_{SD}&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})) + C,\\
+\mathcal{L}_{SD}&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})), \\
 
 &\text{we can remove the stopgrad since we optimize w.r.t }\theta.
 \end{aligned}
@@ -61,4 +57,12 @@ $$
 \underset{\theta}{\operatorname{argmax}} \sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\lambda=1
 $$
 
-This is the maximum entropy RL objective.
+This is the maximum entropy RL objective. Lets call it MaxEnt.
+
+$$
+\begin{aligned}
+
+\nabla_\theta\text{MaxEnt}&=\nabla_\theta\sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y_{t}}|x,f,y_{<t})) +\lambda H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\lambda=1
+
+\end{aligned}
+$$
