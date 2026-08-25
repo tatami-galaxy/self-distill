@@ -39,9 +39,9 @@ $$
 
 &=\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\frac{\pi_{\theta}(\hat{y_{t}}|x,y_{<t})}{sg(\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))} \\
 
-&=\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\pi_{\theta}(\hat{y_{t}}|x,y_{<t})sg(\pi_{T}(\hat{y_{t}}|x,f,y_{<t})) \\
+&=\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\pi_{\theta}(\hat{y_{t}}|x,y_{<t})sg(\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t})) \\
 
-&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - sg(\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\
+&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}sg(\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\
 
 \text{Let } &\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t,s_t).\text{ Then,} \\
 
