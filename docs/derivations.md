@@ -100,3 +100,5 @@ A_{ent}&=Q_\phi(\hat{y}_t, s_t)-\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
 
 \end{aligned}
 $$
+
+[This is a fixed-prefix result, not the full sequence gradient.]
