@@ -94,7 +94,7 @@ $$
 &=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))] \\
 
 \text{If }\beta=1, \\
-\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=\nabla_\theta\mathcal{L}_{SD}, \text{the OPSD gradient.}
+\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=\nabla_\theta\mathcal{L}_{SD}, \text{the SDPO gradient.}
 
 \end{aligned}
 $$
