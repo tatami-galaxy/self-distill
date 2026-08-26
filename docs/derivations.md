@@ -11,7 +11,7 @@ $$
 
 &\text{Let }A_t=\text{log}\frac{sg(\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))}{\pi_{\theta}(\hat{y_{t}}|x,y_{<t})}. \text{ Then,} \\
 
-\nabla_{\theta}\mathcal{L}_{SD}&=-\nabla_{\theta}\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t \\
+\nabla_{\theta}\mathcal{L}_{SD}&=-\nabla_{\theta}\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t \\
 
 &=-\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_{\theta}A_t + A_t\nabla_{\theta}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
 
@@ -23,9 +23,9 @@ $$
 \text{Therefore, } \\
 \nabla_{\theta}\mathcal{L}_{SD}&=-\sum_{t=1}^T\sum_{\hat{y_{t}}}A_t\nabla_{\theta}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
 
-&=-\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t \\
+&=-\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t \\
 
-&=-\sum_{t=1}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t] \\
+&=-\sum_{t=1}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t] \\
 
 \end{aligned}
 $$
@@ -57,7 +57,7 @@ $$
 \underset{\theta}{\operatorname{argmax}} \sum_{t=1}^T \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}Q_{\phi}(\hat{y}_t,s_t) +\beta H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})), \text{where }\beta=1
 $$
 
-This is the (per-prefix) maximum entropy RL objective. Lets call it MaxEnt.
+This is the (per-prefix) maximum entropy RL objective. Lets call it MaxEnt. Differentiating this w.r.t $\theta$ gives us the soft actor critic (SAC) policy gradient : 
 
 $$
 \begin{aligned}
@@ -91,12 +91,10 @@ $$
 \nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t)]-\\
 &\quad\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})] \\
 
-&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_{ent}], \text{where }A_{ent}=Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
+&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))] \\
 
 \text{If }\beta=1, \\
-A_{ent}&=Q_\phi(\hat{y}_t, s_t)-\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
-&=\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))-\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
-&=A_t, \text{ the SDPO advantage}
+\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=\nabla_\theta\mathcal{L}_{SD}, \text{the OPSD gradient.}
 
 \end{aligned}
 $$
