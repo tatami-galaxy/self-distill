@@ -41,7 +41,7 @@ $$
 
 &=\sum_{t=1}^T\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\pi_{\theta}(\hat{y_{t}}|x,y_{<t})sg(\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t})) \\
 
-&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}sg(\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\
+&=\sum_{t=1}^T-H(\pi_{\theta}(\hat{y_{t}}|x,y_{<t})) - \mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}sg(\text{log}\pi_{T}(\hat{y_{t}}|x,f,y_{<t}))) \\\\
 
 \text{Let } &\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t}))=Q_{\phi}(\hat{y}_t,s_t), \text{where }s_t = sg(x, f, y_{<t}).\text{ Then,} \\
 
@@ -95,6 +95,20 @@ $$
 
 \text{If }\beta=1, \\
 \nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=\nabla_\theta\mathcal{L}_{SD}, \text{the SDPO gradient.}
+
+\end{aligned}
+$$
+
+The soft $Q$ function can be fitted with a $1$-step or $\lambda$ returns more generally. We can also subtract the soft $V$ from the soft $Q$ to get an advantage estimate. This is then equal to the centered SDPO advantage at initialization (not the raw SDPO advantage). 
+
+$$
+\begin{aligned}
+
+V^{soft}_\phi(s_t) &= \mathbb{E}_{\hat{y}_t\sim\pi_\theta}[Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))] \\
+
+1\text{-step target :} \\
+
+y_t &=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1}) \\
 
 \end{aligned}
 $$

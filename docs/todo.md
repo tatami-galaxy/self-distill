@@ -24,6 +24,13 @@
 - [-] JSD
 - [-] Forward CE
 
+### Analysis
+
+- [x] Self-teacher behavior analysis
+- [ ] Trained student behavior analysis
+- [ ] PVF analysis
+- [ ] Soft PQF analysis
+
 ### Research
 
 - **PI conditioned V**
