@@ -104,11 +104,19 @@ The soft $Q$ function can be fitted with a $1$-step or $\lambda$ returns more ge
 $$
 \begin{aligned}
 
-V^{soft}_\phi(s_t) &= \mathbb{E}_{\hat{y}_t\sim\pi_\theta}[Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))] \\
+V^{soft}_\phi(s_t) &= \mathbb{E}_{\hat{y}_t\sim\pi_\theta}[Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})] \\
 
 1\text{-step target :} \\
 
-y_t &=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1}) \\
+y_t^{(1)}&=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1}) \\
+
+2\text{-step target :} \\
+
+y_t^{(2)}&=r(\hat{y}_t, s_t)+\gamma[r(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+1}|x,y_{<t+1})+\gamma V^{soft}_\phi(s_{t+2})] \\
+
+n\text{-step target :} \\
+
+y_t^{(n)}&=r(\hat{y}_t, s_t) + \sum_{k=1}^{n-1}\gamma^k(r(\hat{y}_{t+k}, s_{t+k})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+k}|x,y_{<t+k}))+\gamma^nV^{soft}_\phi(s_{t+n})
 
 \end{aligned}
 $$
