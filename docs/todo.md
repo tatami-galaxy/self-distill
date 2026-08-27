@@ -3,7 +3,7 @@
 - [x] Deepmath
 - [ ] Reasoning Gym`
 - [ ] Countdown-CoT-20k
-- [ ] Hyperparameter sweep
+- [ ] Hyperparameter sweep, more steps
 
 ### Benchmarks
 
