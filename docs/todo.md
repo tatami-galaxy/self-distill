@@ -11,6 +11,7 @@
 - [-] Beyondaime
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
+- [ ] avg@12
 
 ### Models
 
