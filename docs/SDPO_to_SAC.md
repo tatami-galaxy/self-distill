@@ -94,7 +94,7 @@ $$
 &=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))] \\
 
 \text{If }\beta=1, \\
-\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=\nabla_\theta\mathcal{L}_{SD}, \text{the SDPO gradient.}
+\nabla_\theta\text{MaxEnt}&=\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot A_t]=-\nabla_\theta\mathcal{L}_{SD}, \text{the SDPO gradient.}
 
 \end{aligned}
 $$
@@ -116,7 +116,25 @@ y_t^{(2)}&=r(\hat{y}_t, s_t)+\gamma[r(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi
 
 n\text{-step target :} \\
 
-y_t^{(n)}&=r(\hat{y}_t, s_t) + \sum_{k=1}^{n-1}\gamma^k(r(\hat{y}_{t+k}, s_{t+k})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+k}|x,y_{<t+k}))+\gamma^nV^{soft}_\phi(s_{t+n})
+y_t^{(n)}&=r(\hat{y}_t, s_t) + \sum_{k=1}^{n-1}\gamma^k(r(\hat{y}_{t+k}, s_{t+k})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+k}|x,y_{<t+k}))+\gamma^nV^{soft}_\phi(s_{t+n}) \\
+
+\lambda\text{-return :} \\
+
+y_t^{(n+1)}-y_t^{(n)}&=\gamma^n[r(\hat{y}_{t+n}, s_{t+n})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+n}|x,y_{<t+n}))+γV_\phi^{soft}​(s_{t+n+1}​)−V_\phi^{soft}​(s_{t+n}​)] \\
+
+\text{Define } \delta_{t+k}&=r(\hat{y}_{t+k}, s_{t+k})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+k}|x,y_{<t+k}))+γV_\phi^{soft}​(s_{t+k+1}​)−V_\phi^{soft}​(s_{t+k}​). \\
+
+\text{ Therefore,} \\
+
+y_t^{(n)}&=y_t^{(1)}+\sum_{k=1}^{n-1}\gamma^k\delta_{t+k} \\
+
+y_t^{(\lambda)}&​=(1−\lambda)\sum_{n=1}^{\infty}\lambda^{n-1}y_t^{(n)}. \text{ Then it can be shown that,} \\
+
+y_t^{(\lambda)}&​=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1})+\sum_{k=1}^{\infty}(\gamma\lambda)^k\delta_{t+k} \\
+
+\text{The soft }Q \text{ can then be fitted by minimizing :} \\
+
+\mathcal{L}(\phi)&=\mathbb{E}[(Q_\phi(\hat{y}_t, s_t)-y_t^{(\lambda)})^2]
 
 \end{aligned}
 $$
