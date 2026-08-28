@@ -99,7 +99,7 @@ $$
 \end{aligned}
 $$
 
-The soft $Q$ function can be fitted with a $1$-step or $\lambda$ returns more generally. We can also subtract the soft $V$ from the soft $Q$ to get an advantage estimate. This is then equal to the centered SDPO advantage at initialization (not the raw SDPO advantage). 
+The soft $Q$ function can be fitted with a $1$-step or $\lambda$ returns more generally. We can also subtract the soft $V$ from the entropy regulazied soft $Q$ $(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))$ to get an advantage estimate. This is then equal to the centered SDPO advantage at initialization (not the raw SDPO advantage). 
 
 $$
 \begin{aligned}
@@ -138,3 +138,5 @@ y_t^{(\lambda)}&​=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1})+\sum_{k=1}^{
 
 \end{aligned}
 $$
+
+$Q_\phi$ is initialized with the teacher log-probability and subsequently trained toward the soft outcome $Q$.
