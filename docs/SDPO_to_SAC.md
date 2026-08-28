@@ -76,7 +76,7 @@ $$
 
 &=\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})Q_{\phi}(\hat{y}_t,s_t)] \\\\
 
-&\text{The the second term is :} \\
+&\text{The second term is :} \\
 &-\beta\nabla_\theta\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
 
 &=-\beta\sum_{\hat{y_{t}}}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\pi_{\theta}(\hat{y_{t}}|x,y_{<t})-\beta\sum_{\hat{y_{t}}}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}) \\
