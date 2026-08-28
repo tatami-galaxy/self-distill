@@ -41,7 +41,7 @@
 
 - **PI conditioned Q function actor-critic**
 
-  $J_{\mathrm{SDPO}}\propto\sum_t\left\{\mathbb{E}_{a\sim\pi_\theta(\cdot\mid s_t)}\left[Q(s_t,a)\right]+H\!\left(\pi_\theta(\cdot\mid s_t)\right)\right\}, \text{where }\\ Q(s_t,a)=\operatorname{logit}_{\mathrm{teacher}}(a\mid s_t).$
+  - [ ] $\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))]$
 
 - **Train self-teacher for hint generation**
   - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
