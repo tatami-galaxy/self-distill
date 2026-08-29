@@ -17,7 +17,7 @@
 
 - [x] think models
 - [ ] sft-ed models
-- [-] instruct models
+- [ ] instruct models
 
 ### SD Objective
 
