@@ -140,3 +140,7 @@ y_t^{(\lambda)}&​=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1})+\sum_{k=1}^{
 $$
 
 $Q_\phi$ is initialized with the teacher log-probability and subsequently trained toward the soft outcome $Q$.
+
+We can also have $\beta\neq1$ and still get the self-distillation initialization by initializing the soft $Q$ to be : 
+
+$$Q_\phi(\hat{y}_t, s_t)=sg[\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t})+(\beta-1)\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})]$$
