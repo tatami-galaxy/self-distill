@@ -8,7 +8,7 @@
 ### Benchmarks
 
 - [x] Aime 24, 25
-- [-] Beyondaime
+- [ ] Beyondaime
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
 - [ ] avg@12
@@ -22,8 +22,9 @@
 ### SD Objective
 
 - [x] Reverse KL
-- [-] JSD
-- [-] Forward CE
+- [ ] Forward KL
+- [ ] JSD
+- [ ] Forward CE
 
 ### Analysis
 
