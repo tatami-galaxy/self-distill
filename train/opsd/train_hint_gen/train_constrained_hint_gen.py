@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m \
 CUDA_VISIBLE_DEVICES=0 uv run python -m \
     train.opsd.train_hint_gen.train_constrained_hint_gen \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2048 \
-    --tau 0.7 --gamma 4 --teacher-rollouts 2 --transfer-rollouts 4
+    --tau 0.7 --gamma 4 
 """
 
 from __future__ import annotations
@@ -112,8 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dual-init", type=float, default=1.0)
     p.add_argument("--dual-max", type=float, default=20.0)
     p.add_argument("--hint-budget", type=int, default=128)
-    p.add_argument("--teacher-rollouts", type=int, default=4)
-    p.add_argument("--transfer-rollouts", type=int, default=4)
+    p.add_argument("--teacher-rollouts", type=int, default=8)
+    p.add_argument("--transfer-rollouts", type=int, default=8)
     p.add_argument("--teacher-max-completion-length", type=int, default=8192)
     p.add_argument("--teacher-temperature", type=float, default=1.0)
     p.add_argument("--teacher-top-p", type=float, default=1.0)

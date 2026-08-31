@@ -3,6 +3,7 @@
 - [x] Deepmath
 - [ ] Reasoning Gym`
 - [ ] Countdown-CoT-20k
+- [ ] CodeIO
 - [ ] Hyperparameter sweep, more steps
 
 ### Benchmarks
@@ -11,6 +12,7 @@
 - [ ] Beyondaime
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
+- [ ] CodeIO
 - [ ] avg@12
 
 ### Models
