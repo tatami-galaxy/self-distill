@@ -1,7 +1,7 @@
 ### Training
 
 - [x] Deepmath
-- [ ] Reasoning Gym`
+- [ ] Reasoning Gym
 - [ ] Countdown-CoT-20k
 - [ ] CodeIO
 - [ ] Hyperparameter sweep, more steps

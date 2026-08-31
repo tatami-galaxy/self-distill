@@ -95,6 +95,55 @@ class CheckpointSpecTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conflicts"):
                 hint_gen_compare.resolve_run_configuration(conflicting)
 
+    def test_constrained_run_metadata_and_checkpoints_are_supported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "method": "constrained_hint_gen_grpo",
+                        "constrained_hint_gen_version": "expected_primal_dual_sct_v1",
+                        "model": "base",
+                        "dataset": "deepmath",
+                        "tau": 0.7,
+                        "gamma": 4.0,
+                    }
+                )
+            )
+            checkpoint = root / "checkpoint-10"
+            checkpoint.mkdir()
+            args = SimpleNamespace(
+                model=None,
+                dataset=None,
+                run_dir=str(root),
+                steps=None,
+                checkpoint=[],
+                resolved_checkpoints=None,
+            )
+
+            hint_gen_compare.resolve_run_configuration(args)
+            self.assertEqual(args.model, "base")
+            self.assertEqual(args.dataset, "deepmath")
+            self.assertEqual(
+                hint_gen_compare.generator_variants(args),
+                [("fresh_base", "base"), ("checkpoint-10", str(checkpoint.resolve()))],
+            )
+
+    def test_non_hint_training_method_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "method": "sft",
+                        "model": "base",
+                        "dataset": "deepmath",
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "not a supported hint-generator"):
+                hint_gen_compare.load_hint_run_meta(root)
+
     def test_generator_variants_include_every_discovered_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

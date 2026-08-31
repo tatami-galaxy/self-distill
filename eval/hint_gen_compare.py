@@ -27,6 +27,14 @@ Example (run separately for each base-model size):
       --num-problems 64 --hints-per-problem 4 \
       --teacher-rollouts 4 --k 1 4
 
+Constrained runs use the same evaluator; only their run directory changes:
+
+    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.hint_gen_compare \
+      --run-dir /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_t0.7_g4 \
+      --output-dir results/hint_gen_compare/Qwen3-1.7B/deepmath_t0.7_g4 \
+      --num-problems 64 --hints-per-problem 4 \
+      --teacher-rollouts 4 --k 1 4
+
 The default ``--phase sweep`` prepares the fixed cohort, generates hints, scores
 sufficiency and transfer, and writes ``summary.json``.  Every expensive stage is
 provenance-checked and reusable; pass ``--force`` to replace incompatible caches.
@@ -68,6 +76,10 @@ from utils.gen_hints import build_messages as build_hint_generator_messages
 SCHEMA_VERSION = 1
 METHOD = "hint_generator_comparison"
 GENERATOR_IDS_RESERVED = {"fresh_base", "no_hint"}
+HINT_RUN_METHODS = {
+    "hint_gen_grpo": "composite",
+    "constrained_hint_gen_grpo": "constrained",
+}
 PHASES = ("sweep", "prepare", "generate", "sufficiency", "transfer", "summarize")
 
 
@@ -249,22 +261,28 @@ def discover_checkpoints(
     return {step: checkpoints[step] for step in sorted(requested)}
 
 
+def validate_hint_run_meta(meta: dict, source: str | Path) -> dict:
+    """Validate fields shared by composite and constrained hint-generator runs."""
+    source = Path(source)
+    required = {"method", "model", "dataset"}
+    missing = required.difference(meta)
+    if missing:
+        raise ValueError(f"{source} is missing required fields {sorted(missing)}")
+    if meta["method"] not in HINT_RUN_METHODS:
+        raise ValueError(
+            f"{source} is method={meta['method']!r}, not a supported hint-generator "
+            f"run ({sorted(HINT_RUN_METHODS)})."
+        )
+    return meta
+
+
 def load_hint_run_meta(run_dir: str | Path) -> dict:
     """Load and validate the identity fields shared by all run checkpoints."""
     root = Path(run_dir)
     meta_path = root / "run_meta.json"
     if not meta_path.is_file():
         raise FileNotFoundError(f"No run_meta.json at {meta_path}")
-    meta = read_json(meta_path)
-    required = {"method", "model", "dataset"}
-    missing = required.difference(meta)
-    if missing:
-        raise ValueError(f"{meta_path} is missing required fields {sorted(missing)}")
-    if meta["method"] != "hint_gen_grpo":
-        raise ValueError(
-            f"{root} is method={meta['method']!r}, not a hint_gen_grpo run."
-        )
-    return meta
+    return validate_hint_run_meta(read_json(meta_path), meta_path)
 
 
 def resolve_run_configuration(args: argparse.Namespace) -> None:
@@ -293,8 +311,8 @@ def validate_hint_checkpoint(path: str, base_model: str, dataset: str) -> None:
     meta_path = checkpoint.parent / "run_meta.json"
     if not meta_path.is_file():
         raise FileNotFoundError(f"No hint-generator run_meta.json next to {checkpoint}")
-    meta = read_json(meta_path)
-    expected = {"method": "hint_gen_grpo", "model": base_model, "dataset": dataset}
+    meta = validate_hint_run_meta(read_json(meta_path), meta_path)
+    expected = {"model": base_model, "dataset": dataset}
     mismatches = {
         key: (meta.get(key), value)
         for key, value in expected.items()
@@ -1385,7 +1403,8 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_source.add_argument(
         "--run-dir",
         default=None,
-        help="Hint-generator run directory; all numeric checkpoint-* children are swept.",
+        help="Composite or constrained hint-generator run directory; all numeric "
+        "checkpoint-* children are swept.",
     )
     checkpoint_source.add_argument(
         "--checkpoint",
