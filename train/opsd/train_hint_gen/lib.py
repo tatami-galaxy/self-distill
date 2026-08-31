@@ -13,6 +13,7 @@ after its generation engine has entered level-2 sleep, leaving room for the teac
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import defaultdict
 from collections.abc import Iterable
@@ -28,6 +29,9 @@ from utils import compose_pi_messages, format_prompt_math, grade, load_train_dat
 from utils.gen_hints import build_messages, leaks_answer
 
 HINT_GEN_VERSION = "composite_sct_v1"
+CONSTRAINED_HINT_GEN_VERSION = "expected_primal_dual_sct_v1"
+CONSTRAINED_REWARD_STATE_FILE = "constrained_reward_state.json"
+CONSTRAINED_REWARD_STATE_VERSION = 1
 
 
 def _as_rows(dataset: Iterable[dict]) -> list[dict]:
@@ -248,6 +252,36 @@ def composite_reward(
     return alpha * sufficiency - hint_cost - gamma * transfer_cost
 
 
+def constrained_reward(
+    sufficiency: float,
+    hint_cost: float,
+    transfer_cost: float,
+    tau: float,
+    gamma: float,
+    dual_lambda: float,
+) -> float:
+    """Lagrangian reward for E[S] >= tau, using the current dual multiplier."""
+    return (
+        dual_lambda * (sufficiency - tau)
+        - hint_cost
+        - gamma * transfer_cost
+    )
+
+
+def dual_ascent_step(
+    dual_lambda: float,
+    tau: float,
+    mean_sufficiency: float,
+    dual_lr: float,
+    dual_max: float,
+) -> float:
+    """Projected dual ascent on the minibatch constraint violation tau - E[S]."""
+    if not 0.0 <= mean_sufficiency <= 1.0:
+        raise ValueError("mean_sufficiency must be in [0, 1]")
+    updated = dual_lambda + dual_lr * (tau - mean_sufficiency)
+    return min(max(updated, 0.0), dual_max)
+
+
 @dataclass(frozen=True)
 class HintRewardConfig:
     model: str
@@ -278,10 +312,57 @@ class HintRewardConfig:
             raise ValueError("alpha, gamma, and invalid_penalty must be nonnegative")
 
 
+@dataclass(frozen=True)
+class ConstrainedHintRewardConfig:
+    """Reward and dual-ascent settings for the expected-sufficiency constraint."""
+
+    model: str
+    dataset: str
+    rollout_root: str = "data/rollouts"
+    hint_budget: int = 128
+    teacher_rollouts: int = 2
+    transfer_rollouts: int = 4
+    teacher_max_completion_length: int = 4096
+    teacher_temperature: float = 1.0
+    teacher_top_p: float = 1.0
+    tau: float = 0.7
+    gamma: float = 1.0
+    invalid_penalty: float = 1.0
+    dual_lr: float = 0.05
+    dual_init: float = 1.0
+    dual_max: float = 20.0
+    recompute_student_logps: bool = True
+    clamp_transfer: bool = True
+
+    def validate(self) -> None:
+        if self.hint_budget < 1:
+            raise ValueError("hint_budget must be >= 1")
+        if self.teacher_rollouts < 1 or self.transfer_rollouts < 1:
+            raise ValueError("teacher_rollouts and transfer_rollouts must be >= 1")
+        if self.teacher_temperature <= 0:
+            raise ValueError("teacher_temperature must be > 0 for stochastic reliability rollouts")
+        if not 0 < self.teacher_top_p <= 1:
+            raise ValueError("teacher_top_p must be in (0, 1]")
+        if not 0.0 <= self.tau <= 1.0:
+            raise ValueError("tau must be in [0, 1]")
+        if self.gamma < 0 or self.invalid_penalty < 0:
+            raise ValueError("gamma and invalid_penalty must be nonnegative")
+        if self.dual_lr <= 0:
+            raise ValueError("dual_lr must be > 0")
+        if self.dual_max <= 0:
+            raise ValueError("dual_max must be > 0")
+        if not 0.0 <= self.dual_init <= self.dual_max:
+            raise ValueError("dual_init must be in [0, dual_max]")
+
+
 class FrozenHintTeacher:
     """Lazy single-GPU backend for sufficiency and sampled reverse-KL scoring."""
 
-    def __init__(self, config: HintRewardConfig, tokenizer):
+    def __init__(
+        self,
+        config: HintRewardConfig | ConstrainedHintRewardConfig,
+        tokenizer,
+    ):
         config.validate()
         self.config = config
         self.tokenizer = tokenizer
@@ -496,6 +577,174 @@ class CompositeHintReward:
         return rewards
 
 
+class ConstrainedHintReward:
+    """Primal-dual reward for minimizing costs at a target expected sufficiency."""
+
+    def __init__(
+        self,
+        config: ConstrainedHintRewardConfig,
+        backend: FrozenHintTeacher,
+    ):
+        config.validate()
+        self.config = config
+        self.backend = backend
+        self.dual_lambda = float(config.dual_init)
+        self.dual_updates = 0
+
+    def state_dict(self) -> dict:
+        return {
+            "state_version": CONSTRAINED_REWARD_STATE_VERSION,
+            "dual_lambda": self.dual_lambda,
+            "dual_updates": self.dual_updates,
+            "tau": self.config.tau,
+            "gamma": self.config.gamma,
+            "dual_lr": self.config.dual_lr,
+            "dual_max": self.config.dual_max,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        version = state.get("state_version")
+        if version != CONSTRAINED_REWARD_STATE_VERSION:
+            raise ValueError(
+                "Unsupported constrained reward state version "
+                f"{version!r}; expected {CONSTRAINED_REWARD_STATE_VERSION}."
+            )
+        expected = {
+            "tau": self.config.tau,
+            "gamma": self.config.gamma,
+            "dual_lr": self.config.dual_lr,
+            "dual_max": self.config.dual_max,
+        }
+        mismatches = [
+            f"{key}: checkpoint={state.get(key)!r}, current={value!r}"
+            for key, value in expected.items()
+            if state.get(key) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                "Constrained reward state does not match this run:\n  "
+                + "\n  ".join(mismatches)
+            )
+        dual_lambda = float(state["dual_lambda"])
+        dual_updates = int(state["dual_updates"])
+        if not 0.0 <= dual_lambda <= self.config.dual_max:
+            raise ValueError("checkpoint dual_lambda is outside [0, dual_max]")
+        if dual_updates < 0:
+            raise ValueError("checkpoint dual_updates must be nonnegative")
+        self.dual_lambda = dual_lambda
+        self.dual_updates = dual_updates
+
+    def save_state(self, directory: str) -> str:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, CONSTRAINED_REWARD_STATE_FILE)
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w") as handle:
+            json.dump(self.state_dict(), handle, indent=2)
+        os.replace(temporary_path, path)
+        return path
+
+    def load_state(self, directory: str) -> str:
+        path = os.path.join(directory, CONSTRAINED_REWARD_STATE_FILE)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"No constrained reward state ({CONSTRAINED_REWARD_STATE_FILE}) in {directory}."
+            )
+        with open(path) as handle:
+            self.load_state_dict(json.load(handle))
+        return path
+
+    def __call__(
+        self,
+        prompts,
+        completions,
+        completion_ids,
+        question,
+        final_answer,
+        log_extra=None,
+        log_metric=None,
+        **_,
+    ) -> list[float]:
+        del prompts
+        rewards, successes, costs, transfers, invalids = [], [], [], [], []
+        reasons = []
+        dual_lambda = self.dual_lambda
+        for completion, token_ids, q, answer in zip(
+            completions, completion_ids, question, final_answer, strict=True
+        ):
+            hint = completion_text(completion)
+            cost = normalized_hint_cost(token_ids, self.config.hint_budget)
+            reason = invalid_hint_reason(hint, str(answer))
+            if reason is not None:
+                success, transfer = 0.0, 0.0
+                reward = constrained_reward(
+                    success,
+                    cost,
+                    transfer,
+                    self.config.tau,
+                    self.config.gamma,
+                    dual_lambda,
+                ) - self.config.invalid_penalty
+                invalid = 1.0
+            else:
+                success = self.backend.score_sufficiency(str(q), str(answer), hint)
+                transfer = self.backend.score_transfer(str(q), hint)
+                reward = constrained_reward(
+                    success,
+                    cost,
+                    transfer,
+                    self.config.tau,
+                    self.config.gamma,
+                    dual_lambda,
+                )
+                invalid = 0.0
+                reason = ""
+            rewards.append(float(reward))
+            successes.append(float(success))
+            costs.append(float(cost))
+            transfers.append(float(transfer))
+            invalids.append(invalid)
+            reasons.append(reason)
+
+        if not successes:
+            return rewards
+        mean_sufficiency = sum(successes) / len(successes)
+        next_dual_lambda = dual_ascent_step(
+            dual_lambda,
+            self.config.tau,
+            mean_sufficiency,
+            self.config.dual_lr,
+            self.config.dual_max,
+        )
+        self.dual_lambda = next_dual_lambda
+        self.dual_updates += 1
+
+        if log_extra is not None:
+            log_extra("hint_sufficiency", successes)
+            log_extra("hint_cost", costs)
+            log_extra("hint_transfer", transfers)
+            log_extra("hint_invalid_reason", reasons)
+            log_extra("hint_constraint_margin", [s - self.config.tau for s in successes])
+            log_extra("hint_feasible", [float(s >= self.config.tau) for s in successes])
+            log_extra("hint_dual_lambda", [dual_lambda] * len(successes))
+        if log_metric is not None:
+            log_metric("hint/sufficiency", mean_sufficiency)
+            log_metric("hint/cost", sum(costs) / len(costs))
+            log_metric("hint/transfer", sum(transfers) / len(transfers))
+            log_metric("hint/invalid_fraction", sum(invalids) / len(invalids))
+            log_metric("hint/constraint_margin", mean_sufficiency - self.config.tau)
+            log_metric(
+                "hint/feasible_fraction",
+                sum(s >= self.config.tau for s in successes) / len(successes),
+            )
+            log_metric("hint/dual_lambda", dual_lambda)
+            log_metric("hint/dual_lambda_next", next_dual_lambda)
+            log_metric(
+                "hint/dual_at_max",
+                float(next_dual_lambda >= self.config.dual_max),
+            )
+        return rewards
+
+
 def make_reward_function(config: HintRewardConfig, tokenizer):
     """Create a named closure because GRPOTrainer expects ``reward_func.__name__``."""
     backend = FrozenHintTeacher(config, tokenizer)
@@ -505,3 +754,17 @@ def make_reward_function(config: HintRewardConfig, tokenizer):
         return reward(**kwargs)
 
     return hint_composite_reward
+
+
+def make_constrained_reward_function(
+    config: ConstrainedHintRewardConfig,
+    tokenizer,
+) -> tuple[object, ConstrainedHintReward]:
+    """Return the TRL reward closure and its checkpointable primal-dual state."""
+    backend = FrozenHintTeacher(config, tokenizer)
+    reward = ConstrainedHintReward(config, backend)
+
+    def hint_constrained_reward(**kwargs):
+        return reward(**kwargs)
+
+    return hint_constrained_reward, reward
