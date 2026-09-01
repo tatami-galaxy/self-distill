@@ -35,6 +35,7 @@
 - [ ] PVF analysis
 - [ ] Soft PQF analysis
 - [ ] Comparison with SDFT
+- [ ] Connecting self-teacher and PI optimization
 
 ### Research
 
@@ -48,6 +49,7 @@
 
 - **Train self-teacher for hint generation**
   - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
+  - [ ] Training objective theoretical justification
   - [x] Tune hyperparameters
   - [ ] Other cost functions
   - [x] Constrained optimization : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad \mathbb E_{h\sim g_\phi}[S(h)]\ge \tau$
