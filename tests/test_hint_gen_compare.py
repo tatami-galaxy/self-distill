@@ -37,6 +37,38 @@ class IdentityAndDefinitionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shapes differ"):
             hint_gen_compare.raw_sampled_transfer(torch.zeros(2), torch.zeros(3))
 
+    def test_completion_scoring_uses_shared_batch_one_logp_helper(self):
+        class UniformModel:
+            def __init__(self):
+                self.embedding = SimpleNamespace(weight=torch.empty(1))
+                self.calls = []
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+            def __call__(self, input_ids, logits_to_keep, use_cache):
+                self.calls.append(
+                    {
+                        "input_ids": input_ids.clone(),
+                        "logits_to_keep": logits_to_keep,
+                        "use_cache": use_cache,
+                    }
+                )
+                return SimpleNamespace(
+                    logits=torch.zeros(1, logits_to_keep, 8, dtype=torch.bfloat16)
+                )
+
+        model = UniformModel()
+        values = hint_gen_compare._score_completion(model, [1, 2], [3, 4])
+
+        self.assertEqual(values.shape, (2,))
+        self.assertTrue(
+            torch.allclose(values, torch.full((2,), -torch.log(torch.tensor(8.0))))
+        )
+        self.assertEqual(model.calls[0]["input_ids"].tolist(), [[1, 2, 3, 4]])
+        self.assertEqual(model.calls[0]["logits_to_keep"], 3)
+        self.assertFalse(model.calls[0]["use_cache"])
+
 
 class CheckpointSpecTest(unittest.TestCase):
     def test_default_label_is_checkpoint_directory_name(self):

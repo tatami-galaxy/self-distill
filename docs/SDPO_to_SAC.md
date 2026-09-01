@@ -1,3 +1,5 @@
+## SDPO gradient
+
 Lets derive the SDPO gradient from the SDPO objective. As in the SDPO paper we derive (and use) the per-prefix semi-gradient and not the full gradient through the on-policy trajectory distribution  :
 
 $$
@@ -30,7 +32,12 @@ $$
 \end{aligned}
 $$
 
-This means minimzing $\mathcal{L}_{SD}$ is the same as using $\sum_{t=1}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t]$ as the policy gradient. Now lets write the SDPO objective in a slightly different way : 
+This means minimzing $\mathcal{L}_{SD}$ is the same as using $\sum_{t=1}^T\mathbb{E}_{\hat{y_{t}}\sim\pi_\theta}[\nabla_{\theta}\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})A_t]$ as the policy gradient. 
+
+
+## Soft Actor Critic
+
+Now lets write the SDPO objective in a slightly different way : 
 
 $$
 \begin{aligned}
@@ -140,6 +147,128 @@ y_t^{(\lambda)}&​=r(\hat{y}_t, s_t)+\gamma V^{soft}_\phi(s_{t+1})+\sum_{k=1}^{
 $$
 
 $Q_\phi$ is initialized with the teacher log-probability and subsequently trained toward the soft outcome $Q$.
+
+## Sampled soft SARSA
+
+Computing $V^{soft}$ exactly requires an expectation over the full vocabulary at every prefix. We can instead use the next action in the on-policy rollout as a Monte Carlo sample of this expectation. This is State–action–reward–state–action (SARSA). To distinguish the two inputs, define the observable actor state and the privileged critic state as
+
+$$
+o_t=(x,y_{<t}), \qquad s_t=(x,f,y_{<t}),
+$$
+
+and let the rollout policy be $\pi_b(a_t|o_t)$. During on-policy training, $\pi_b$ is the frozen policy $\pi_{old}$ that generated the batch. The soft value under this policy is
+
+$$
+V^{soft}_{\bar\phi}(s_{t+1})
+=
+\mathbb{E}_{a\sim\pi_b(\cdot|o_{t+1})}
+\left[
+Q_{\bar\phi}(s_{t+1},a)-\beta\log\pi_b(a|o_{t+1})
+\right],
+$$
+
+where $\bar\phi$ denotes critic parameters held fixed while the targets are constructed. Since the observed next token was sampled as $a_{t+1}\sim\pi_b(\cdot|o_{t+1})$, the sampled soft-SARSA value is
+
+$$
+\widehat V^{SARSA}_{t+1}
+=
+Q_{\bar\phi}(s_{t+1},a_{t+1})
+-\beta\log\pi_b(a_{t+1}|o_{t+1}).
+$$
+
+It is conditionally unbiased for the soft value:
+
+$$
+\mathbb{E}_{a_{t+1}\sim\pi_b}
+\left[
+\widehat V^{SARSA}_{t+1}\mid s_{t+1}
+\right]
+=
+V^{soft}_{\bar\phi}(s_{t+1}).
+$$
+
+The one-step sampled soft-SARSA target is therefore
+
+$$
+Y_t^{(1)}
+=
+r_t
++\gamma(1-d_t)
+\left[
+Q_{\bar\phi}(s_{t+1},a_{t+1})
+-\beta\log\pi_b(a_{t+1}|o_{t+1})
+\right],
+$$
+
+where $d_t=1$ when action $a_t$ ends the episode. Thus a terminal action has target $Y_t=r_t$ and does not bootstrap from a state after termination. With outcome-only rewards, $r_t=0$ except on the final generated token, where it is the outcome reward.
+
+Provided no terminal state occurs within the next $n$ transitions, the sampled $n$-step target is
+
+$$
+\begin{aligned}
+Y_t^{(n)}
+&=r_t
++\sum_{k=1}^{n-1}\gamma^k
+\left[
+r_{t+k}-\beta\log\pi_b(a_{t+k}|o_{t+k})
+\right] \\
+&\quad+\gamma^n
+\left[
+Q_{\bar\phi}(s_{t+n},a_{t+n})
+-\beta\log\pi_b(a_{t+n}|o_{t+n})
+\right].
+\end{aligned}
+$$
+
+If a terminal action occurs first, the target stops there and the final bootstrap term is omitted. The corresponding finite-trajectory $\lambda$-return can be computed backwards without constructing every $n$-step return:
+
+$$
+\boxed{
+G_t^\lambda
+=
+r_t
++\gamma(1-d_t)
+\left[
+-\beta\log\pi_b(a_{t+1}|o_{t+1})
++(1-\lambda)Q_{\bar\phi}(s_{t+1},a_{t+1})
++\lambda G_{t+1}^\lambda
+\right]
+}
+$$
+
+with $G_T^\lambda=r_T$ at the terminal token. At $\lambda=0$, this reduces to the one-step sampled soft-SARSA target. At $\lambda=1$, it becomes the sampled Monte Carlo soft return. The critic is fitted with
+
+$$
+\mathcal{L}_Q(\phi)
+=
+\mathbb{E}_t
+\left[
+\left(Q_\phi(s_t,a_t)-sg(G_t^\lambda)\right)^2
+\right].
+$$
+
+For an on-policy rollout batch, the values $Q_{\bar\phi}(s_t,a_t)$ and the behavior log-probabilities can be cached before any optimization and kept fixed while forming and fitting these targets. This gives a fitted soft-SARSA update without requiring a separate target-model copy. If the actions instead come from a policy different from $\pi_b$, the estimator no longer directly targets $V^{soft,\pi_b}$ without an off-policy correction.
+
+Sampled soft SARSA is used here to estimate the continuation value in the critic target. It is not necessary to use the same sample as a soft-$V$ baseline in the actor update. In particular, if
+
+$$
+Q_\phi(s_t,a)=c_\phi(s_t)+\ell_\phi(s_t,a),
+\qquad
+\ell_\phi(s_t,a)=\log\operatorname{softmax}(z_\phi(s_t))_a,
+$$
+
+then the action-independent $c_\phi(s_t)$ can be dropped as a policy-gradient baseline. The sampled actor score can be written as
+
+$$
+g_t
+=
+sg\left[
+\ell_{\bar\phi}(s_t,a_t)
+-\beta\log\pi_b(a_t|o_t)
+\right].
+$$
+
+At initialization, with $c=0$, $\ell=\log\pi_T$, and $\beta=1$, this is exactly the raw SDPO log-ratio advantage. Subtracting the sampled value constructed from the same action would instead make the actor score identically zero; a centered actor advantage would require an independent baseline estimate or an explicit vocabulary expectation.
 
 We can also have $\beta\neq1$ and still get the self-distillation initialization by initializing the soft $Q$ to be : 
 

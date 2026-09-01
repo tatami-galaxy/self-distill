@@ -61,9 +61,9 @@ from datasets import Dataset, load_from_disk
 
 from eval.run_eval import pass_at_k
 from train.opsd.train_hint_gen.lib import invalid_hint_reason
-from train.opsd.train_sdft import PI_HINT
 from utils import (
     DATASET_REGISTRY_TRAIN,
+    PI_HINT,
     compose_pi_messages,
     format_prompt_math,
     grade,
@@ -817,6 +817,8 @@ def _render_prompt_ids(tokenizer, messages: list[dict]) -> list[int]:
 
 def _score_completion(model, prompt_ids: list[int], completion_ids: list[int]):
     import torch
+
+    from utils.model_scoring import per_token_logps
 
     device = _input_device(model)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)

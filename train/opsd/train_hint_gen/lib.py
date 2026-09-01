@@ -23,8 +23,14 @@ from typing import Any
 import torch
 from datasets import Dataset, load_from_disk
 
-from train.opsd.train_sdft import PI_HINT
-from utils import compose_pi_messages, format_prompt_math, grade, load_train_dataset, rollout_path
+from utils import (
+    PI_HINT,
+    compose_pi_messages,
+    format_prompt_math,
+    grade,
+    load_train_dataset,
+    rollout_path,
+)
 from utils.gen_hints import build_messages, leaks_answer
 from utils.model_scoring import per_token_logps
 
