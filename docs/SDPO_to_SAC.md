@@ -164,6 +164,6 @@ $$Q_\phi(\hat{y}_t, s_t)=sg[\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t})+(\beta-1)\te
 Computing $V_\phi^{soft}$ exactly requires an expectation over the full vocabulary at every prefix. One option is to instead take an expectation over top-$K$ tokens but then the value estimate is no longer unbiased. Another option is to use the unbiased but high variance SARSA estimate : 
 
 $$
-\boxed{V_{SARSA}=Q_\phi(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+1}|x,y_{<t+1})}
+\boxed{V_{SARSA}=Q_\phi(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi_{old}(\hat{y}_{t+1}|x,y_{<t+1})}
 $$
 
