@@ -24,7 +24,7 @@ was correct. The cached reward is used only for this post-hoc split, never for s
 
 Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
 
-# Generate the rollout cache using the command in train/opsd/train_self_teacher/gen_rollouts.py first.
+# Generate the rollout cache with ``python -m utils.gen_rollouts`` first.
 CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
     --model Qwen/Qwen3-1.7B --pi-modes none answer hint full rollout \
     --num-problems 128 --n 8 --k 1 8 --save-samples \
@@ -43,7 +43,6 @@ from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
 from eval.run_eval import compute_pass_at_k, pass_at_k
-from train.opsd.train_self_teacher.lib import rollout_path
 from train.opsd.train_sdft import (
     PI_ANSWER,
     PI_FULL,
@@ -51,7 +50,7 @@ from train.opsd.train_sdft import (
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
 )
-from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path
+from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path, rollout_path
 
 
 PI_MODES = ("none", "rollout", "answer", "hint", "full")
@@ -160,7 +159,7 @@ def load_rollout_pi(
     if not os.path.isdir(path):
         raise FileNotFoundError(
             f"No rollout-PI cache for {model} on {dataset} at {path}. Generate it first:\n"
-            "  python -m train.opsd.train_self_teacher.gen_rollouts "
+            "  python -m utils.gen_rollouts "
             f"--model {model} --dataset {dataset} --output-root {root} "
             "--skip-logp-scoring"
         )

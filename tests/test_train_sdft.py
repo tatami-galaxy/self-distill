@@ -107,7 +107,7 @@ class HintSdftDatasetTest(unittest.TestCase):
 class RolloutSdftDatasetTest(unittest.TestCase):
     def build(self, cache=None, sample_idx=1):
         with (
-            mock.patch.object(train_sdft, "rollout_pi_path", return_value="pi/cache"),
+            mock.patch.object(train_sdft, "rollout_path", return_value="pi/cache"),
             mock.patch.object(train_sdft.os.path, "isdir", return_value=True),
             mock.patch.object(
                 train_sdft, "load_from_disk",

@@ -60,8 +60,8 @@ from typing import Any, Iterable
 
 from datasets import Dataset, load_from_disk
 
-from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT, rollout_pi_path
-from utils import compose_pi_messages, format_prompt_math, grade, load_hint_cache, load_train_dataset
+from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT
+from utils import compose_pi_messages, format_prompt_math, grade, load_hint_cache, load_train_dataset, rollout_path
 
 
 PI_MODES = ("none", "answer", "hint", "full", "rollout")
@@ -354,7 +354,7 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
 
 def _load_rollout_attempts(model: str, dataset: str, root: str, sample_idx: int):
     """Load one provenance-checked attempted solution per cached question."""
-    path = Path(rollout_pi_path(model, dataset, root))
+    path = Path(rollout_path(model, dataset, root))
     if not path.is_dir():
         raise FileNotFoundError(f"No rollout-PI cache at {path}")
     cache = load_from_disk(str(path))
@@ -676,7 +676,7 @@ def _load_model(model_path: str, dtype_name: str):
 def _score_one(model, prompt_ids: list[int], completion_id_list: list[int]) -> list[float]:
     """Score one unpadded completion and return raw per-token log-probabilities."""
     import torch
-    from train.opsd.train_self_teacher.lib import per_token_logps
+    from utils.model_scoring import per_token_logps
 
     device = _input_device(model)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)

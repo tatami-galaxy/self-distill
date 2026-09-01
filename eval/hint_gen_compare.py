@@ -62,7 +62,6 @@ from datasets import Dataset, load_from_disk
 from eval.run_eval import pass_at_k
 from train.opsd.train_hint_gen.lib import invalid_hint_reason
 from train.opsd.train_sdft import PI_HINT
-from train.opsd.train_self_teacher.lib import per_token_logps, rollout_path
 from utils import (
     DATASET_REGISTRY_TRAIN,
     compose_pi_messages,
@@ -70,6 +69,7 @@ from utils import (
     grade,
     load_hint_cache,
     load_train_dataset,
+    rollout_path,
 )
 from utils.gen_hints import build_messages as build_hint_generator_messages
 

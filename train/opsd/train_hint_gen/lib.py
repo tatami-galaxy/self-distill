@@ -24,9 +24,9 @@ import torch
 from datasets import Dataset, load_from_disk
 
 from train.opsd.train_sdft import PI_HINT
-from train.opsd.train_self_teacher.lib import per_token_logps, rollout_path
-from utils import compose_pi_messages, format_prompt_math, grade, load_train_dataset
+from utils import compose_pi_messages, format_prompt_math, grade, load_train_dataset, rollout_path
 from utils.gen_hints import build_messages, leaks_answer
+from utils.model_scoring import per_token_logps
 
 HINT_GEN_VERSION = "composite_sct_v1"
 CONSTRAINED_HINT_GEN_VERSION = "expected_primal_dual_sct_v1"
@@ -136,7 +136,7 @@ def build_hint_grpo_dataset(
     if not os.path.isdir(cache_path):
         raise FileNotFoundError(
             f"No frozen-student rollout cache at {cache_path}. Generate it first with:\n"
-            "  python -m train.opsd.train_self_teacher.gen_rollouts "
+            "  python -m utils.gen_rollouts "
             f"--model {model} --dataset {dataset} --n {transfer_rollouts}"
         )
     rollouts = load_from_disk(cache_path)

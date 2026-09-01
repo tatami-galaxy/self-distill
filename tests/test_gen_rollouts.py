@@ -6,7 +6,7 @@ from unittest import mock
 
 from datasets import Dataset
 
-from train.opsd.train_self_teacher import gen_rollouts
+from utils import gen_rollouts
 
 
 class RolloutCliTest(unittest.TestCase):

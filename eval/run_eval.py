@@ -61,14 +61,8 @@ from utils import (
 # traces). If train_sft.py ever grows a second one -- teacher-sampled or rejection-sampled
 # completions -- the corpus becomes the variable under study and `sft` should join
 # VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
-#
-# `sdft_tt` follows the same reasoning as `ppo_val`: it is a separate trainer file writing its
-# own `method` stamp, so filing it under a neighbour would leave an arm and its own control
-# distinguished only by a --run label. `sdft_tt` is
-# train/opsd/train_self_teacher/sdft_with_teacher.py -- SDFT whose teacher was trained by the
-# E-step in that same package.
 ALGOS = (
-    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sdft_tt", "sft"
+    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sft"
 )
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
@@ -85,9 +79,6 @@ VARIANT_REQUIRED = {
     "ppo_pi": "the critic's privileged context, e.g. --variant answer or --variant none",
     "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
-    # For sdft_tt the variable is the pair (PI, E-step objective): the per-token and aggregate
-    # asymmetric variants yield different teachers and therefore different students.
-    "sdft_tt": "the teacher's PI and objective, e.g. --variant hint-asymmetric",
 }
 
 # What a checkpoint directory is called: `checkpoint-<N>`, TRL's end-of-training `final/`, or

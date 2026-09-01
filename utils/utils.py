@@ -124,6 +124,11 @@ def hint_path(model: str, dataset: str, root: str = "data/pi/hint") -> str:
     return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
 
 
+def rollout_path(model: str, dataset: str, root: str = "data/rollouts") -> str:
+    """On-disk rollout cache, keyed by dataset and model slug."""
+    return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
+
+
 # ---------------------------------------------------------------------------
 # Privileged context (PI)
 #
@@ -154,8 +159,7 @@ def compose_pi_messages(
     which is what SDFTTrainer does, so a caller reconstructing its teacher prompt must do
     the same or the two will disagree by the template's literal text. `template` is a
     parameter for the one case where that literal matters: an arm whose empty-PI control
-    must be a true no-op passes a concatenating template (see
-    train/opsd/train_self_teacher/lib.py's `teacher_prompt_template`).
+    must be a true no-op can pass a concatenating template.
 
     Returns a new list; `messages` is not mutated.
     """

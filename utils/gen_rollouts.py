@@ -1,21 +1,13 @@
 r"""
-Stage 1 of the trained-self-teacher arm: sample rollouts from the FROZEN student, grade them,
-and, by default, record the student's own log-probabilities for the sampled tokens.
+Generate, grade, and cache frozen-model rollouts shared by OPSD training and evaluation.
 
-Run ONCE per (model, dataset). The rollouts are drawn from the student's UN-PRIVILEGED prompt --
-the PI only enters when the teacher scores them in stage 2 -- so a single cache serves every
-`--pi-mode`. Questions always come from that model's hint cache, fixing the generated data to the
-common subset for which every PI arm is available.
+The unprivileged rollouts are consumed by the learned hint generator's transfer reward and its
+evaluation. They can also supply a fixed attempted solution as PI for SDFT/pass@k experiments.
+Questions come from the model's validated hint cache, keeping those experiments on a common
+cohort.
 
-Why the student's logprobs are cached here rather than recomputed in stage 2: the student is
-frozen for the entire E-step, so `log pi_theta(y_t | x, y_<t)` is a constant of the problem.
-Caching it means stage 2 holds only the teacher in memory.
-
-Multiple rollouts per prompt : With one rollout per question the teacher can possibly drive the
-E-step loss down by reading the QUESTION's difficulty and ignoring the trace entirely. Sampling
-`--n` rollouts means the same question appears with different outcomes, so stage 2 can measure
-within-question discrimination. The mixed-outcome fraction is reported below, and `--mixed-only`
-keeps just those questions.
+By default a clean Hugging Face subprocess also records the generating model's selected-token
+log-probabilities. Pass ``--skip-logp-scoring`` when only completion text is needed.
 
 Output: an on-disk HF dataset at data/rollouts/<dataset>/<model-slug>/ with columns rollout_id,
 question_id, question, final_answer, completion_ids, completion_text, reward, n_tokens,
@@ -31,12 +23,12 @@ the same forward in a clean one. Use --skip-logp-scoring when the cache is only 
 completions, as in the attempted-solution PI pass@k ablation.
 
 # Generate/reuse rollouts and score them; the clean-process boundary is automatic.
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
+CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_rollouts \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2084 --n 4
 
 # Generate attempted solutions for the pass@k rollout-PI ablation. Do not use --mixed-only:
 # PI selection must not depend on verifier outcomes.
-CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_self_teacher.gen_rollouts \
+CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_rollouts \
     --model Qwen/Qwen3-1.7B --dataset deepmath --output-root data/pi/attempted_solution_8k \
     --n 1 --max-completion-length 8192 --skip-logp-scoring
 """
@@ -52,13 +44,14 @@ from collections import defaultdict
 import torch
 from datasets import Dataset, load_from_disk
 
-from train.opsd.train_self_teacher.lib import per_token_logps, rollout_path
 from utils import (
     DATASET_REGISTRY_TRAIN,
     format_prompt_math,
     grade,
     load_hint_cache,
+    rollout_path,
 )
+from utils.model_scoring import per_token_logps
 
 
 def summarize_outcomes(rows: list[dict]) -> tuple[float, float]:
@@ -206,9 +199,8 @@ def generate(args, out_dir: str) -> None:
     print(f"Generated {len(rows)} rollouts over {len(ds)} questions")
     print(f"  pass rate {pass_rate:.3f}  |  questions with mixed outcomes {mixed_rate:.3f}")
     if mixed_rate < 0.2:
-        print("  warning: few questions carry both outcomes, so the teacher might be able to fit the label "
-              "from question difficulty alone. Raise --n, or pick a dataset slice nearer this "
-              "model's ability. Watch `within_question_auc_q*` in stage 2.")
+        print("  warning: few questions carry both outcomes. Raise --n, or choose a dataset "
+              "slice nearer this model's ability if within-question contrast matters.")
     if args.mixed_only:
         by_question = defaultdict(list)
         for row in rows:
@@ -301,15 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--model", default="Qwen/Qwen3-4B",
-                   help="The frozen student. MUST be the model trained in stage 3.")
+                   help="The frozen model used to generate and optionally score rollouts.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()))
     p.add_argument("--output-root", default="data/rollouts")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Questions to roll out. Omit to use the full hint cache. Total "
                         "rollouts = selected questions x --n.")
     p.add_argument("--n", type=int, default=4,
-                   help="Rollouts per question. >1 is what stops the teacher fitting the outcome "
-                        "from question difficulty alone; see the module docstring.")
+                   help="Rollouts per question.")
     p.add_argument("--mixed-only", action="store_true",
                    help="Keep only questions that produced BOTH a correct and an incorrect "
                         "rollout. Strongest form of the difficulty-shortcut guard, at the cost of "

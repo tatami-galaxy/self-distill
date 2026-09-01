@@ -12,7 +12,7 @@ Privileged context (`--pi-mode`):
             optionally `--hint-cache` to use a trained hint generator instead.
             Sits between `full` and `answer`.
   rollout -- one fixed, unverified solution attempt sampled from the same base model;
-             precompute with `train.opsd.train_self_teacher.gen_rollouts` first
+             precompute with `python -m utils.gen_rollouts` first
 
 Resume (`--resume-from-checkpoint`) restores weights/optimizer/scheduler/RNG and
 skips already-seen data; pass the same hyperparameters (verified against run_meta.json).
@@ -70,6 +70,7 @@ from utils import (
     hint_path,
     load_hint_cache,
     load_train_dataset,
+    rollout_path,
     validate_resume,
 )
 
@@ -193,15 +194,6 @@ def filter_long_pi_prompts(
     return ds
 
 
-def rollout_pi_path(
-    model: str,
-    dataset: str,
-    root: str = "data/pi/attempted_solution_8k",
-) -> str:
-    """Attempted-solution cache path without importing self-teacher.lib (which imports us)."""
-    return os.path.join(root, dataset, model.rstrip("/").split("/")[-1])
-
-
 def build_rollout_dataset(
     model: str | None,
     dataset: str,
@@ -220,11 +212,11 @@ def build_rollout_dataset(
     if sample_idx < 0:
         raise ValueError("rollout_pi_sample_idx must be >= 0")
 
-    path = rollout_pi_path(model, dataset, root)
+    path = rollout_path(model, dataset, root)
     if not os.path.isdir(path):
         raise FileNotFoundError(
             f"No rollout-PI cache for {model} on {dataset} at {path}. Generate it first:\n"
-            "  python -m train.opsd.train_self_teacher.gen_rollouts "
+            "  python -m utils.gen_rollouts "
             f"--model {model} --dataset {dataset} --output-root {root} --n 1 "
             "--max-completion-length 8192 --skip-logp-scoring"
         )

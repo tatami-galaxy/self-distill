@@ -29,6 +29,7 @@ from utils.utils import (
     hint_path,
     load_hint_cache,
     load_train_dataset,
+    rollout_path,
     register_dataset_eval,
     register_dataset_train,
     # resume validation
@@ -53,6 +54,7 @@ __all__ = [
     "hint_path",
     "load_hint_cache",
     "load_train_dataset",
+    "rollout_path",
     "register_dataset_eval",
     "register_dataset_train",
     "validate_resume",
