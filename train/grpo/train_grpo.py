@@ -59,6 +59,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_generations": args.num_generations,
+        "vllm_max_model_length": args.vllm_max_model_length,
     }
 
 
@@ -135,6 +136,12 @@ def main():
                         "transformers generation for debugging.")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3,
                    help="Fraction of GPU memory vLLM may reserve (colocate).")
+    p.add_argument(
+        "--vllm-max-model-length", "--max-model-len", "--max_model_len",
+        dest="vllm_max_model_length", type=int, default=None,
+        help="Maximum model context length used by vLLM. Omit to use the default "
+             "inferred from the model configuration.",
+    )
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
@@ -158,6 +165,8 @@ def main():
                         "a warning (use only if you understand the data-skip consequences).")
     args = p.parse_args()
 
+    if args.vllm_max_model_length is not None and args.vllm_max_model_length < 1:
+        p.error("--vllm-max-model-length must be >= 1")
     model_slug = args.model.rstrip("/").split("/")[-1]
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, args.dataset)
     print(f"model: {model_slug}  dataset: {args.dataset}  ->  output: {output_dir}")
@@ -177,6 +186,7 @@ def main():
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_length=args.vllm_max_model_length,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         # optimization
         learning_rate=args.learning_rate,

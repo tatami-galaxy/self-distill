@@ -70,7 +70,7 @@ ALGOS = (
 # (e.g. results/aime24/base/) do not even carry that. A reader comparing two runs needs to
 # distinguish "this field is absent because it was never recorded" from "absent because it
 # was null", and only a version stamp answers that.
-SUMMARY_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 3
 
 # Algorithms the algorithm name alone does not identify: for SDFT the privileged context and
 # for GOLD the teacher ARE the independent variable under study, so filing two of them under
@@ -184,6 +184,7 @@ def evaluate_model(
     model_name: str,
     problems: list[dict],
     max_tokens: int = 2048,
+    max_model_len: int | None = None,
     tensor_parallel_size: int = 1,
     chat_template_tokenizer=None,
     n_samples: int = 1,
@@ -218,6 +219,12 @@ def evaluate_model(
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
     )
+    # Leaving this unset preserves vLLM's model-derived default. Passing None as an
+    # explicit kwarg is not equivalent across vLLM versions, so only add the key when
+    # the caller requested an override.
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
@@ -423,6 +430,12 @@ def main():
     parser.add_argument("--k", type=int, nargs="+", default=[1, 8, 16],
                         help="pass@k value(s) to report, e.g. --k 1 8 16")
     parser.add_argument("--max_tokens", type=int, default=32000)
+    parser.add_argument(
+        "--max_model_len", "--max-model-len", dest="max_model_len", type=int,
+        default=None,
+        help="Maximum model context length passed to vLLM. Omit to use the default "
+             "inferred from the model configuration.",
+    )
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9,
                         help="Fraction of the GPU vLLM may reserve. This is measured against "
@@ -442,6 +455,9 @@ def main():
 
     if max(args.k) > args.n:
         parser.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
+
+    if args.max_model_len is not None and args.max_model_len < 1:
+        parser.error("--max_model_len must be >= 1")
 
     # Resolve the destination BEFORE loading anything: an eval is hours of generation, and a
     # flag combination that cannot be filed should fail in the first second, not the last.
@@ -485,6 +501,7 @@ def main():
         model_name=args.model,
         problems=problems,
         max_tokens=args.max_tokens,
+        max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
         chat_template_tokenizer=chat_template_tokenizer,
         n_samples=args.n,
@@ -504,6 +521,7 @@ def main():
         "n": args.n,
         "k": args.k,
         "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
         "sampling": eval_output["sampling"],
         "num_samples": args.num_samples,
         "seed": args.seed,
