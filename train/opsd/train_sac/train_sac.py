@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--max-samples", type=int, default=None)
 
     parser.add_argument(
-        "--pi-mode", default="full", choices=["full", "answer", "hint", "rollout"]
+        "--pi-mode", default="hint", choices=["full", "answer", "hint", "rollout"]
     )
     parser.add_argument("--hint-generator-model", default=None)
     parser.add_argument("--hint-cache", default=None)
@@ -108,7 +108,7 @@ def main():
         "--soft-v-estimator",
         default="topk",
         choices=["topk", "sarsa"],
-        help="Soft-V estimator. 'sarsa' is reserved for the next implementation arm.",
+        help="Soft-V estimator. 'sarsa' is not implemented yet",
     )
     parser.add_argument("--soft-v-topk", type=int, default=100)
     parser.add_argument("--lam", type=float, default=0.0)
@@ -152,7 +152,7 @@ def main():
     args = parser.parse_args()
 
     if args.soft_v_estimator == "sarsa":
-        parser.error("--soft-v-estimator sarsa is reserved but not implemented yet")
+        parser.error("--soft-v-estimator sarsa is not implemented yet")
     if args.soft_v_topk < 1:
         parser.error("--soft-v-topk must be >= 1")
     if not 0.0 <= args.lam <= 1.0:
