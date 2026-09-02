@@ -94,6 +94,7 @@ def build_sdft_dataset(
     rollout_pi_sample_idx: int = 0,
     hint_generator_model: str | None = None,
     hint_cache: str | None = None,
+    include_reward_solution: bool = False,
 ):
     """
     `prompt`             -- conversational [system, user] messages, identical to
@@ -101,7 +102,9 @@ def build_sdft_dataset(
                             inference prompts align.
     `privileged_context` -- the teacher-only string c (see PI_* above), selected
                             by `pi_mode`. SDFTTrainer requires exactly these two
-                            columns; everything else is dropped.
+                            columns; everything else is normally dropped.
+    `solution`           -- optional boxed gold answer for an online RLVR reward
+                            function. SAC requests it; ordinary SDFT does not.
 
     `pi_mode="hint"` loads precomputed hints from disk (see build_hint_dataset);
     `rollout` loads one fixed, unverified attempt per question from
@@ -123,6 +126,7 @@ def build_sdft_dataset(
             max_samples,
             hint_generator_model=hint_generator_model,
             hint_cache=hint_cache,
+            include_reward_solution=include_reward_solution,
         )
     if pi_mode == "rollout":
         ds = build_rollout_dataset(
@@ -131,6 +135,7 @@ def build_sdft_dataset(
             max_samples,
             rollout_pi_root,
             rollout_pi_sample_idx,
+            include_reward_solution=include_reward_solution,
         )
         return filter_long_pi_prompts(
             ds, pi_mode, model=model, max_prompt_length=max_prompt_length
@@ -150,10 +155,13 @@ def build_sdft_dataset(
             privileged_context = PI_ANSWER.format(answer=str(row["final_answer"]))
         else:  # full
             privileged_context = PI_FULL.format(demo=row["solution"])
-        return {
+        example = {
             "prompt": format_prompt_math(row["question"]),
             "privileged_context": privileged_context,
         }
+        if include_reward_solution:
+            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+        return example
 
     ds = ds.map(_map, remove_columns=ds.column_names)
 
@@ -200,6 +208,7 @@ def build_rollout_dataset(
     max_samples: int | None,
     root: str,
     sample_idx: int,
+    include_reward_solution: bool = False,
 ):
     """Join one fixed unverified attempt onto the matching self-hint questions.
 
@@ -281,6 +290,11 @@ def build_rollout_dataset(
         )
 
     questions = load_hint_cache(model, dataset, max_samples=max_samples)
+    if include_reward_solution and "final_answer" not in questions.column_names:
+        raise ValueError(
+            "The hint cache needs a final_answer column when it is used for online "
+            "RLVR reward scoring. Regenerate it with the current utils/gen_hints.py."
+        )
     missing_indices = [idx for idx in range(len(questions)) if idx not in attempts]
     if missing_indices:
         preview = missing_indices[:10]
@@ -298,10 +312,13 @@ def build_rollout_dataset(
                 f"question_idx={question_idx}: hint={row['question']!r}, "
                 f"rollout={cached_question!r}."
             )
-        return {
+        example = {
             "prompt": format_prompt_math(row["question"]),
             "privileged_context": PI_ROLLOUT.format(attempt=attempt),
         }
+        if include_reward_solution:
+            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+        return example
 
     return questions.map(_map, with_indices=True, remove_columns=questions.column_names)
 
@@ -333,6 +350,7 @@ def build_hint_dataset(
     max_samples: int | None,
     hint_generator_model: str | None = None,
     hint_cache: str | None = None,
+    include_reward_solution: bool = False,
 ):
     """Load precomputed hints (utils/gen_hints.py) and wrap them as PI.
 
@@ -355,6 +373,8 @@ def build_hint_dataset(
 
     ds = load_from_disk(path)
     required = {"question", "hint", "gen_model"}
+    if include_reward_solution:
+        required.add("final_answer")
     missing = required.difference(ds.column_names)
     if missing:
         raise ValueError(
@@ -383,10 +403,13 @@ def build_hint_dataset(
         ds = ds.select(range(max_samples))
 
     def _map(row):
-        return {
+        example = {
             "prompt": format_prompt_math(row["question"]),
             "privileged_context": PI_HINT.format(hint=row["hint"]),
         }
+        if include_reward_solution:
+            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+        return example
 
     return ds.map(_map, remove_columns=ds.column_names)
 
