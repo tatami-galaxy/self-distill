@@ -161,9 +161,15 @@ $Q_\phi$ is initialized with the teacher log-probability and subsequently traine
 
 $$Q_\phi(\hat{y}_t, s_t)=sg[\text{log}\pi_T(\hat{y_{t}}|x,f,y_{<t})+(\beta-1)\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})]$$
 
-Computing $V_\phi^{soft}$ exactly requires an expectation over the full vocabulary at every prefix. One option is to instead take an expectation over top-$K$ tokens but then the value estimate is no longer unbiased. Another option is to use the unbiased but high variance SARSA estimate : 
+Computing $V_\phi^{soft}$ exactly requires an expectation over the full vocabulary at every prefix. One option is to instead take an expectation over top-$K$ tokens but then the value estimate is no longer unbiased. Another option is to use the unbiased but high variance SARSA estimate $V_{\phi, SARSA}^{soft}=Q_\phi(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi_{\theta}(\hat{y}_{t+1}|x,y_{<t+1})$
+
+
+## Q construction
+
+As a first attempt we can have : 
 
 $$
-\boxed{V_{SARSA}=Q_\phi(\hat{y}_{t+1}, s_{t+1})-\beta\text{log}\pi_{old}(\hat{y}_{t+1}|x,y_{<t+1})}
+\boxed{Q_\phi(\hat{y}_t, s_t)=\operatorname{sg}[\ell_T(\hat{y}_t, s_t)]+u_{\hat{y}_t}^\top z_\phi(\operatorname{sg}[h_T(s_t)])}
 $$
 
+where $u_{\hat{y}_t}=W_{LM}[\hat{y}_t]$, $z_\phi(h)=B_\phi\sigma(A_\phi h)$, with $B_\phi$ initialized to zero.
