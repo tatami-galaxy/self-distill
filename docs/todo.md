@@ -54,3 +54,4 @@
   - [ ] Other cost functions
   - [x] Constrained optimization : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad \mathbb E_{h\sim g_\phi}[S(h)]\ge \tau$
   - [ ] LoRA on top of self-teacher 
+  - [ ] Want PI to be what student does not know
