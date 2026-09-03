@@ -52,6 +52,7 @@
   - [x] Tune hyperparameters
   - [ ] Other cost functions
   - [x] Constrained optimization : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad \mathbb E_{h\sim g_\phi}[S(h)]\ge \tau$
+  - [ ] Other objectives
   - [ ] LoRA on top of self-teacher 
 
 - Single forward pass PPO, segment level PPO, LoRA PPO
