@@ -204,12 +204,14 @@ class RolloutRunMetadataTest(unittest.TestCase):
             gradient_accumulation_steps=16,
             num_generations=1,
             max_prompt_length=16384,
+            vllm_max_model_length=32768,
         )
 
         meta = train_sdft.build_run_meta(args, num_train_examples=100)
 
         self.assertEqual(meta["gen_model"], "student")
         self.assertEqual(meta["rollout_pi_sample_idx"], 0)
+        self.assertEqual(meta["vllm_max_model_length"], 32768)
         self.assertEqual(
             meta["rollout_pi_selection_policy"], "fixed_sample_idx_without_reward"
         )
@@ -234,6 +236,7 @@ class RolloutRunMetadataTest(unittest.TestCase):
             gradient_accumulation_steps=16,
             num_generations=1,
             max_prompt_length=8192,
+            vllm_max_model_length=None,
         )
 
         meta = train_sdft.build_run_meta(args, num_train_examples=100)

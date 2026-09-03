@@ -474,6 +474,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_generations": args.num_generations,
         "max_prompt_length": args.max_prompt_length,
+        "vllm_max_model_length": args.vllm_max_model_length,
     }
 
 
@@ -574,6 +575,12 @@ def main():
                         "transformers generation for debugging.")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3,
                    help="Fraction of GPU memory vLLM may reserve (colocate).")
+    p.add_argument(
+        "--vllm-max-model-length", "--max-model-len", "--max_model_len",
+        dest="vllm_max_model_length", type=int, default=None,
+        help="Maximum model context length used by vLLM. Omit to use the default "
+             "inferred from the model configuration.",
+    )
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
@@ -592,6 +599,8 @@ def main():
                    help="Downgrade a run_meta.json hyperparameter mismatch from an error to "
                         "a warning (use only if you understand the data-skip consequences).")
     args = p.parse_args()
+    if args.vllm_max_model_length is not None and args.vllm_max_model_length < 1:
+        p.error("--vllm-max-model-length must be >= 1")
     if args.rollout_pi_sample_idx < 0:
         p.error("--rollout-pi-sample-idx must be >= 0")
     if args.pi_mode != "hint" and (
@@ -662,6 +671,7 @@ def main():
         use_vllm=args.use_vllm,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_length=args.vllm_max_model_length,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         # optimization
         learning_rate=args.learning_rate,
