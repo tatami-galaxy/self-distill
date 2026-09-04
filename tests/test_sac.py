@@ -17,6 +17,7 @@ from train.opsd.train_sac.lib import (
     terminal_token_rewards,
 )
 from train.opsd.train_sac.trainer import SACConfig, SACTrainer
+from train.opsd.train_sac.train_sac import sac_run_name
 
 
 class ResidualQHeadTest(unittest.TestCase):
@@ -124,6 +125,12 @@ class SACConfigTest(unittest.TestCase):
         self.assertEqual(config.soft_v_topk, 100)
         self.assertEqual(config.lam, 0.0)
         self.assertEqual(config.num_iterations, 1)
+
+    def test_run_name_records_linear_q_head(self):
+        self.assertEqual(
+            sac_run_name("deepmath", "full", "topk"),
+            "deepmath_full_topk_linear",
+        )
 
     def test_rejects_rollout_distribution_mismatch(self):
         with tempfile.TemporaryDirectory() as output_dir:

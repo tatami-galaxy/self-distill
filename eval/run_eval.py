@@ -62,7 +62,7 @@ from utils import (
 # completions -- the corpus becomes the variable under study and `sft` should join
 # VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
 ALGOS = (
-    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sft"
+    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sac", "sft"
 )
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
@@ -72,12 +72,14 @@ ALGOS = (
 # was null", and only a version stamp answers that.
 SUMMARY_SCHEMA_VERSION = 3
 
-# Algorithms the algorithm name alone does not identify: for SDFT the privileged context and
-# for GOLD the teacher ARE the independent variable under study, so filing two of them under
-# a bare `sdft/` or `gold/` would merge runs that the experiment exists to tell apart.
+# Algorithms whose names alone do not identify the experimental arm. PI is the independent
+# variable for SDFT; PI, the soft-V estimator, and Q head identify SAC; and the teacher
+# identifies GOLD. Requiring a variant prevents distinct runs from silently sharing a
+# results folder.
 VARIANT_REQUIRED = {
     "ppo_pi": "the critic's privileged context, e.g. --variant answer or --variant none",
     "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
+    "sac": "the PI, soft-V estimator, and Q head, e.g. --variant full_topk_linear",
     "gold": "the teacher, e.g. --variant Qwen3-30B-A3B-Thinking-2507",
 }
 
@@ -411,7 +413,9 @@ def main():
     parser.add_argument(
         "--variant", default=None,
         help="What distinguishes this arm within its algorithm: the privileged context for "
-             "sdft (full/answer/hint/rollout/self_rollout) or the teacher slug for gold. "
+             "sdft (full/answer/hint/rollout/self_rollout), PI plus soft-V estimator for "
+             "sac including its Q head (e.g. full_topk_linear), or the teacher slug for "
+             "gold. "
              "Required where the algorithm has multiple experiment arms; optional elsewhere.",
     )
     parser.add_argument(

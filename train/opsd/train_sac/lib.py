@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+Q_HEAD_ARCHITECTURE = "linear"
+
 
 class ResidualQHead(nn.Module):
     """Map a frozen teacher hidden state to a residual hidden state.

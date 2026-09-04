@@ -34,7 +34,13 @@ from train.opsd.train_sdft import (
 )
 from utils import DATASET_REGISTRY_TRAIN, TEACHER_PROMPT_TEMPLATE, validate_resume
 
+from .lib import Q_HEAD_ARCHITECTURE
 from .trainer import GAMMA, SOFT_BETA, SACConfig, SACTrainer
+
+
+def sac_run_name(dataset: str, pi_slug: str, soft_v_estimator: str) -> str:
+    """Name an SAC run by every architectural choice currently under study."""
+    return f"{dataset}_{pi_slug}_{soft_v_estimator}_{Q_HEAD_ARCHITECTURE}"
 
 
 def build_run_meta(args, num_train_examples: int) -> dict:
@@ -68,6 +74,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "rollout_pi_sample_idx": args.rollout_pi_sample_idx if args.pi_mode == "rollout" else None,
         "reward": "accuracy_reward",
         "teacher_model_kind": "base",
+        "q_head_architecture": Q_HEAD_ARCHITECTURE,
         "q_parameterization": "frozen_lm_head_zero_linear_residual",
         "soft_v_estimator": args.soft_v_estimator,
         "soft_v_topk": args.soft_v_topk,
@@ -176,11 +183,12 @@ def main():
     output_dir = args.output_dir or os.path.join(
         args.output_root,
         model_slug,
-        f"{args.dataset}_{pi_slug}_{args.soft_v_estimator}",
+        sac_run_name(args.dataset, pi_slug, args.soft_v_estimator),
     )
     print(
         f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  "
-        f"soft-V: {args.soft_v_estimator}  ->  output: {output_dir}"
+        f"soft-V: {args.soft_v_estimator}  Q-head: {Q_HEAD_ARCHITECTURE}  "
+        f"->  output: {output_dir}"
     )
 
     train_dataset = build_sdft_dataset(
