@@ -72,11 +72,7 @@ class TopKSoftValueEstimator:
 
 
 def make_soft_value_estimator(name: str, *, topk: int):
-    """Construct a soft-V estimator without coupling it to the trainer.
-
-    The CLI reserves ``sarsa`` now so experiment metadata and trainer wiring do not
-    need to change when it is added, but intentionally fails rather than silently
-    using different semantics.
+    """Construct a soft-V estimator without coupling it to the trainer
     """
 
     if name == "topk":
