@@ -19,6 +19,9 @@ Mapping to the SDFT/OPSD runs (only the teacher should differ -- capability, no 
   * beta=1.0           -- reverse KL KL(student||teacher), == SDFT distillation_alpha=1.0.
                           (GOLD beta: 0=forward KL, 1=reverse KL, 0.5=JSD.)
   * seq_kd=False       -- token-level distillation, not SFT on teacher samples.
+  * temperature=1.0, top_p=1.0, top_k=0 -- same unfiltered sampling distribution
+                          as SDFT. GOLD otherwise defaults to temperature=0.9 and
+                          top_p=0.95; temperature also rescales its distillation logits.
   * learning_rate 1e-5 -- GOLD defaults to 1e-7; we override to match train_sdft.py.
 
 GPU topology (bf16 30B teacher + colocate vLLM don't share one GPU comfortably):
@@ -60,6 +63,14 @@ from utils import (
 )
 
 
+# GOLD's library defaults differ from SDFT's. Keep these explicit so upgrading TRL
+# cannot silently change the OPD arm's rollout or distillation distribution.
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_TOP_K = 0
+GOLD_RESUME_STRICT_KEYS = ("temperature", "top_p", "top_k")
+
+
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------
@@ -78,6 +89,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "use_uld_loss": False,
         "lmbda": args.lmbda,
         "beta": args.beta,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
         "max_completion_length": args.max_completion_length,
         # resume-critical: on resume the LR comes from the CHECKPOINT, not the CLI (see
         # validate_resume), so recording it turns a silently-ignored change into an error.
@@ -210,6 +224,14 @@ def main():
                         "0.0 = forward KL, 0.5 = JSD.")
     p.add_argument("--seq-kd", action=argparse.BooleanOptionalAction, default=False,
                    help="Sequence-level KD (SFT on teacher samples) instead of on-policy.")
+    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
+                   help="Sampling and distillation-logit temperature. Default 1.0 "
+                        "matches SDFT (rather than GOLD's library default 0.9).")
+    p.add_argument("--top-p", type=float, default=DEFAULT_TOP_P,
+                   help="Nucleus-sampling threshold. Default 1.0 matches SDFT and "
+                        "keeps the full token support.")
+    p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
+                   help="Top-k sampling cutoff; 0 disables it, matching SDFT.")
     p.add_argument("--max-completion-length", type=int, default=8192,
                    help="On-policy completion budget (GOLD's max_completion_length). "
                         "Matches the SDFT runs.")
@@ -298,6 +320,9 @@ def main():
         lmbda=args.lmbda,
         beta=args.beta,
         seq_kd=args.seq_kd,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         # teacher
@@ -334,7 +359,12 @@ def main():
     # (its run_meta.json sits beside the checkpoint), so the seeded data-skip lands
     # on the examples that were actually left untrained.
     if args.resume_from_checkpoint:
-        validate_resume(args.resume_from_checkpoint, meta, args.force_resume)
+        validate_resume(
+            args.resume_from_checkpoint,
+            meta,
+            args.force_resume,
+            strict_keys=GOLD_RESUME_STRICT_KEYS,
+        )
 
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
