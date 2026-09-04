@@ -41,10 +41,13 @@
 - **PI conditioned V**
   - [ ] $A^{\mathrm{actor}}_{t,k}=(1-\rho_k)A^{\mathrm{SD}}_{0,t}+\rho_k A^{R,\mathrm{GAE}}_{t},\qquad\rho_k\in[0,1]$
   - [x] value warmup
+  - [ ] judge instruction
 
 - **PI conditioned Q function actor-critic**
 
   - [ ] $\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))]$
+  - [ ] Non linear Q head
+  - [ ] Hyperparameter sweep
 
 - **Train self-teacher for hint generation**
   - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
@@ -56,3 +59,5 @@
   - [ ] LoRA on top of self-teacher 
 
 - Single forward pass PPO, segment level PPO, LoRA PPO
+
+- Is step correctness same as causal contribution? 
