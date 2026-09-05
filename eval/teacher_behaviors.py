@@ -77,7 +77,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from eval.advantage_dynamics import (
+from eval.advantage_dynamics_sdft import (
     fingerprint_ids,
     question_cluster_bootstrap_ci,
     read_json,
