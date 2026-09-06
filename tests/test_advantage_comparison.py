@@ -174,10 +174,36 @@ class JoinTest(unittest.TestCase):
     def test_cli_controls(self):
         args = ac.build_parser().parse_args(["--student", "s", "--opd-teacher", "t", "--output-dir", "out",
                                              "--num-token-samples", "7", "--K", "23"])
+        self.assertEqual(args.pi_modes, ["answer", "full", "hint"])
         self.assertEqual(args.selection_modes, ["uniform", "steps"])
         self.assertEqual(args.num_token_samples, 7)
         self.assertEqual(args.mc_samples, 23)
 
+
+
+class SourceTest(unittest.TestCase):
+    def test_default_dataset_joins_hints_by_question_and_answer(self):
+        args = SimpleNamespace(cohort=None, dataset="deepmath", pi_modes=["answer", "full", "hint"],
+                               opsd_teacher="teacher")
+        rows = [{"question": "q1", "final_answer": "1", "solution": "s1"},
+                {"question": "q2", "final_answer": "2", "solution": "s2"}]
+        hints = [{"question": "q2", "final_answer": "2", "hint": "h2"},
+                 {"question": "q1", "final_answer": "wrong", "hint": "wrong hint"}]
+        with mock.patch("utils.load_train_dataset", return_value=rows) as dataset, \
+             mock.patch("utils.load_hint_cache", return_value=hints) as cache:
+            source = ac.load_source(args)
+        dataset.assert_called_once_with("deepmath", require_solution=True)
+        cache.assert_called_once_with("teacher", "deepmath")
+        self.assertIsNone(source[0]["hint"])
+        self.assertEqual(source[1]["hint"], "h2")
+        self.assertEqual(source[1]["solution"], "s2")
+
+    def test_custom_cohort_keeps_its_own_hints(self):
+        args = SimpleNamespace(cohort="custom.json")
+        rows = [{"question": "q", "final_answer": "a", "hint": "custom"}]
+        with mock.patch.object(ac, "load_rows", return_value=rows), \
+             mock.patch("utils.load_hint_cache", side_effect=AssertionError("Unexpected cache load")):
+            self.assertEqual(ac.load_source(args), rows)
 
 
 class PipelineTest(unittest.TestCase):

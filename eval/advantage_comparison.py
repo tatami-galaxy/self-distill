@@ -1,7 +1,19 @@
 """Compare OPD, OPSD and outcome MC advantages on one frozen student's rollouts.
 
-See ``eval/advantage_comparison.md`` for definitions, CLI examples and artifact schemas.
-Heavy imports are phase-local: vLLM generation and HF scoring run in clean processes.
+CUDA_VISIBLE_DEVICES=0,1 uv run python -m eval.advantage_comparison \
+  --student /path/to/student/checkpoint-100 \
+  --opd-teacher Qwen/Qwen3-30B-A3B-Thinking-2507 \
+  --opsd-teacher Qwen/Qwen3-1.7B \
+  --dataset deepmath \
+  --pi-modes answer full \
+  --num-problems 8 --n 2 \
+  --selection-modes uniform steps \
+  --num-token-samples 16 --mc-samples 32 \
+  --min-segment-tokens 32 --max-segment-tokens 256 \
+  --max-completion-length 8192 --max-model-len 16384 \
+  --student-device cuda:0 --teacher-device cuda:1 \
+  --output-dir results/advantage_comparison/student100
+
 """
 
 from __future__ import annotations
@@ -238,9 +250,29 @@ def chat_ids(tokenizer, messages):
                 add_generation_prompt=True, return_dict=True)["input_ids"][0])
 
 
+def load_source(args):
+    """Attach cached self-teacher hints to registered datasets by exact problem identity."""
+    from utils import DATASET_REGISTRY_EVAL, load_hint_cache, load_train_dataset
+
+    if args.cohort:
+        return load_rows(args.cohort)
+    if args.dataset in DATASET_REGISTRY_EVAL:
+        source = list(DATASET_REGISTRY_EVAL[args.dataset]())
+    else:
+        source = list(load_train_dataset(args.dataset, require_solution="full" in args.pi_modes))
+    if "hint" in args.pi_modes:
+        hints = load_hint_cache(args.opsd_teacher, args.dataset)
+        by_problem = {}
+        for row in hints:
+            key = (str(row["question"]), str(row["final_answer"]))
+            by_problem.setdefault(key, row["hint"])
+        source = [{**row, "hint": by_problem.get((str(row["question"]), str(row["final_answer"])))}
+                  for row in source]
+    return source
+
+
 def prepare(args):
     from transformers import AutoConfig, AutoTokenizer
-    from utils import DATASET_REGISTRY_EVAL, load_train_dataset
 
     out = Path(args.output_dir)
     if (out / "cohort.json").exists():
@@ -248,6 +280,7 @@ def prepare(args):
     student = AutoTokenizer.from_pretrained(args.student, trust_remote_code=True)
     opd = AutoTokenizer.from_pretrained(args.opd_teacher, trust_remote_code=True)
     opsd = AutoTokenizer.from_pretrained(args.opsd_teacher, trust_remote_code=True)
+
     tokenizers = {"student": tokenizer_identity(student), "opd": check_tokenizers(student, opd),
                   "opsd": check_tokenizers(student, opsd)}
     configs = {name: AutoConfig.from_pretrained(path, trust_remote_code=True)
@@ -260,18 +293,15 @@ def prepare(args):
         eos_ids.add(student.eos_token_id)
     if not eos_ids:
         raise ValueError("Student must define an EOS token")
-    if args.cohort:
-        source = load_rows(args.cohort)
-    elif args.dataset in DATASET_REGISTRY_EVAL:
-        source = list(DATASET_REGISTRY_EVAL[args.dataset]())
-    else:
-        source = list(load_train_dataset(args.dataset, require_solution="full" in args.pi_modes))
+    
+    source = load_source(args)
     source_hash = fingerprint(source)
     order = list(range(len(source)))
     random.Random(args.seed).shuffle(order)
     needed = {"answer": "final_answer", "full": "solution", "hint": "hint", "rollout": "rollout"}
     rows, seen = [], set()
     missing = too_long = 0
+
     for index in order:
         problem = source[index]
         columns = {"question", "final_answer"} | {needed[m] for m in args.pi_modes if m in needed}
@@ -295,9 +325,11 @@ def prepare(args):
         seen.add(qid)
         if len(rows) == args.num_problems:
             break
+
     if len(rows) != args.num_problems:
         raise ValueError(f"Only {len(rows)}/{args.num_problems} eligible problems; {missing} missing PI, "
-                         f"{too_long} too long. For hint/rollout PI, supply --cohort with those columns.")
+                         f"{too_long} too long. Check hint-cache coverage or supply --cohort with the required PI columns.")
+    
     write_json(out / "cohort.json", {"rows": rows, "source_fingerprint": source_hash,
                "tokenizers": tokenizers, "eos_ids": sorted(eos_ids), "model_revisions": revisions,
                "missing_context": missing, "prompt_too_long": too_long})
@@ -685,7 +717,8 @@ def build_parser():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--dataset", default="deepmath", help="Registered training/eval dataset")
     source.add_argument("--cohort", help="JSON/JSONL rows or saved HF Dataset; hint/rollout PI require corresponding columns")
-    parser.add_argument("--pi-modes", nargs="+", choices=PI_MODES, default=["answer", "full"])
+    parser.add_argument("--pi-modes", nargs="+", choices=PI_MODES, default=["answer", "full", "hint"],
+                        help="OPSD PI modes (default: answer full hint)")
     parser.add_argument("--selection-modes", nargs="+", choices=("uniform", "steps"), default=["uniform", "steps"])
     parser.add_argument("--num-problems", type=int, default=32)
     parser.add_argument("--n", type=int, default=4, help="Original student rollouts per problem")
@@ -694,7 +727,7 @@ def build_parser():
     parser.add_argument("--min-segment-tokens", type=int, default=32)
     parser.add_argument("--max-segment-tokens", type=int, default=256)
     parser.add_argument("--max-completion-length", type=int, default=8192)
-    parser.add_argument("--max-model-len", type=int, default=16384)
+    parser.add_argument("--max-model-len", type=int, default=32000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)

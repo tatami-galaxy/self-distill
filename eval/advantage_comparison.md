@@ -1,43 +1,9 @@
-# Fixed-rollout advantage comparison
-
-Run `python -m eval.advantage_comparison` to compare one frozen student's OPD,
-OPSD, and Vine-style outcome advantages. This evaluator is separate from
-`advantage_dynamics_sdft.py`, which follows SDFT training checkpoints.
-
-## Example
-
-```sh
-CUDA_VISIBLE_DEVICES=0,1 uv run python -m eval.advantage_comparison \
-  --student /path/to/student/checkpoint-100 \
-  --opd-teacher Qwen/Qwen3-30B-A3B-Thinking-2507 \
-  --opsd-teacher Qwen/Qwen3-1.7B \
-  --dataset deepmath \
-  --pi-modes answer full \
-  --num-problems 8 --n 2 \
-  --selection-modes uniform steps \
-  --num-token-samples 16 --mc-samples 32 \
-  --min-segment-tokens 32 --max-segment-tokens 256 \
-  --max-completion-length 8192 --max-model-len 16384 \
-  --student-device cuda:0 --teacher-device cuda:1 \
-  --output-dir results/advantage_comparison/student100
-```
-
-Choose device placement to fit the models. HF scoring holds the student and one
-teacher at a time; `--teacher-device auto` enables HF automatic placement.
-The self-teacher defaults to the student when `--opsd-teacher` is omitted.
-Generation uses vLLM with `--tensor-parallel-size` and
-`--gpu-memory-utilization`. Scoring uses unpadded batch size one, KV caching,
-and `--score-chunk-size` (default 128) to bound full-vocabulary temporaries.
-Model forwards default to BF16; normalization and stored scores are FP32.
-
-Use `--cohort PATH` instead of `--dataset` for JSON/JSONL records or a saved
-Hugging Face Dataset. Required columns are `question` and `final_answer`.
-PI modes require `solution` (full), `hint` (hint), or `rollout` (rollout).
-For example, a saved hint cache can serve as the cohort for `--pi-modes hint`.
-Join any additional solution/rollout columns before using multiple PI modes.
-The cohort is shuffled with the seed and filtered to the common feasibility
-intersection: every requested prompt must fit with the full completion budget.
-Rollout PI is read as provided; the evaluator never selects an attempt by reward.
+OPSD PI defaults to `answer full hint`. With `--dataset`, hints are loaded from
+the existing cache for `--opsd-teacher` (which defaults to `--student`) and matched
+by both question and final answer. The cache must already exist; missing hints
+are excluded from the common cohort. With `--cohort`, provide `question`,
+`final_answer`, `solution`, and `hint` for these default modes. Override
+`--pi-modes` to select a different set.
 
 ## Definitions
 
