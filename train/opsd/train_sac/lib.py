@@ -12,8 +12,8 @@ class ResidualQHead(nn.Module):
     """Map a frozen teacher hidden state to a residual hidden state.
 
     The frozen teacher LM-head row for action ``a`` supplies ``u_a`` outside this
-    module, so ``c(s, a) = u_a^T z(h_T(s))``. A zero projection makes the initial
-    correction exactly zero without adding an output-scale hyperparameter.
+    module, so ``c(s, a) = u_a^T z(h_T(s))``.
+    A zero projection makes the initial correction exactly zero : 
     """
 
     def __init__(self, hidden_size: int):
@@ -68,6 +68,7 @@ class TopKSoftValueEstimator:
     def estimate(self, q_values: torch.Tensor, support: TopKPolicySupport) -> torch.Tensor:
         if q_values.shape != support.logps.shape:
             raise ValueError("top-K Q values and policy support must have the same shape")
+        # beta = 1
         return (support.weights * (q_values.float() - support.logps)).sum(dim=-1)
 
 

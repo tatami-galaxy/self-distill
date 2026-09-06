@@ -19,6 +19,27 @@ Four GPUs, data parallel:
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
     -m train.opsd.train_sac.train_sac --model Qwen/Qwen3-4B \
     --dataset deepmath --pi-mode full --max-samples 8192
+
+
+Current problems : 
+
+The concern is that the current parameterization :
+c_phi(s,a)=w_a^T A_\phi h_T(s) must fit the return offset through an action-dependent projection. 
+It has no explicit state-only scalar component. 
+Fitting that offset can introduce unwanted differences between actions.
+The damaging route is the learned critic changing subsequent actor coefficients.
+
+There is an initialization-versus-objective mismatch : 
+Initializing Q_0=log pi_T gives the desired self-distillation actor gradient. 
+It does not make Q_0 a Bellman-consistent soft value function for binary correctness rewards.
+Consequently, CRITIC LEARNING HAS NO REQUIREMENT TO PRESERVE THE TEACHER'S PREFERENCES. 
+The teacher term remains frozen in the formula, but the residual can cancel or overwhelm it. 
+Even outcome-only regression would eventually move Q away from log-probabilities.
+
+For λ=0, bootstraps from the initialization instead of exposing the full return immediately. 
+That explains the much smaller early regression error. 
+It does not eliminate the underlying mismatch: the λ=0 run also worsens.
+
 """
 
 import argparse

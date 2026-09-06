@@ -1,4 +1,4 @@
-1. This codebase has LLM post training experiments with multiple algorithms : grpo, ppo, on policy distillation, op policy self distillation, sft. The ppo code is custom, built on top of TRL's GRPOTrainer for RLVR tasks like math in our case. opsd has mostly SDFT ([https://arxiv.org/html/2601.19897](https://arxiv.org/html/2601.19897)) based experiments and also some self-teacher training experiments. We are also doing some teacher analysis experiments and visualizations in eval.
+1. This codebase has LLM post training experiments with multiple algorithms : grpo, ppo, on policy distillation, op policy self distillation, sft. The ppo code is custom, built on top of TRL's GRPOTrainer for RLVR tasks like math in our case. opsd has mostly SDFT ([https://arxiv.org/html/2601.19897](https://arxiv.org/html/2601.19897)) based experiments and also some self-teacher training experiments with the soft A2C formulation . We are also doing some teacher analysis and visualization experiments in eval.
 
 
 

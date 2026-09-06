@@ -262,8 +262,9 @@ class SACTrainer(SDFTTrainer):
         sampled_correction = (
             residual_hidden.float() * teacher["sampled_action_vectors"].float()
         ).sum(dim=-1)
-        sampled_q = teacher["sampled_teacher_logps"] + sampled_correction
 
+        # Q_phi(y_t, s_t)=sg[L_T(y_t, s_t)]+u_{y_t}^T z_phi(sg[h_T(s_t)])
+        sampled_q = teacher["sampled_teacher_logps"] + sampled_correction
         support = self.soft_value_estimator.build_support(topk_ids, topk_student_logps)
         topk_q = teacher["topk_teacher_logps"] + teacher["topk_corrections"]
         soft_values = self.soft_value_estimator.estimate(topk_q, support)
