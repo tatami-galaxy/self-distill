@@ -1,10 +1,7 @@
 """Compare OPD, OPSD and outcome MC advantages on one frozen student's rollouts.
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 uv run python -m eval.advantage_comparison \
-  --student Qwen/Qwen3-1.7B \
-  --opd-teacher Qwen/Qwen3-30B-A3B-Thinking-2507 \
-  --output-dir results/advantage_comparison/Qwen-1.7B
-
+bash eval/run_advantage_comparison.sh Qwen/Qwen3-1.7B
+bash eval/run_advantage_comparison.sh Qwen/Qwen3-4B
 """
 
 from __future__ import annotations
@@ -196,7 +193,11 @@ def mc_advantage(before, after, terminal_reward=None):
 
 def experiment_config(args):
     # K can increase on resume without changing rollouts, positions or earlier MC draws.
-    excluded = {"phase", "output_dir", "mc_samples", "mc_batch_size", "bootstrap_samples"}
+    # shard/num_shards only slice the SAME prefix population, so they must not fingerprint
+    # the experiment either -- otherwise concurrent shards would each reject the manifest
+    # written by the others.
+    excluded = {"phase", "output_dir", "mc_samples", "mc_batch_size", "bootstrap_samples",
+                "shard", "num_shards"}
     models = {}
     for name in ("student", "opd_teacher", "opsd_teacher"):
         path = Path(getattr(args, name))
@@ -415,7 +416,19 @@ def mc(args):
     spec, cohort = read_json(out / "plan.json"), read_json(out / "cohort.json")
     caches, jobs = {}, []
 
-    for prefix in spec["prefixes"]:
+    # Shards partition the prefix population so independent engines can run MC concurrently
+    # against ONE output directory. The stride is over the canonical plan.json order, which is
+    # fixed on disk (plan() refuses to overwrite a differing spec), so shards are disjoint and
+    # jointly exhaustive with no coordination, and each prefix owns its own mc/<key>.json, so
+    # no two shards ever write the same file. Striding rather than slicing contiguously is what
+    # balances COST: plan.json is ordered by rollout then ascending endpoint, so a contiguous
+    # block would hand one shard mostly early prefixes (long remaining budgets, slow) and
+    # another mostly late ones (short, fast).
+    prefixes = spec["prefixes"][args.shard::args.num_shards]
+    if args.num_shards > 1:
+        print(f"MC shard {args.shard}/{args.num_shards}: {len(prefixes)} of "
+              f"{len(spec['prefixes'])} prefixes", flush=True)
+    for prefix in prefixes:
         path = out / "mc" / f"{prefix['key']}.json"
         cached = read_json(path) if path.exists() else {"prefix": prefix, "draws": []}
         if cached["prefix"] != prefix:
@@ -738,6 +751,15 @@ def build_parser():
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--score-chunk-size", type=int, default=128)
     parser.add_argument("--bootstrap-samples", type=int, default=200)
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Split the MC prefix population across this many independent engines. "
+                             "Run prepare/generate/plan once, then one '--phase mc' process per "
+                             "shard (each on its own GPU with --tensor-parallel-size 1), then score "
+                             "and aggregate once. MC dominates the run, so N shards is ~N times "
+                             "faster than one engine and far faster than tensor parallelism at "
+                             "these model sizes.")
+    parser.add_argument("--shard", type=int, default=0,
+                        help="Zero-based index of this shard; requires --phase mc.")
     return parser
 
 
@@ -756,6 +778,16 @@ def main():
         parser.error("--max-model-len must exceed --max-completion-length")
     if not 0 < args.gpu_memory_utilization < 1 or args.bootstrap_samples < 0:
         parser.error("Require 0 < gpu-memory-utilization < 1 and bootstrap-samples >= 0")
+    if args.num_shards < 1:
+        parser.error("--num-shards must be positive")
+    if not 0 <= args.shard < args.num_shards:
+        parser.error("--shard must satisfy 0 <= --shard < --num-shards")
+    # prepare/generate/plan write artifacts every shard reads, so racing them would corrupt the
+    # cohort; aggregate needs EVERY shard's draws (counts_for_prefix raises on a short cache).
+    # Refusing here turns a sharded '--phase all' into an error rather than a silent partial run.
+    if args.num_shards > 1 and args.phase != "mc":
+        parser.error("--num-shards > 1 requires --phase mc; run prepare/generate/plan once first, "
+                     "then the shards, then score and aggregate")
     args.pi_modes = sorted(set(args.pi_modes))
     args.selection_modes = sorted(set(args.selection_modes))
     ensure_manifest(args)

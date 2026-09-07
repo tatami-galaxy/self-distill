@@ -1,3 +1,18 @@
+Run the recommended configuration with the student model as the only argument:
+
+```bash
+bash eval/run_advantage_comparison.sh Qwen/Qwen3-1.7B
+bash eval/run_advantage_comparison.sh Qwen/Qwen3-4B
+```
+
+Run one model at a time. The script uses GPUs 4–7 for four independent MC shards
+(TP=1, K=8, batch size 128), then GPUs 4–5 for scoring with the Qwen3-8B OPD
+teacher. OPSD uses the student with answer, full, and hint PI. Other evaluator
+settings retain their defaults. Results go to
+`results/advantage_comparison/<student-model-name>` relative to the repository.
+Rerun the same command to resume; a failed phase prevents subsequent phases
+from running, and all MC workers are checked before scoring.
+
 OPSD PI defaults to `answer full hint`. With `--dataset`, hints are loaded from
 the existing cache for `--opsd-teacher` (which defaults to `--student`) and matched
 by both question and final answer. The cache must already exist; missing hints

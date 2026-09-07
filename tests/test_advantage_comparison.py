@@ -100,7 +100,8 @@ class MCTest(unittest.TestCase):
 
             llm = SimpleNamespace(get_tokenizer=lambda: tokenizer, generate=generate)
             args = SimpleNamespace(output_dir=directory, mc_samples=2, max_completion_length=6,
-                                   seed=42, mc_batch_size=3, save_mc_completions=True)
+                                   seed=42, mc_batch_size=3, save_mc_completions=True,
+                                   shard=0, num_shards=1)
             with mock.patch.object(ac, "load_llm", return_value=llm), \
                  mock.patch.object(ac, "tokenizer_identity", return_value={}), \
                  mock.patch.object(ac, "sampling_params", side_effect=lambda a, remaining, seed, eos: (remaining, seed)), \
@@ -118,6 +119,40 @@ class MCTest(unittest.TestCase):
                 self.assertTrue(all(param[0] == 4 for _, param in calls))
                 self.assertEqual(len({param[1] for _, param in calls}), 4)
                 grade.assert_called_with("prefix text suffix", "answer")
+
+    def test_shards_partition_prefixes_without_overlap(self):
+        """Independent MC engines must cover every prefix exactly once between them."""
+        prefixes = [{"key": f"k{i}", "question_id": "q", "student_prompt_ids": [7],
+                     "prefix_ids": [1] * (i + 1), "final_answer": "answer"} for i in range(7)]
+        tokenizer = PieceTokenizer({1: "a", 9: " suffix"})
+        written = []
+        for shard in range(3):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                ac.write_json(root / "cohort.json", {"eos_ids": [9], "tokenizers": {"student": {}}})
+                ac.write_json(root / "plan.json", {"prefixes": prefixes})
+
+                def generate(prompts, params, **kwargs):
+                    return [SimpleNamespace(outputs=[SimpleNamespace(token_ids=[9], finish_reason="stop")])
+                            for _ in prompts]
+
+                llm = SimpleNamespace(get_tokenizer=lambda: tokenizer, generate=generate)
+                args = SimpleNamespace(output_dir=directory, mc_samples=1, max_completion_length=32,
+                                       seed=42, mc_batch_size=4, save_mc_completions=False,
+                                       shard=shard, num_shards=3)
+                with mock.patch.object(ac, "load_llm", return_value=llm), \
+                     mock.patch.object(ac, "tokenizer_identity", return_value={}), \
+                     mock.patch.object(ac, "sampling_params",
+                                       side_effect=lambda a, remaining, seed, eos: (remaining, seed)), \
+                     mock.patch("utils.grade", return_value=("answer", True)):
+                    ac.mc(args)
+                written.append({path.stem for path in (root / "mc").glob("*.json")})
+        # Striding 7 prefixes by 3 gives 3/2/2, and the shards must tile the population.
+        self.assertEqual([len(shard) for shard in written], [3, 2, 2])
+        self.assertEqual(set.union(*written), {f"k{i}" for i in range(7)})
+        for a in range(3):
+            for b in range(a + 1, 3):
+                self.assertEqual(written[a] & written[b], set())
 
 
 class ScoringTest(unittest.TestCase):
@@ -178,6 +213,20 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(args.selection_modes, ["uniform", "steps"])
         self.assertEqual(args.num_token_samples, 7)
         self.assertEqual(args.mc_samples, 23)
+        self.assertEqual((args.shard, args.num_shards), (0, 1))
+
+    def test_shard_cli_rejects_unsafe_combinations(self):
+        base = ["prog", "--student", "s", "--opd-teacher", "t", "--output-dir", "out"]
+        ok = ac.build_parser().parse_args(base[1:] + ["--phase", "mc", "--num-shards", "4", "--shard", "3"])
+        self.assertEqual((ok.shard, ok.num_shards), (3, 4))
+        for extra in (["--num-shards", "0"],
+                      ["--phase", "mc", "--num-shards", "2", "--shard", "2"],
+                      ["--phase", "mc", "--num-shards", "2", "--shard", "-1"],
+                      # sharding anything but mc would race the shared artifacts
+                      ["--num-shards", "2"],
+                      ["--phase", "aggregate", "--num-shards", "2"]):
+            with mock.patch("sys.argv", base + extra), self.assertRaises(SystemExit):
+                ac.main()
 
 
 
