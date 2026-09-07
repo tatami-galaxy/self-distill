@@ -59,6 +59,5 @@
   - [ ] Other objectives
   - [ ] LoRA on top of self-teacher 
 
-- Single forward pass PPO, segment level PPO, LoRA PPO
-
-- Is step correctness same as causal contribution? 
+- Advantage comparison
+- Vine SD

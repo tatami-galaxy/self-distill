@@ -1,18 +1,9 @@
 """Compare OPD, OPSD and outcome MC advantages on one frozen student's rollouts.
 
-CUDA_VISIBLE_DEVICES=0,1 uv run python -m eval.advantage_comparison \
-  --student /path/to/student/checkpoint-100 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 uv run python -m eval.advantage_comparison \
+  --student Qwen/Qwen3-1.7B \
   --opd-teacher Qwen/Qwen3-30B-A3B-Thinking-2507 \
-  --opsd-teacher Qwen/Qwen3-1.7B \
-  --dataset deepmath \
-  --pi-modes answer full \
-  --num-problems 8 --n 2 \
-  --selection-modes uniform steps \
-  --num-token-samples 16 --mc-samples 32 \
-  --min-segment-tokens 32 --max-segment-tokens 256 \
-  --max-completion-length 8192 --max-model-len 16384 \
-  --student-device cuda:0 --teacher-device cuda:1 \
-  --output-dir results/advantage_comparison/student100
+  --output-dir results/advantage_comparison/Qwen-1.7B
 
 """
 
@@ -272,6 +263,7 @@ def load_source(args):
 
 
 def prepare(args):
+    """Builds and saves the fixed problem cohort and prompts used by later phases"""
     from transformers import AutoConfig, AutoTokenizer
 
     out = Path(args.output_dir)
@@ -361,6 +353,7 @@ def validate_completion(ids, budget, eos_ids, finish_reason):
 
 
 def generate(args):
+    """produces the fixed student rollouts that OPD, OPSD, and Vine will all evaluate"""
     from utils import grade
     out = Path(args.output_dir)
     cohort = read_json(out / "cohort.json")
@@ -391,6 +384,7 @@ def generate(args):
 
 
 def plan(args):
+    """decides which tokens and segments to compare, and which student prefixes need MC value estimates"""
     from transformers import AutoTokenizer
     out = Path(args.output_dir)
     rollouts = read_json(out / "rollouts.json")
@@ -412,10 +406,15 @@ def plan(args):
 
 
 def mc(args):
+    """
+    Samples K fresh student continuations from each nonterminal prefix selected by plan. 
+    Their correctness estimates how likely the student is to finish successfully from that prefix
+    """
     from utils import grade
     out = Path(args.output_dir)
     spec, cohort = read_json(out / "plan.json"), read_json(out / "cohort.json")
     caches, jobs = {}, []
+
     for prefix in spec["prefixes"]:
         path = out / "mc" / f"{prefix['key']}.json"
         cached = read_json(path) if path.exists() else {"prefix": prefix, "draws": []}
@@ -424,7 +423,7 @@ def mc(args):
         caches[prefix["key"]] = cached
         jobs.extend((prefix, i) for i in range(len(cached["draws"]), args.mc_samples))
     if not jobs:
-        return
+        return    
     llm = load_llm(args)
     tokenizer = llm.get_tokenizer()
     if tokenizer_identity(tokenizer) != cohort["tokenizers"]["student"]:
@@ -519,6 +518,7 @@ def load_hf(path, device, dtype, revision=None):
 
 
 def score_condition(args, condition, teacher_path):
+    """Computes OPD and OPSD distillation signals for every token in the original student rollouts"""
     import torch
     from transformers import AutoTokenizer
     out = Path(args.output_dir)
@@ -723,7 +723,7 @@ def build_parser():
     parser.add_argument("--num-problems", type=int, default=32)
     parser.add_argument("--n", type=int, default=4, help="Original student rollouts per problem")
     parser.add_argument("--num-token-samples", type=int, default=32, help="Uniform samples per rollout, without replacement")
-    parser.add_argument("--mc-samples", "--K", dest="mc_samples", type=int, default=16, help="Continuations per distinct prefix")
+    parser.add_argument("--mc-samples", "--K", dest="mc_samples", type=int, default=8, help="Continuations per distinct prefix")
     parser.add_argument("--min-segment-tokens", type=int, default=32)
     parser.add_argument("--max-segment-tokens", type=int, default=256)
     parser.add_argument("--max-completion-length", type=int, default=8192)
