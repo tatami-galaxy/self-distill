@@ -12,6 +12,7 @@ after its generation engine has entered level-2 sleep, leaving room for the teac
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -38,6 +39,77 @@ HINT_GEN_VERSION = "composite_sct_v1"
 CONSTRAINED_HINT_GEN_VERSION = "expected_primal_dual_sct_v1"
 CONSTRAINED_REWARD_STATE_FILE = "constrained_reward_state.json"
 CONSTRAINED_REWARD_STATE_VERSION = 1
+
+
+def add_lora_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared opt-in LoRA arguments used by both hint trainers."""
+
+    parser.add_argument(
+        "--use-lora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train and checkpoint only a PEFT LoRA adapter instead of full model weights.",
+    )
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="all-linear",
+        help="PEFT target selector 'all-linear' or a comma-separated module list.",
+    )
+
+
+def lora_target_modules(value: str) -> str | list[str]:
+    value = value.strip()
+    if value == "all-linear":
+        return value
+    modules = [module.strip() for module in value.split(",") if module.strip()]
+    if not modules:
+        raise ValueError("lora_target_modules must be 'all-linear' or a module list")
+    return modules
+
+
+def validate_lora_args(args: argparse.Namespace) -> None:
+    if args.lora_r < 1:
+        raise ValueError("lora_r must be >= 1")
+    if args.lora_alpha < 1:
+        raise ValueError("lora_alpha must be >= 1")
+    if not 0 <= args.lora_dropout < 1:
+        raise ValueError("lora_dropout must be in [0, 1)")
+    lora_target_modules(args.lora_target_modules)
+
+
+def lora_config_from_args(args: argparse.Namespace):
+    """Build the optional PEFT config lazily so full training stays unchanged."""
+
+    validate_lora_args(args)
+    if not args.use_lora:
+        return None
+
+    from peft import LoraConfig, TaskType
+
+    return LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=lora_target_modules(args.lora_target_modules),
+        bias="none",
+    )
+
+
+def lora_run_meta(args: argparse.Namespace) -> dict:
+    """Stable adapter metadata used for provenance and resume validation."""
+
+    return {
+        "training_mode": "lora" if args.use_lora else "full",
+        "use_lora": args.use_lora,
+        "lora_r": args.lora_r if args.use_lora else None,
+        "lora_alpha": args.lora_alpha if args.use_lora else None,
+        "lora_dropout": args.lora_dropout if args.use_lora else None,
+        "lora_target_modules": args.lora_target_modules if args.use_lora else None,
+    }
 
 
 def _as_rows(dataset: Iterable[dict]) -> list[dict]:

@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
 Current problems : 
 
 The concern is that the current parameterization :
-c_phi(s,a)=w_a^T A_\phi h_T(s) must fit the return offset through an action-dependent projection. 
+c_phi(s,a)=w_a^T A_phi h_T(s) must fit the return offset through an action-dependent projection. 
 It has no explicit state-only scalar component. 
 Fitting that offset can introduce unwanted differences between actions.
 The damaging route is the learned critic changing subsequent actor coefficients.

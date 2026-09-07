@@ -72,6 +72,7 @@ from utils import (
     rollout_path,
 )
 from utils.gen_hints import build_messages as build_hint_generator_messages
+from utils.model_adapters import resolve_model_adapter, vllm_model_and_adapter
 
 SCHEMA_VERSION = 1
 METHOD = "hint_generator_comparison"
@@ -323,6 +324,17 @@ def validate_hint_checkpoint(path: str, base_model: str, dataset: str) -> None:
             f"Checkpoint {checkpoint} is not from the requested hint run: {mismatches}"
         )
 
+    model_spec = resolve_model_adapter(str(checkpoint))
+    if meta.get("use_lora") and not model_spec.is_adapter:
+        raise ValueError(
+            f"LoRA run checkpoint {checkpoint} has no adapter_config.json."
+        )
+    if model_spec.is_adapter and model_spec.base_model != base_model:
+        raise ValueError(
+            f"Checkpoint {checkpoint} adapter base {model_spec.base_model!r} "
+            f"does not match run base model {base_model!r}."
+        )
+
 
 def generator_variants(args: argparse.Namespace) -> list[tuple[str, str]]:
     variants = [("fresh_base", args.model)]
@@ -498,10 +510,14 @@ def load_cohort(args: argparse.Namespace) -> tuple[Dataset, dict]:
 def generation_config(
     args: argparse.Namespace, generator_id: str, generator_model: str, cohort_fp: str
 ) -> dict:
+    model_spec = resolve_model_adapter(generator_model)
     return {
         "schema_version": SCHEMA_VERSION,
         "generator_id": generator_id,
         "generator_model": generator_model,
+        "generator_base_model": model_spec.base_model,
+        "generator_adapter_path": model_spec.adapter_path,
+        "generator_adapter_rank": model_spec.rank,
         "base_model": args.model,
         "dataset": args.dataset,
         "cohort_fingerprint": cohort_fp,
@@ -529,8 +545,12 @@ def generate_phase(args: argparse.Namespace) -> None:
     if cache_matches(out, meta_path, config, args.force):
         return
 
+    model_kwargs, lora_request, model_spec = vllm_model_and_adapter(
+        args.generator_model,
+        adapter_name=args.generator_id,
+    )
     llm = LLM(
-        model=args.generator_model,
+        **model_kwargs,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -538,6 +558,11 @@ def generate_phase(args: argparse.Namespace) -> None:
         trust_remote_code=True,
     )
     tokenizer = llm.get_tokenizer()
+    if model_spec.is_adapter:
+        print(
+            f"Loading LoRA generator {model_spec.adapter_path} over "
+            f"{model_spec.base_model}"
+        )
     conversations = [
         build_hint_generator_messages(row["question"], row["solution"])
         for row in cohort
@@ -567,6 +592,7 @@ def generate_phase(args: argparse.Namespace) -> None:
     outputs = llm.chat(
         conversations,
         sampling,
+        lora_request=lora_request,
         chat_template_kwargs={"enable_thinking": False},
     )
     rows = []

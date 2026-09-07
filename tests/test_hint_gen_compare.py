@@ -161,6 +161,62 @@ class CheckpointSpecTest(unittest.TestCase):
                 [("fresh_base", "base"), ("checkpoint-10", str(checkpoint.resolve()))],
             )
 
+    def test_lora_checkpoint_is_validated_and_recorded_in_generation_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "method": "constrained_hint_gen_grpo",
+                        "constrained_hint_gen_version": "expected_primal_dual_sct_v1",
+                        "model": "base",
+                        "dataset": "deepmath",
+                        "tau": 0.7,
+                        "gamma": 4.0,
+                        "use_lora": True,
+                    }
+                )
+            )
+            checkpoint = root / "checkpoint-10"
+            checkpoint.mkdir()
+            args = hint_gen_compare.build_parser().parse_args(["--run-dir", str(root)])
+            hint_gen_compare.resolve_run_configuration(args)
+
+            with self.assertRaisesRegex(ValueError, "no adapter_config"):
+                hint_gen_compare.generator_variants(args)
+
+            (checkpoint / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "peft_type": "LORA",
+                        "base_model_name_or_path": "base",
+                        "r": 16,
+                    }
+                )
+            )
+            variants = hint_gen_compare.generator_variants(args)
+            config = hint_gen_compare.generation_config(
+                args, variants[1][0], variants[1][1], "cohort"
+            )
+            self.assertEqual(config["generator_base_model"], "base")
+            self.assertEqual(config["generator_adapter_rank"], 16)
+            self.assertEqual(
+                config["generator_adapter_path"], str(checkpoint.resolve())
+            )
+
+            adapter_config = checkpoint / "adapter_config.json"
+            adapter_config.write_text(
+                json.dumps(
+                    {
+                        "peft_type": "LORA",
+                        "base_model_name_or_path": "other-base",
+                        "r": 16,
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "does not match run base"):
+                hint_gen_compare.generator_variants(args)
+
     def test_non_hint_training_method_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

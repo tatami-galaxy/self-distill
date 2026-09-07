@@ -1,4 +1,4 @@
-"""Full-parameter GRPO training for a learned self-hint generator.
+"""GRPO training for a learned self-hint generator.
 
 The policy sees a math problem plus its worked solution and generates a short hint.
 Its frozen initial weights act as the hinted teacher. For each sampled hint the reward is
@@ -18,6 +18,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_hint_gen.train_hint_gen
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_hint_gen.train_hint_gen \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2048 \
     --alpha 1.0 --gamma 1.0 --teacher-rollouts 2 --transfer-rollouts 4
+
+# LoRA run (checkpoints contain only the adapter)
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_hint_gen.train_hint_gen \
+    --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2048 \
+    --alpha 1.0 --gamma 1.0 --use-lora --learning-rate 1e-5
 """
 
 from __future__ import annotations
@@ -32,8 +37,12 @@ from trl import GRPOConfig, GRPOTrainer
 from train.opsd.train_hint_gen.lib import (
     HINT_GEN_VERSION,
     HintRewardConfig,
+    add_lora_args,
     build_hint_grpo_dataset,
+    lora_config_from_args,
+    lora_run_meta,
     make_reward_function,
+    validate_lora_args,
 )
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
@@ -86,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    add_lora_args(p)
     # Colocated vLLM. A generation batch is fixed to one complete hint group.
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.2)
@@ -116,7 +126,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not args.use_vllm:
         raise ValueError(
-            "The single-GPU full-parameter experiment requires colocated vLLM sleep mode to "
+            "The single-GPU hint-generator experiment requires colocated vLLM sleep mode to "
             "free memory before teacher inference."
         )
     if not args.vllm_enable_sleep_mode:
@@ -125,6 +135,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("generator_temperature must be > 0 for GRPO exploration")
     if not 0 < args.generator_top_p <= 1:
         raise ValueError("generator_top_p must be in (0, 1]")
+    validate_lora_args(args)
     HintRewardConfig(
         model=args.model,
         dataset=args.dataset,
@@ -171,6 +182,7 @@ def build_run_meta(args: argparse.Namespace, num_train_examples: int) -> dict:
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "seed": args.seed,
+        **lora_run_meta(args),
     }
 
 
@@ -179,7 +191,8 @@ def main() -> None:
     validate_args(args)
 
     model_slug = args.model.rstrip("/").split("/")[-1]
-    default_name = f"{args.dataset}_a{args.alpha:g}_g{args.gamma:g}"
+    adapter_suffix = f"_lora_r{args.lora_r}" if args.use_lora else ""
+    default_name = f"{args.dataset}_a{args.alpha:g}_g{args.gamma:g}{adapter_suffix}"
     output_dir = args.output_dir or os.path.join(args.output_root, model_slug, default_name)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -201,6 +214,11 @@ def main() -> None:
         f"  reward: {args.alpha:g} * sufficiency - length/{args.hint_budget} "
         f"- {args.gamma:g} * transfer"
     )
+    if args.use_lora:
+        print(
+            f"  LoRA: r={args.lora_r} alpha={args.lora_alpha} "
+            f"dropout={args.lora_dropout:g} targets={args.lora_target_modules}"
+        )
 
     reward_config = HintRewardConfig(
         model=args.model,
@@ -255,13 +273,18 @@ def main() -> None:
         remove_unused_columns=False,
     )
 
+    peft_config = lora_config_from_args(args)
     meta = build_run_meta(args, len(train_dataset))
     if args.resume_from_checkpoint:
         validate_resume(
             args.resume_from_checkpoint,
             meta,
             args.force_resume,
-            strict_keys=("hint_gen_version",),
+            strict_keys=(
+                ("hint_gen_version", "use_lora")
+                if args.use_lora
+                else ("hint_gen_version",)
+            ),
         )
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -274,6 +297,7 @@ def main() -> None:
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
+        peft_config=peft_config,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     final_dir = os.path.join(output_dir, "final")

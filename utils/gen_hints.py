@@ -41,6 +41,7 @@ from datasets import Dataset, load_from_disk
 from vllm import LLM, SamplingParams
 
 from utils import DATASET_REGISTRY_TRAIN, hint_path, load_train_dataset
+from utils.model_adapters import vllm_model_and_adapter
 
 HINT_SYSTEM = (
     "You are given a math problem and a full worked solution. Extract a "
@@ -146,8 +147,9 @@ def main():
     print(f"Loaded {len(ds)} {args.dataset} rows (with solutions) for hint generation "
           f"with {args.model}")
 
+    model_kwargs, lora_request, model_spec = vllm_model_and_adapter(args.model)
     llm = LLM(
-        model=args.model,
+        **model_kwargs,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -155,6 +157,11 @@ def main():
         trust_remote_code=True,
     )
     tokenizer = llm.get_tokenizer()
+    if model_spec.is_adapter:
+        print(
+            f"  loading LoRA adapter {model_spec.adapter_path} over "
+            f"{model_spec.base_model}"
+        )
 
     # Build prompts and drop any whose input won't leave room for the hint.
     budget = args.max_model_len - args.max_tokens
@@ -182,7 +189,9 @@ def main():
         max_tokens=args.max_tokens, seed=args.seed,
     )
     outputs = llm.chat(
-        conversations, sampling,
+        conversations,
+        sampling,
+        lora_request=lora_request,
         chat_template_kwargs={"enable_thinking": False},
     )
 
