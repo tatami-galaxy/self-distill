@@ -124,7 +124,7 @@ remain nonzero for all-success/all-failure samples and are approximate intervals
 not simultaneous guarantees across all selected positions. Bootstrap summaries
 condition on the cached MC estimates. Shared prefixes and broadcast segment
 values create dependence; token counts are not independent MC sample counts.
-Increasing K improves the estimate but does not turn it into ground truth.
+Increasing K improves the estimate. 
 
 ## Validation
 
