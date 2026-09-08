@@ -19,7 +19,7 @@ args=(
   --opd-teacher Qwen/Qwen3-8B
   --output-dir "results/advantage_comparison/$model_name"
   --tensor-parallel-size 1
-  --mc-samples 8
+  --mc-samples 16
   --mc-batch-size 128
   --pi-modes answer full hint
 )
