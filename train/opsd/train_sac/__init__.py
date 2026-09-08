@@ -1,6 +1,7 @@
 """Online soft actor-critic experiments for privileged self-distillation."""
 
 from .lib import (
+    QHeadOutput,
     ResidualQHead,
     TopKPolicySupport,
     TopKSoftValueEstimator,
@@ -12,6 +13,7 @@ from .lib import (
 from .trainer import SACConfig, SACTrainer
 
 __all__ = [
+    "QHeadOutput",
     "ResidualQHead",
     "SACConfig",
     "SACTrainer",

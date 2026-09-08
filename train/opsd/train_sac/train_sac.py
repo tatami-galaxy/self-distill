@@ -7,13 +7,21 @@ log-probabilities and hidden states. The critic is
     Q(s, a) = log pi_T(a | s, PI) + W_lm[a]^T A h_T(s),
 
 where only the zero-initialized square matrix A is trained by the critic loss.
+With --q-head-architecture state_scaled_linear, the critic instead uses
+
+    Q(s, a) = exp(c^T h_T(s)) * log pi_T(a | s, PI) + W_lm[a]^T A h_T(s).
+
+The additional vector c starts at zero, so both heads start at teacher log-probs.
+The positive multiplier is shared across actions at a prefix; the additive term
+can still change teacher rankings. Both A and c train with the same critic loss.
 Actor and critic each update once per generated effective batch, synchronously,
 with beta=gamma=1 and no critic warmup or target network.
 
 Single GPU:
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sac.train_sac \
-    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode full \
-    --soft-v-estimator topk --soft-v-topk 100 --lam 0
+    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
+    --soft-v-estimator topk --soft-v-topk 100 --lam 0 \
+    --q-head-architecture state_scaled_linear
 
 Four GPUs, data parallel:
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
@@ -55,13 +63,16 @@ from train.opsd.train_sdft import (
 )
 from utils import DATASET_REGISTRY_TRAIN, TEACHER_PROMPT_TEMPLATE, validate_resume
 
-from .lib import Q_HEAD_ARCHITECTURE
+from .lib import Q_HEAD_ARCHITECTURE, Q_HEAD_PARAMETERIZATIONS
 from .trainer import GAMMA, SOFT_BETA, SACConfig, SACTrainer
 
 
-def sac_run_name(dataset: str, pi_slug: str, soft_v_estimator: str) -> str:
+def sac_run_name(
+    dataset: str, pi_slug: str, soft_v_estimator: str,
+    q_head_architecture: str = Q_HEAD_ARCHITECTURE,
+) -> str:
     """Name an SAC run by every architectural choice currently under study."""
-    return f"{dataset}_{pi_slug}_{soft_v_estimator}_{Q_HEAD_ARCHITECTURE}"
+    return f"{dataset}_{pi_slug}_{soft_v_estimator}_{q_head_architecture}"
 
 
 def build_run_meta(args, num_train_examples: int) -> dict:
@@ -95,8 +106,8 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "rollout_pi_sample_idx": args.rollout_pi_sample_idx if args.pi_mode == "rollout" else None,
         "reward": "accuracy_reward",
         "teacher_model_kind": "base",
-        "q_head_architecture": Q_HEAD_ARCHITECTURE,
-        "q_parameterization": "frozen_lm_head_zero_linear_residual",
+        "q_head_architecture": args.q_head_architecture,
+        "q_parameterization": Q_HEAD_PARAMETERIZATIONS[args.q_head_architecture],
         "soft_v_estimator": args.soft_v_estimator,
         "soft_v_topk": args.soft_v_topk,
         "beta": SOFT_BETA,
@@ -112,7 +123,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
     }
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -137,6 +148,13 @@ def main():
         default="topk",
         choices=["topk", "sarsa"],
         help="Soft-V estimator. 'sarsa' is not implemented yet",
+    )
+    parser.add_argument(
+        "--q-head-architecture",
+        default=Q_HEAD_ARCHITECTURE,
+        choices=list(Q_HEAD_PARAMETERIZATIONS),
+        help="linear: additive residual (default); state_scaled_linear: also learn "
+             "a positive exp(c^T h) multiplier shared across tokens at each prefix.",
     )
     parser.add_argument("--soft-v-topk", type=int, default=100)
     parser.add_argument("--lam", type=float, default=0.0)
@@ -177,6 +195,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--force-resume", action="store_true")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.soft_v_estimator == "sarsa":
@@ -204,11 +227,11 @@ def main():
     output_dir = args.output_dir or os.path.join(
         args.output_root,
         model_slug,
-        sac_run_name(args.dataset, pi_slug, args.soft_v_estimator),
+        sac_run_name(args.dataset, pi_slug, args.soft_v_estimator, args.q_head_architecture),
     )
     print(
         f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  "
-        f"soft-V: {args.soft_v_estimator}  Q-head: {Q_HEAD_ARCHITECTURE}  "
+        f"soft-V: {args.soft_v_estimator}  Q-head: {args.q_head_architecture}  "
         f"->  output: {output_dir}"
     )
 
@@ -233,6 +256,7 @@ def main():
 
     training_args = SACConfig(
         output_dir=output_dir,
+        q_head_architecture=args.q_head_architecture,
         soft_v_estimator=args.soft_v_estimator,
         soft_v_topk=args.soft_v_topk,
         lam=args.lam,

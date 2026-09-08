@@ -11,6 +11,8 @@ from trl.models.utils import _ForwardRedirection
 from trl.trainer.utils import selective_log_softmax
 
 from .lib import (
+    Q_HEAD_ARCHITECTURE,
+    Q_HEAD_PARAMETERIZATIONS,
     ResidualQHead,
     compute_soft_q_lambda_returns,
     make_soft_value_estimator,
@@ -29,6 +31,10 @@ _TEACHER_SCORE_CHUNK_SIZE = 128
 class SACConfig(SDFTConfig):
     """SDFT rollout configuration plus the deliberately small SAC surface."""
 
+    q_head_architecture: str = field(
+        default=Q_HEAD_ARCHITECTURE,
+        metadata={"help": "Q head: linear residual, or state_scaled_linear with exp(c^T h)."},
+    )
     soft_v_estimator: str = field(
         default="topk",
         metadata={"help": "Soft-V estimator: topk now, sampled SARSA in a later experiment."},
@@ -44,6 +50,8 @@ class SACConfig(SDFTConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.q_head_architecture not in Q_HEAD_PARAMETERIZATIONS:
+            raise ValueError(f"unknown q_head_architecture {self.q_head_architecture!r}")
         if self.soft_v_estimator not in {"topk", "sarsa"}:
             raise ValueError(
                 f"soft_v_estimator must be 'topk' or 'sarsa'; got {self.soft_v_estimator!r}"
@@ -98,7 +106,10 @@ class SACTrainer(SDFTTrainer):
         hidden_size = int(teacher.config.hidden_size)
         # Keep the small critic head in fp32; autocast handles its matmuls against
         # bf16 teacher activations while the optimizer retains fp32 parameters.
-        q_head = ResidualQHead(hidden_size).to(device=self.accelerator.device)
+        q_head = ResidualQHead(
+            hidden_size,
+            learn_state_scale=self.args.q_head_architecture == "state_scaled_linear",
+        ).to(device=self.accelerator.device)
         self.q_head = self.accelerator.prepare_model(q_head)
         self.q_head.train()
         self._sac_forward_redirection = _ForwardRedirection()
@@ -217,7 +228,7 @@ class SACTrainer(SDFTTrainer):
             topk_teacher_logps.append(selected_teacher_logps[..., 1:].float())
             del teacher_logits, selected_teacher_logps
 
-            residual_hidden = self.q_head(chunk_hidden)
+            residual_hidden, _ = self.q_head(chunk_hidden)
             correction_logits = F.linear(residual_hidden.float(), head.weight.float(), None)
             topk_corrections.append(
                 torch.gather(correction_logits, dim=-1, index=chunk_topk_ids).float()
@@ -258,15 +269,18 @@ class SACTrainer(SDFTTrainer):
         topk_student_logps = selected_student_logps[..., 1:].detach()
 
         teacher = self._teacher_scores_and_q_inputs(inputs, topk_ids)
-        residual_hidden = self.q_head(teacher["hidden"])
+        residual_hidden, state_scale = self.q_head(teacher["hidden"])
         sampled_correction = (
             residual_hidden.float() * teacher["sampled_action_vectors"].float()
         ).sum(dim=-1)
 
-        # Q_phi(y_t, s_t)=sg[L_T(y_t, s_t)]+u_{y_t}^T z_phi(sg[h_T(s_t)])
-        sampled_q = teacher["sampled_teacher_logps"] + sampled_correction
+        # The same prefix scale applies to the sampled action and every top-K action.
+        sampled_q = state_scale * teacher["sampled_teacher_logps"] + sampled_correction
         support = self.soft_value_estimator.build_support(topk_ids, topk_student_logps)
-        topk_q = teacher["topk_teacher_logps"] + teacher["topk_corrections"]
+        topk_q = (
+            state_scale.detach().unsqueeze(-1) * teacher["topk_teacher_logps"]
+            + teacher["topk_corrections"]
+        )
         soft_values = self.soft_value_estimator.estimate(topk_q, support)
 
         with torch.no_grad():
@@ -299,6 +313,8 @@ class SACTrainer(SDFTTrainer):
             q_loss=q_loss,
             sampled_q=sampled_q,
             sampled_correction=sampled_correction,
+            state_scale=state_scale,
+            sampled_scale_correction=(state_scale - 1.0) * teacher["sampled_teacher_logps"],
             soft_values=soft_values,
             soft_advantages=soft_advantages,
             q_targets=q_targets,

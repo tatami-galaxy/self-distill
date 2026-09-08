@@ -1,28 +1,56 @@
 """Small, testable components for the SDPO-to-SAC experiment."""
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
 Q_HEAD_ARCHITECTURE = "linear"
+Q_HEAD_PARAMETERIZATIONS = {
+    "linear": "frozen_lm_head_zero_linear_residual",
+    "state_scaled_linear": "frozen_lm_head_exp_state_scale_linear_residual",
+}
+
+
+class QHeadOutput(NamedTuple):
+    residual_hidden: torch.Tensor
+    state_scale: torch.Tensor
 
 
 class ResidualQHead(nn.Module):
-    """Map a frozen teacher hidden state to a residual hidden state.
+    """Linear action correction with an optional positive scale shared by a prefix.
 
-    The frozen teacher LM-head row for action ``a`` supplies ``u_a`` outside this
-    module, so ``c(s, a) = u_a^T z(h_T(s))``.
-    A zero projection makes the initial correction exactly zero : 
+    The frozen teacher LM-head row supplies the action vector outside this module:
+    Q(s, a) = alpha(s) * log pi_T(a | s) + u_a^T D h_T(s).
+    D starts at zero. With learn_state_scale, alpha(s) = exp(c^T h_T(s))
+    and c also starts at zero; otherwise alpha is fixed at one.
     """
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, *, learn_state_scale: bool = False):
         super().__init__()
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
         nn.init.zeros_(self.projection.weight)
+        self.scale_projection = None
+        if learn_state_scale:
+            self.scale_projection = nn.Linear(hidden_size, 1, bias=False)
+            nn.init.zeros_(self.scale_projection.weight)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.projection(hidden_states)
+    def forward(self, hidden_states: torch.Tensor) -> QHeadOutput:
+        residual_hidden = self.projection(hidden_states)
+        if self.scale_projection is None:
+            state_scale = torch.ones(
+                hidden_states.shape[:-1], device=hidden_states.device, dtype=torch.float32
+            )
+        else:
+            # Keep small deviations from alpha=1 visible under bf16 training, and
+            # evaluate the exponential in fp32 without changing the proposed map.
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                log_scale = torch.nn.functional.linear(
+                    hidden_states.float(), self.scale_projection.weight.float()
+                ).squeeze(-1)
+                state_scale = log_scale.exp()
+        return QHeadOutput(residual_hidden, state_scale)
 
 
 @dataclass(frozen=True)

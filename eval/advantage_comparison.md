@@ -135,3 +135,30 @@ Increasing K improves the estimate.
 The tests run on CPU, including causal alignment against a full tiny-Qwen
 forward pass, FP32 normalization, exact centering, token/segment matching,
 terminal handling, remaining budgets, and MC cache extension.
+
+## Vine split-half reliability
+
+After aggregating K=16, compare two independent sets of eight continuations at
+each prefix without generating new samples or loading models:
+
+```bash
+uv run python -m eval.vine_reliability --run-dir results/advantage_comparison/Qwen3-1.7B --k 16
+```
+
+The analysis uses sample indices 0–7 and 8–15 and validates their seeds, prefix
+identities, and agreement with the saved K=16 aggregate. Any even `--k >= 2`
+works when its aggregate and draws exist; later cached draws are ignored.
+
+Outputs are saved in `k-16/split_half/`: `summary.json`, `paired_estimates.jsonl`,
+`report.md`, and `split_half.png` / `split_half.pdf`. The report includes Pearson
+and Spearman correlations, RMSE, zero frequencies, and sign agreement with and
+without zero ties. Confidence intervals resample whole questions (1,000
+bootstrap samples by default; configurable with `--bootstrap-samples`).
+
+Prefix-value reliability, uniform-token advantage reliability, and step
+advantage reliability are reported separately. Each step is one observation;
+its advantage is not duplicated across tokens. Terminal transitions are also
+reported separately because both halves share the original observed reward.
+For interior credit assignment, inspect the `*_nonterminal` groups. Bootstrap
+intervals condition on the saved cohort and split. These are reliability
+estimates for K/2 draws per half, not direct reliability estimates for K draws.

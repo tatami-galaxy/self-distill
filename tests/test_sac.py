@@ -26,7 +26,7 @@ class ResidualQHeadTest(unittest.TestCase):
         hidden = torch.tensor([[[1.0, 2.0, 3.0]]])
         action = torch.tensor([[[2.0, -1.0, 0.5]]])
 
-        correction = (head(hidden) * action).sum()
+        correction = (head(hidden).residual_hidden * action).sum()
         self.assertEqual(correction.item(), 0.0)
 
         (correction - 1.0).square().backward()
