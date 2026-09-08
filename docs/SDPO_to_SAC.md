@@ -173,3 +173,16 @@ $$
 $$
 
 where $u_{\hat{y}_t}=W_{LM}[\hat{y}_t]$, $z_\phi(h)=B_\phi\sigma(A_\phi h)$, with $B_\phi$ initialized to zero.
+
+For the next experiment, add a shared positive multiplier per state while retaining the current linear, action-dependent additive correction:
+
+$$
+\boxed{Q_\phi(\hat{y}_t,s_t)=\alpha_\phi(s_t)\operatorname{sg}[\ell_T(\hat{y}_t,s_t)]+b_\phi(s_t,\hat{y}_t)}
+$$
+
+$$
+\alpha_\phi(s_t)=\exp\!\left(c_\phi^\top\operatorname{sg}[h_T(s_t)]\right),\qquad
+b_\phi(s_t,\hat{y}_t)=\operatorname{sg}[u_{\hat{y}_t}]^\top D_\phi\operatorname{sg}[h_T(s_t)].
+$$
+
+Initialize $c_\phi=0$ and $D_\phi=0$, so $\alpha_\phi=1$, $b_\phi=0$, and $Q_0=\ell_T$. The teacher remains frozen; both $c_\phi$ and $D_\phi$ learn through the existing critic loss. The positive multiplier is shared across tokens at each prefix, preserving teacher rankings in the multiplicative branch; the action-dependent additive term can still change them. This tests whether learning a state-dependent scale is less destructive to Q during training; it does not resolve the initialization-objective or scale mismatch by itself.
