@@ -24,7 +24,8 @@
 #
 # - Data source : JSON files under `results/`
 # - Best-checkpoint tables select the highest configured pass@k within each
-#   algorithm/variant across runs.
+#   algorithm/variant across repeated runs. Hint-trained generator settings remain
+#   separate even though schema-v2 records those setting names in the `run` field.
 # - Older AIME summaries do not contain `arm` or `eval_config`;
 #   their identities are recovered from the directory layout and are marked as schema 0.
 # - Scores are shown on a 0–1 scale in tables and as percentages in plots.
@@ -124,6 +125,15 @@ def fallback_aime_arm(path: Path) -> dict:
     train_dataset, model, algo = parts[:3]
     step = parts[-1]
     extras = list(parts[3:-1])
+    if algo == "sdft" and len(extras) >= 2 and extras[0] == "hint_trained":
+        return {
+            "algo": algo,
+            "model": model,
+            "train_dataset": train_dataset,
+            "variant": "hint_trained",
+            "run": "/".join(extras[1:]),
+            "step": step,
+        }
     run_parts = [part for part in extras if re.fullmatch(r"run-\d+", part)]
     variant_parts = [part for part in extras if part not in run_parts]
     return {
@@ -212,29 +222,35 @@ def method_label(row: pd.Series, include_run: bool = True) -> str:
 def best_aime_by_algo(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
     """Select the best checkpoint per model, dataset, algorithm, and variant.
 
-    Checkpoints compete across runs, but variants remain separate. If scores tie,
-    prefer the earlier checkpoint, then the run name for a deterministic result.
-    The base evaluation is treated as the `base` algorithm with no variant.
+    Repeated runs compete, but each ``hint_trained`` run names a distinct hint-generator
+    setting and therefore remains separate. If scores tie, prefer the earlier checkpoint,
+    then the run name for a deterministic result. The base evaluation is treated as the
+    ``base`` algorithm with no variant.
     """
     candidates = frame.dropna(subset=[metric]).copy()
     candidates["_checkpoint_sort"] = candidates["checkpoint"].fillna(-1)
     candidates["_dataset_key"] = candidates["train_dataset"].fillna("")
     candidates["_variant_key"] = candidates["variant"].fillna("")
+    candidates["_setting_key"] = candidates["run"].where(
+        candidates["variant"].eq("hint_trained"), ""
+    ).fillna("")
     candidates["_run_sort"] = candidates["run"].fillna("")
     candidates = candidates.sort_values(
         [
-            "model", "_dataset_key", "algo", "_variant_key", metric,
+            "model", "_dataset_key", "algo", "_variant_key", "_setting_key", metric,
             "_checkpoint_sort", "_run_sort",
         ],
-        ascending=[True, True, True, True, False, True, True],
+        ascending=[True, True, True, True, True, False, True, True],
     )
     best = candidates.groupby(
-        ["model", "_dataset_key", "algo", "_variant_key"],
+        ["model", "_dataset_key", "algo", "_variant_key", "_setting_key"],
         as_index=False,
         sort=False,
     ).head(1)
     return best.drop(
-        columns=["_checkpoint_sort", "_dataset_key", "_variant_key", "_run_sort"]
+        columns=[
+            "_checkpoint_sort", "_dataset_key", "_variant_key", "_setting_key", "_run_sort",
+        ]
     ).reset_index(drop=True)
 
 
@@ -247,11 +263,13 @@ for model, model_results in aime_best.groupby("model", sort=True):
         ]
     ].copy()
     table["algorithm"] = table.pop("algo").str.upper()
-    for column in ("variant", "run", "train_dataset"):
+    table["setting"] = table["run"].where(table["variant"].eq("hint_trained"))
+    table["checkpoint"] = table.pop("step")
+    for column in ("variant", "run", "setting", "checkpoint", "train_dataset"):
         table[column] = table[column].fillna("—")
     table = table[
         [
-            "algorithm", "variant", "train_dataset",
+            "algorithm", "variant", "setting", "checkpoint", "train_dataset",
             f"pass@{AIME_BEST_K}",
         ]
     ]
