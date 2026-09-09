@@ -14,6 +14,7 @@
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
 - [ ] CodeIO
+- [ ] Comparison with other SD methods
 
 ### Models
 
