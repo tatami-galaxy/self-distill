@@ -53,6 +53,10 @@
   - [ ] Different Q construction
   - [ ] Different Q fitting objective
   - [ ] Non linear Q head
+  - [ ] Randomly initialzed Q : pure SAC
+  - [ ] Fit Q to future log probs
+  - [ ] Fit Q to answer log prob
+  - [ ] NLAC
 
 - **Train self-teacher for hint generation**
   - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
