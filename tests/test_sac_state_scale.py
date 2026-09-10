@@ -83,7 +83,9 @@ class _Teacher(nn.Module):
 
 def make_trainer(scaled=True):
     trainer = object.__new__(SACTrainer)
-    trainer.args = types.SimpleNamespace(lam=0.0, should_save=True)
+    trainer.args = types.SimpleNamespace(
+        lam=0.0, should_save=True, q_init="teacher", critic_warmup_steps=0
+    )
     trainer.current_gradient_accumulation_steps = 1
     trainer.temperature = 1.0
     trainer.soft_value_estimator = TopKSoftValueEstimator(2)

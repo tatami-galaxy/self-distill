@@ -1,8 +1,13 @@
-"""Synchronous online SAC trainer initialized from privileged self-distillation."""
+"""Synchronous online SAC trainer using frozen privileged-teacher features."""
 
+import json
+import math
 import os
+import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +16,7 @@ from trl.models.utils import _ForwardRedirection
 from trl.trainer.utils import selective_log_softmax
 
 from .lib import (
+    DEFAULT_Q_INIT_SCALE,
     Q_HEAD_ARCHITECTURE,
     Q_HEAD_PARAMETERIZATIONS,
     ResidualQHead,
@@ -20,8 +26,8 @@ from .lib import (
     terminal_token_rewards,
 )
 
-
 Q_HEAD_FILE = "sac_q_head.pt"
+Q_INIT_FILE = "sac_q_init.json"
 SOFT_BETA = 1.0
 GAMMA = 1.0
 _TEACHER_SCORE_CHUNK_SIZE = 128
@@ -34,6 +40,18 @@ class SACConfig(SDFTConfig):
     q_head_architecture: str = field(
         default=Q_HEAD_ARCHITECTURE,
         metadata={"help": "Q head: linear residual, or state_scaled_linear with exp(c^T h)."},
+    )
+    q_init: str = field(
+        default="teacher",
+        metadata={"help": "teacher: log-probability offset; random: learn Q without that offset."},
+    )
+    q_init_scale: float = field(
+        default=DEFAULT_Q_INIT_SCALE,
+        metadata={"help": "Random Q projection weight std is this scale / sqrt(hidden_size)."},
+    )
+    critic_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Critic-only optimizer steps, included in max_steps."},
     )
     soft_v_estimator: str = field(
         default="topk",
@@ -52,6 +70,14 @@ class SACConfig(SDFTConfig):
         super().__post_init__()
         if self.q_head_architecture not in Q_HEAD_PARAMETERIZATIONS:
             raise ValueError(f"unknown q_head_architecture {self.q_head_architecture!r}")
+        if self.q_init not in {"teacher", "random"}:
+            raise ValueError(f"unknown q_init {self.q_init!r}")
+        if not math.isfinite(self.q_init_scale) or self.q_init_scale <= 0:
+            raise ValueError("q_init_scale must be finite and positive")
+        if self.q_init == "random" and self.q_head_architecture != "linear":
+            raise ValueError("random Q requires q_head_architecture='linear'")
+        if self.critic_warmup_steps < 0:
+            raise ValueError("critic_warmup_steps must be >= 0")
         if self.soft_v_estimator not in {"topk", "sarsa"}:
             raise ValueError(
                 f"soft_v_estimator must be 'topk' or 'sarsa'; got {self.soft_v_estimator!r}"
@@ -81,13 +107,20 @@ class SACConfig(SDFTConfig):
             raise ValueError("SAC needs local privileged-teacher hidden states")
         if self.use_liger_kernel:
             raise ValueError("the initial SAC loss does not use the SDFT Liger divergence kernel")
+        if self.q_init == "random" and self.lam < 1.0:
+            warnings.warn(
+                f"Random Q with --lam={self.lam:g} bootstraps from an initially untrained critic. "
+                "--lam 1 is recommended for this experiment; continuing with the requested lambda.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 class SACTrainer(SDFTTrainer):
-    """SDFT rollout machinery with a frozen-teacher residual Q and soft actor loss."""
+    """SDFT rollout machinery with a Q head on frozen teacher features and soft actor loss."""
 
     _name = "SAC"
-    _tag_names = ["trl", "sdft", "sac"]
+    _tag_names: ClassVar[list[str]] = ["trl", "sdft", "sac"]
     config_cls = SACConfig
 
     def __init__(
@@ -109,6 +142,8 @@ class SACTrainer(SDFTTrainer):
         q_head = ResidualQHead(
             hidden_size,
             learn_state_scale=self.args.q_head_architecture == "state_scaled_linear",
+            q_init=self.args.q_init,
+            q_init_scale=self.args.q_init_scale,
         ).to(device=self.accelerator.device)
         self.q_head = self.accelerator.prepare_model(q_head)
         self.q_head.train()
@@ -157,7 +192,7 @@ class SACTrainer(SDFTTrainer):
         )
         return batch
 
-    # -- residual-Q optimizer ownership ------------------------------------
+    # -- Q-head optimizer ownership ------------------------------------
 
     def create_optimizer(self, *args, **kwargs):
         optimizer = super().create_optimizer(*args, **kwargs)
@@ -216,17 +251,17 @@ class SACTrainer(SDFTTrainer):
         for start in range(0, logits_to_keep, _TEACHER_SCORE_CHUNK_SIZE):
             stop = min(start + _TEACHER_SCORE_CHUNK_SIZE, logits_to_keep)
             chunk_hidden = hidden[:, start:stop]
-            chunk_sampled_ids = completion_ids[:, start:stop]
             chunk_topk_ids = topk_ids[:, start:stop]
-            selected_ids = torch.cat(
-                [chunk_sampled_ids.unsqueeze(-1), chunk_topk_ids], dim=-1
-            )
-
-            teacher_logits = F.linear(chunk_hidden, head.weight, head.bias) / self.temperature
-            selected_teacher_logps = selective_log_softmax(teacher_logits, selected_ids)
-            sampled_teacher_logps.append(selected_teacher_logps[..., 0].float())
-            topk_teacher_logps.append(selected_teacher_logps[..., 1:].float())
-            del teacher_logits, selected_teacher_logps
+            if self.args.q_init == "teacher":
+                chunk_sampled_ids = completion_ids[:, start:stop]
+                selected_ids = torch.cat(
+                    [chunk_sampled_ids.unsqueeze(-1), chunk_topk_ids], dim=-1
+                )
+                teacher_logits = F.linear(chunk_hidden, head.weight, head.bias) / self.temperature
+                selected_teacher_logps = selective_log_softmax(teacher_logits, selected_ids)
+                sampled_teacher_logps.append(selected_teacher_logps[..., 0].float())
+                topk_teacher_logps.append(selected_teacher_logps[..., 1:].float())
+                del teacher_logits, selected_teacher_logps
 
             residual_hidden, _ = self.q_head(chunk_hidden)
             correction_logits = F.linear(residual_hidden.float(), head.weight.float(), None)
@@ -234,13 +269,15 @@ class SACTrainer(SDFTTrainer):
                 torch.gather(correction_logits, dim=-1, index=chunk_topk_ids).float()
             )
 
-        return {
+        result = {
             "hidden": hidden.detach(),
             "sampled_action_vectors": sampled_action_vectors,
-            "sampled_teacher_logps": torch.cat(sampled_teacher_logps, dim=1),
-            "topk_teacher_logps": torch.cat(topk_teacher_logps, dim=1),
             "topk_corrections": torch.cat(topk_corrections, dim=1),
         }
+        if self.args.q_init == "teacher":
+            result["sampled_teacher_logps"] = torch.cat(sampled_teacher_logps, dim=1)
+            result["topk_teacher_logps"] = torch.cat(topk_teacher_logps, dim=1)
+        return result
 
     # -- synchronous actor and critic loss ---------------------------------
 
@@ -255,18 +292,27 @@ class SACTrainer(SDFTTrainer):
         student_attention_mask = torch.cat(
             [inputs["prompt_mask"], inputs["completion_mask"]], dim=1
         )
-        student_logits = self._forward_logits(
-            model,
-            student_input_ids,
-            student_attention_mask,
-            completion_ids.size(1),
+        # global_step counts optimizer steps, so every accumulated microbatch
+        # uses the same phase. Resuming restores this counter through TrainerState.
+        warmup = (
+            model.training
+            and self.args.critic_warmup_steps > 0
+            and self.state.global_step < self.args.critic_warmup_steps
         )
-
-        topk_ids = self.soft_value_estimator.select_token_ids(student_logits)
-        selected_ids = torch.cat([completion_ids.unsqueeze(-1), topk_ids], dim=-1)
-        selected_student_logps = selective_log_softmax(student_logits, selected_ids)
-        sampled_student_logps = selected_student_logps[..., 0]
-        topk_student_logps = selected_student_logps[..., 1:].detach()
+        # Keep policy grads None during warmup: its optimizer state and weight
+        # decay must not advance while the critic learns from the fixed policy.
+        with torch.no_grad() if warmup else nullcontext():
+            student_logits = self._forward_logits(
+                model,
+                student_input_ids,
+                student_attention_mask,
+                completion_ids.size(1),
+            )
+            topk_ids = self.soft_value_estimator.select_token_ids(student_logits)
+            selected_ids = torch.cat([completion_ids.unsqueeze(-1), topk_ids], dim=-1)
+            selected_student_logps = selective_log_softmax(student_logits, selected_ids)
+            sampled_student_logps = selected_student_logps[..., 0]
+            topk_student_logps = selected_student_logps[..., 1:].detach()
 
         teacher = self._teacher_scores_and_q_inputs(inputs, topk_ids)
         residual_hidden, state_scale = self.q_head(teacher["hidden"])
@@ -274,13 +320,18 @@ class SACTrainer(SDFTTrainer):
             residual_hidden.float() * teacher["sampled_action_vectors"].float()
         ).sum(dim=-1)
 
-        # The same prefix scale applies to the sampled action and every top-K action.
-        sampled_q = state_scale * teacher["sampled_teacher_logps"] + sampled_correction
+        sampled_q = sampled_correction
+        topk_q = teacher["topk_corrections"]
+        sampled_scale_correction = torch.zeros_like(sampled_correction)
+        if self.args.q_init == "teacher":
+            # The same prefix scale applies to sampled and top-K teacher log-probs.
+            sampled_q = state_scale * teacher["sampled_teacher_logps"] + sampled_correction
+            topk_q = (
+                state_scale.detach().unsqueeze(-1) * teacher["topk_teacher_logps"]
+                + topk_q
+            )
+            sampled_scale_correction = (state_scale - 1.0) * teacher["sampled_teacher_logps"]
         support = self.soft_value_estimator.build_support(topk_ids, topk_student_logps)
-        topk_q = (
-            state_scale.detach().unsqueeze(-1) * teacher["topk_teacher_logps"]
-            + teacher["topk_corrections"]
-        )
         soft_values = self.soft_value_estimator.estimate(topk_q, support)
 
         with torch.no_grad():
@@ -300,11 +351,13 @@ class SACTrainer(SDFTTrainer):
             )
 
         loss_mask = completion_mask * inputs["scorable"].float().unsqueeze(1)
-        actor_loss = masked_sequence_mean(
-            -sampled_student_logps * soft_advantages, loss_mask
+        actor_loss = (
+            sampled_q.new_zeros(())
+            if warmup
+            else masked_sequence_mean(-sampled_student_logps * soft_advantages, loss_mask)
         )
         q_loss = masked_sequence_mean((sampled_q - q_targets) ** 2, loss_mask)
-        loss = actor_loss + q_loss
+        loss = q_loss if warmup else actor_loss + q_loss
 
         mode = "train" if model.training else "eval"
         self._record_sac_metrics(
@@ -314,7 +367,8 @@ class SACTrainer(SDFTTrainer):
             sampled_q=sampled_q,
             sampled_correction=sampled_correction,
             state_scale=state_scale,
-            sampled_scale_correction=(state_scale - 1.0) * teacher["sampled_teacher_logps"],
+            sampled_scale_correction=sampled_scale_correction,
+            critic_warmup=sampled_q.new_tensor(float(warmup)),
             soft_values=soft_values,
             soft_advantages=soft_advantages,
             q_targets=q_targets,
@@ -346,6 +400,10 @@ class SACTrainer(SDFTTrainer):
             return
         q_head = self.accelerator.unwrap_model(self.q_head)
         torch.save(q_head.state_dict(), os.path.join(output_dir, Q_HEAD_FILE))
+        # Both initialization modes have the same tensor shapes but different
+        # forward semantics. Guard direct Trainer resumes as well as CLI resumes.
+        with open(os.path.join(output_dir, Q_INIT_FILE), "w") as handle:
+            json.dump({"q_init": self.args.q_init}, handle)
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
@@ -353,6 +411,17 @@ class SACTrainer(SDFTTrainer):
         self._save_q_head(output_dir)
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        init_path = os.path.join(resume_from_checkpoint, Q_INIT_FILE)
+        if os.path.isfile(init_path):
+            with open(init_path) as handle:
+                saved_q_init = json.load(handle)["q_init"]
+        else:
+            saved_q_init = "teacher"  # checkpoints predating random-Q support
+        if saved_q_init != self.args.q_init:
+            raise ValueError(
+                f"SAC checkpoint q_init={saved_q_init!r} differs from "
+                f"requested q_init={self.args.q_init!r}; Q forward semantics would change."
+            )
         super()._load_from_checkpoint(resume_from_checkpoint, model)
         path = os.path.join(resume_from_checkpoint, Q_HEAD_FILE)
         if not os.path.isfile(path):

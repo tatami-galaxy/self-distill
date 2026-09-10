@@ -1,4 +1,4 @@
-"""Train online SDPO-initialized soft actor-critic with privileged information.
+"""Train online soft actor-critic with privileged teacher features.
 
 The student samples an untruncated temperature-1 rollout. A separate frozen copy
 of the same model reads privileged information and supplies both teacher
@@ -15,13 +15,30 @@ The additional vector c starts at zero, so both heads start at teacher log-probs
 The positive multiplier is shared across actions at a prefix; the additive term
 can still change teacher rankings. Both A and c train with the same critic loss.
 Actor and critic each update once per generated effective batch, synchronously,
-with beta=gamma=1 and no critic warmup or target network.
+with beta=gamma=1 and no target network.
+
+Random Q (--q-init random, linear head only) omits the teacher log-probability
+term and initializes A with Normal(0, q_init_scale^2 / hidden_size). The privileged
+teacher remains a frozen feature extractor. --critic-warmup-steps trains only Q
+on fresh fixed-student rollouts before enabling actor updates. Warmup counts
+against --max-steps; resumes continue from the restored optimizer-step count.
+The default constant LR schedule also stays constant across this transition.
+
+Random Q with 20 critic-only steps followed by 200 actor steps:
+CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sac.train_sac \
+    --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
+    --q-head-architecture linear --q-init random --q-init-scale 0.01 \
+    --critic-warmup-steps 20 --max-steps 220 --lam 1
+
+Lambda < 1 is allowed (e.g. --lam 0.9), but random-Q runs warn because their
+returns bootstrap from an initially untrained critic. Lambda 1 uses sampled
+soft Monte Carlo returns during both warmup and joint training.
 
 Single GPU:
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sac.train_sac \
     --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
     --soft-v-estimator topk --soft-v-topk 100 --lam 0 \
-    --q-head-architecture state_scaled_linear
+    --q-head-architecture linear
 
 Four GPUs, data parallel:
 CUDA_VISIBLE_DEVICES=0,1,2,3 uv run accelerate launch --num_processes 4 \
@@ -52,6 +69,7 @@ It does not eliminate the underlying mismatch: the λ=0 run also worsens.
 
 import argparse
 import json
+import math
 import os
 
 from trl.rewards import accuracy_reward
@@ -63,16 +81,23 @@ from train.opsd.train_sdft import (
 )
 from utils import DATASET_REGISTRY_TRAIN, TEACHER_PROMPT_TEMPLATE, validate_resume
 
-from .lib import Q_HEAD_ARCHITECTURE, Q_HEAD_PARAMETERIZATIONS
+from .lib import DEFAULT_Q_INIT_SCALE, Q_HEAD_ARCHITECTURE, Q_HEAD_PARAMETERIZATIONS
 from .trainer import GAMMA, SOFT_BETA, SACConfig, SACTrainer
 
 
 def sac_run_name(
     dataset: str, pi_slug: str, soft_v_estimator: str,
     q_head_architecture: str = Q_HEAD_ARCHITECTURE,
+    *, q_init: str = "teacher", q_init_scale: float = DEFAULT_Q_INIT_SCALE,
+    critic_warmup_steps: int = 0, lam: float = 0.0,
 ) -> str:
-    """Name an SAC run by every architectural choice currently under study."""
-    return f"{dataset}_{pi_slug}_{soft_v_estimator}_{q_head_architecture}"
+    """Preserve legacy names; distinguish random-Q and warmup experiment settings."""
+    name = f"{dataset}_{pi_slug}_{soft_v_estimator}_{q_head_architecture}"
+    if q_init != "teacher" or critic_warmup_steps:
+        name += f"_{q_init}_warmup{critic_warmup_steps}_lam{lam:g}"
+        if q_init == "random":
+            name += f"_init{q_init_scale:g}"
+    return name
 
 
 def build_run_meta(args, num_train_examples: int) -> dict:
@@ -107,7 +132,13 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "reward": "accuracy_reward",
         "teacher_model_kind": "base",
         "q_head_architecture": args.q_head_architecture,
-        "q_parameterization": Q_HEAD_PARAMETERIZATIONS[args.q_head_architecture],
+        "q_parameterization": (
+            "frozen_lm_head_random_linear" if args.q_init == "random"
+            else Q_HEAD_PARAMETERIZATIONS[args.q_head_architecture]
+        ),
+        "q_init": args.q_init,
+        "q_init_scale": args.q_init_scale if args.q_init == "random" else None,
+        "critic_warmup_steps": args.critic_warmup_steps,
         "soft_v_estimator": args.soft_v_estimator,
         "soft_v_topk": args.soft_v_topk,
         "beta": SOFT_BETA,
@@ -155,6 +186,18 @@ def build_parser():
         choices=list(Q_HEAD_PARAMETERIZATIONS),
         help="linear: additive residual (default); state_scaled_linear: also learn "
              "a positive exp(c^T h) multiplier shared across tokens at each prefix.",
+    )
+    parser.add_argument(
+        "--q-init", choices=["teacher", "random"], default="teacher",
+        help="random removes the teacher log-probability offset; requires the linear head.",
+    )
+    parser.add_argument(
+        "--q-init-scale", type=float, default=DEFAULT_Q_INIT_SCALE,
+        help="Random projection weight std = this scale / sqrt(hidden_size).",
+    )
+    parser.add_argument(
+        "--critic-warmup-steps", type=int, default=0,
+        help="Critic-only optimizer steps, counted against --max-steps.",
     )
     parser.add_argument("--soft-v-topk", type=int, default=100)
     parser.add_argument("--lam", type=float, default=0.0)
@@ -208,6 +251,12 @@ def main():
         parser.error("--soft-v-topk must be >= 1")
     if not 0.0 <= args.lam <= 1.0:
         parser.error("--lam must be in [0, 1]")
+    if args.q_init == "random" and args.q_head_architecture != "linear":
+        parser.error("--q-init random requires --q-head-architecture linear")
+    if not math.isfinite(args.q_init_scale) or args.q_init_scale <= 0:
+        parser.error("--q-init-scale must be finite and positive")
+    if args.critic_warmup_steps < 0:
+        parser.error("--critic-warmup-steps must be >= 0")
     if args.rollout_pi_sample_idx < 0:
         parser.error("--rollout-pi-sample-idx must be >= 0")
     if args.pi_mode != "hint" and (
@@ -227,11 +276,16 @@ def main():
     output_dir = args.output_dir or os.path.join(
         args.output_root,
         model_slug,
-        sac_run_name(args.dataset, pi_slug, args.soft_v_estimator, args.q_head_architecture),
+        sac_run_name(
+            args.dataset, pi_slug, args.soft_v_estimator, args.q_head_architecture,
+            q_init=args.q_init, q_init_scale=args.q_init_scale,
+            critic_warmup_steps=args.critic_warmup_steps, lam=args.lam,
+        ),
     )
     print(
         f"model: {model_slug}  dataset: {args.dataset}  pi: {args.pi_mode}  "
         f"soft-V: {args.soft_v_estimator}  Q-head: {args.q_head_architecture}  "
+        f"Q-init: {args.q_init}  critic-warmup: {args.critic_warmup_steps}  "
         f"->  output: {output_dir}"
     )
 
@@ -257,6 +311,9 @@ def main():
     training_args = SACConfig(
         output_dir=output_dir,
         q_head_architecture=args.q_head_architecture,
+        q_init=args.q_init,
+        q_init_scale=args.q_init_scale,
+        critic_warmup_steps=args.critic_warmup_steps,
         soft_v_estimator=args.soft_v_estimator,
         soft_v_topk=args.soft_v_topk,
         lam=args.lam,
@@ -301,7 +358,14 @@ def main():
 
     meta = build_run_meta(args, len(train_dataset))
     if args.resume_from_checkpoint:
-        validate_resume(args.resume_from_checkpoint, meta, args.force_resume)
+        strict_keys = []
+        if args.q_init == "random":
+            strict_keys.extend(["q_init", "q_init_scale"])
+        if args.critic_warmup_steps:
+            strict_keys.append("critic_warmup_steps")
+        validate_resume(
+            args.resume_from_checkpoint, meta, args.force_resume, strict_keys=tuple(strict_keys)
+        )
     if training_args.process_index == 0:
         os.makedirs(output_dir, exist_ok=True)
         meta_path = os.path.join(output_dir, "run_meta.json")

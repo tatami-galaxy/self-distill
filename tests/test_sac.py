@@ -162,7 +162,7 @@ class SACDatasetTest(unittest.TestCase):
 class JointSACLossTest(unittest.TestCase):
     def test_one_loss_backpropagates_to_actor_and_residual_q(self):
         trainer = object.__new__(SACTrainer)
-        trainer.args = types.SimpleNamespace(lam=0.0)
+        trainer.args = types.SimpleNamespace(lam=0.0, q_init="teacher", critic_warmup_steps=0)
         trainer.current_gradient_accumulation_steps = 1
         trainer.soft_value_estimator = TopKSoftValueEstimator(k=2)
         trainer.q_head = ResidualQHead(hidden_size=2)

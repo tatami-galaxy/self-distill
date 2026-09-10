@@ -1,5 +1,6 @@
 """Small, testable components for the SDPO-to-SAC experiment."""
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -7,6 +8,7 @@ import torch
 from torch import nn
 
 Q_HEAD_ARCHITECTURE = "linear"
+DEFAULT_Q_INIT_SCALE = 0.01
 Q_HEAD_PARAMETERIZATIONS = {
     "linear": "frozen_lm_head_zero_linear_residual",
     "state_scaled_linear": "frozen_lm_head_exp_state_scale_linear_residual",
@@ -23,14 +25,29 @@ class ResidualQHead(nn.Module):
 
     The frozen teacher LM-head row supplies the action vector outside this module:
     Q(s, a) = alpha(s) * log pi_T(a | s) + u_a^T D h_T(s).
-    D starts at zero. With learn_state_scale, alpha(s) = exp(c^T h_T(s))
-    and c also starts at zero; otherwise alpha is fixed at one.
+    With q_init="teacher", D starts at zero. With learn_state_scale,
+    alpha(s) = exp(c^T h_T(s)) and c also starts at zero; otherwise alpha is one.
+    With q_init="random", D ~ Normal(0, q_init_scale^2 / hidden_size),
+    and the trainer omits the teacher-log-probability term entirely.
     """
 
-    def __init__(self, hidden_size: int, *, learn_state_scale: bool = False):
+    def __init__(
+        self, hidden_size: int, *, learn_state_scale: bool = False,
+        q_init: str = "teacher", q_init_scale: float = DEFAULT_Q_INIT_SCALE,
+    ):
         super().__init__()
+        if q_init not in {"teacher", "random"}:
+            raise ValueError(f"unknown q_init {q_init!r}")
+        if not math.isfinite(q_init_scale) or q_init_scale <= 0:
+            raise ValueError("q_init_scale must be finite and positive")
+        if q_init == "random" and learn_state_scale:
+            raise ValueError("random Q requires the linear head without a teacher multiplier")
+        self.q_init = q_init
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
-        nn.init.zeros_(self.projection.weight)
+        if q_init == "random":
+            nn.init.normal_(self.projection.weight, std=q_init_scale / math.sqrt(hidden_size))
+        else:
+            nn.init.zeros_(self.projection.weight)
         self.scale_projection = None
         if learn_state_scale:
             self.scale_projection = nn.Linear(hidden_size, 1, bias=False)

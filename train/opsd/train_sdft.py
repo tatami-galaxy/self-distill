@@ -19,9 +19,9 @@ skips already-seen data; pass the same hyperparameters (verified against run_met
 CAVEAT: only sound for `--teacher-model-kind base` (the frozen base teacher is re-loaded
 from the base model id, so resume can't corrupt it). For `ema` the EMA teacher state is
 held in a callback and is NOT in the checkpoint, so resuming resets it to the base weights
-and silently loses the accumulated EMA -- don't resume `ema` runs without accounting for this.
+and loses the accumulated EMA -- don't resume `ema` runs without accounting for this.
 --max-steps is the TOTAL budget and is free to raise, but the LEARNING RATE comes from the
-checkpoint rather than the command line, so a changed --learning-rate is refused. 
+checkpoint so a changed --learning-rate is refused. 
 
 # single GPU, colocate vLLM, check optima and vLLM gpu util for larger models
 CUDA_VISIBLE_DEVICES=0 uv run python -m train.opsd.train_sdft \
