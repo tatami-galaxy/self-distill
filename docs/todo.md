@@ -56,6 +56,7 @@
   - [ ] Randomly initialzed Q : pure SAC
   - [ ] Fit Q to future log probs
   - [ ] Fit Q to answer log prob
+  - [ ] Double Q
   - [ ] NLAC
 
 - **Train self-teacher for hint generation**
