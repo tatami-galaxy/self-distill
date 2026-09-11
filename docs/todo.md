@@ -50,6 +50,8 @@
 - **PI conditioned Q function actor-critic**
 
   - [ ] $\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))]$
+  - [ ] Max Ent ablation
+  - [ ] Reward shaping
   - [ ] Different Q construction
   - [ ] Different Q fitting objective
   - [ ] Non linear Q head
