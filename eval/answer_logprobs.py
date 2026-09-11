@@ -5,8 +5,8 @@ The teacher is the frozen generating model, under none/answer/hint/full PI.
 Pooled correctness discrimination includes every usable question. Within-question
 ranking is a separate analysis restricted to questions containing both outcomes.
 
-CUDA_VISIBLE_DEVICES=0 python -m eval.answer_logprobs --model Qwen/Qwen3-1.7B
-CUDA_VISIBLE_DEVICES=1 python -m eval.answer_logprobs --model Qwen/Qwen3-4B
+CUDA_VISIBLE_DEVICES=0 uv run python -m eval.answer_logprobs --model Qwen/Qwen3-1.7B
+CUDA_VISIBLE_DEVICES=1 uv run python -m eval.answer_logprobs --model Qwen/Qwen3-4B
 
 Defaults read data/rollouts/deepmath/<model>/ and write
 results/answer_logprobs/<model>/. Phases: prepare, score, aggregate, all (default).
@@ -90,9 +90,10 @@ def file_hash(path):
 
 
 def source_stamp(path):
+    """Use JSON-stable entries so saved stamps compare equal after a restart."""
     root = Path(path).resolve()
     return [
-        (str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns)
+        [str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns]
         for p in sorted(root.rglob("*"))
         if p.is_file()
     ]

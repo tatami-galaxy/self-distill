@@ -1,5 +1,6 @@
 """Extraction, causal scoring, statistics, and resume checks without model downloads."""
 
+import json
 import tempfile
 import types
 import unittest
@@ -200,6 +201,23 @@ class CorrectnessComparisonTest(unittest.TestCase):
         self.assertEqual(result, {("q", "1"): "", ("q", "2"): "b"})
 
 
+class SourceStampTest(unittest.TestCase):
+    def test_legacy_manifest_round_trip_preserves_stamp_and_score_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.arrow"
+            path.write_bytes(b"original cache")
+            stamp = experiment.source_stamp(tmp)
+            # Existing manifests serialized tuple entries as JSON arrays.
+            legacy = {"source_stamp": [tuple(entry) for entry in stamp]}
+            loaded = json.loads(json.dumps(legacy))
+            self.assertEqual(loaded["source_stamp"], experiment.source_stamp(tmp))
+            self.assertEqual(
+                experiment.fingerprint(legacy), experiment.fingerprint(loaded)
+            )
+            path.write_bytes(b"a changed cache with a different size")
+            self.assertNotEqual(loaded["source_stamp"], experiment.source_stamp(tmp))
+
+
 class FullCachePipelineTest(unittest.TestCase):
     def test_prepare_score_resume_and_all_question_aggregation(self):
         tokenizer = CharacterTokenizer()
@@ -234,6 +252,8 @@ class FullCachePipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "rollouts"
             cache.mkdir()
+            cache_file = cache / "data.arrow"
+            cache_file.write_bytes(b"nonempty cache fixture")
             args = experiment.build_parser().parse_args(
                 [
                     "--model",
@@ -305,9 +325,21 @@ class FullCachePipelineTest(unittest.TestCase):
                 self.assertEqual(load.call_count, 1)
                 score.reset_mock()
                 load.reset_mock()
+                with (
+                    mock.patch.object(
+                        experiment,
+                        "summarize",
+                        side_effect=ModuleNotFoundError("scipy"),
+                    ),
+                    self.assertRaises(ModuleNotFoundError),
+                ):
+                    experiment.aggregate(args)
+                manifest_before = (out / "manifest.json").read_bytes()
+                experiment.prepare(args)
                 experiment.score(args)
                 score.assert_not_called()
                 load.assert_not_called()
+                self.assertEqual((out / "manifest.json").read_bytes(), manifest_before)
             experiment.aggregate(args)
             summary = experiment.read_json(out / "summary.json")
             self.assertEqual(summary["questions"], 4)
@@ -320,6 +352,9 @@ class FullCachePipelineTest(unittest.TestCase):
                 )
             self.assertTrue((out / "answer_score_distributions.png").exists())
             self.assertEqual(len(list(experiment.jsonl_rows(out / "answers.jsonl"))), 7)
+            cache_file.write_bytes(b"changed rollout cache")
+            with self.assertRaisesRegex(ValueError, "Rollout cache changed"):
+                experiment.prepare(args)
             score_file = next((out / "scores").glob("*.json"))
             saved = experiment.read_json(score_file)
             saved["signature"] = "wrong"
