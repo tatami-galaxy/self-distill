@@ -54,11 +54,6 @@
   - [ ] Reward shaping
   - [ ] Different Q construction
   - [ ] Different Q fitting objective
-  - [ ] Non linear Q head
-  - [ ] Randomly initialzed Q : pure SAC
-  - [ ] Fit Q to future log probs
-  - [ ] Fit Q to answer log prob
-  - [ ] Double Q
   - [ ] NLAC
 
 - **Train self-teacher for hint generation**
@@ -70,4 +65,3 @@
   - [ ] Other objectives
   - [x] LoRA on top of self-teacher 
 
-- **Vine SD**
