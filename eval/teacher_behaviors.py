@@ -63,6 +63,13 @@ uv run python -m eval.teacher_behaviors --teacher-model Qwen/Qwen3-1.7B --dry-ru
 # the sweep
 CUDA_VISIBLE_DEVICES=0 uv run python -m eval.teacher_behaviors \
     --teacher-model Qwen/Qwen3-1.7B --samples-per-problem 4
+
+# 8k teacher references for the cached SDFT student study (judge inference only).
+# Repeat with --teacher-model Qwen/Qwen3-4B for the other model size.
+CUDA_VISIBLE_DEVICES=0 uv run python -m eval.teacher_behaviors \
+    --teacher-model Qwen/Qwen3-1.7B --samples-per-problem 4 \
+    --completions-root results/teacher_uncertainty_8k \
+    --output-root results/teacher_behaviors_8k
 """
 
 from __future__ import annotations
@@ -83,8 +90,7 @@ from eval.advantage_dynamics_sdft import (
     read_json,
     write_json_atomic,
 )
-from eval.teacher_uncertainty import EPISTEMIC_MARKERS, count_epistemic, split_think
-
+from eval.teacher_uncertainty import EPISTEMIC_MARKERS
 
 PI_MODES = ("none", "rollout", "answer", "hint", "full")
 
@@ -560,8 +566,10 @@ def render_system_prompt() -> str:
     free after the first segment.
     """
     parts = [
-        "You are to label excerpts of mathematical reasoning for four cognitive behaviors. For the "
-        "segment given, report how many times each behavior occurs.",
+        (
+            "You are to label excerpts of mathematical reasoning for four cognitive behaviors. For the "
+            "segment given, report how many times each behavior occurs."
+        ),
         "",
         "BEHAVIORS",
     ]
@@ -895,6 +903,71 @@ def classify_chunks(llm, sampling_params, plan: list[dict], system_prompt: str,
     return rows
 
 
+def create_classifier(args):
+    """Load only the judge, using identical decoding settings for both studies."""
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
+    llm = LLM(
+        model=args.classifier_model,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
+        enable_prefix_caching=args.enable_prefix_caching,
+        max_num_seqs=args.max_num_seqs,
+        # NOT optional, and it has to be set HERE. A JSON grammar admits arbitrary
+        # whitespace between members, and this model exploits it: it emits the four
+        # counts correctly, then runs newlines and tabs until it hits
+        # --max-output-tokens, so the response is truncated before the closing brace and
+        # fails to parse. Measured at 110 of 138 segments before this was set.
+        #
+        # SamplingParams.structured_outputs also has a `disable_any_whitespace` field and
+        # it is IGNORED: vllm/v1/structured_output/backend_xgrammar.py reads
+        # `vllm_config.structured_outputs_config`, i.e. the engine-level config below,
+        # never the per-request one. Setting it per request looks right, changes nothing,
+        # and shows up as a parse-failure rate rather than an error.
+        # `backend` must be named explicitly: the validator rejects
+        # disable_any_whitespace while the backend is still "auto", even though auto
+        # resolves to xgrammar for this schema anyway.
+        structured_outputs_config={
+            "backend": "xgrammar",
+            "disable_any_whitespace": True,
+        },
+        seed=args.seed,
+        trust_remote_code=True,
+    )
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_output_tokens,
+        seed=args.seed,
+        structured_outputs=StructuredOutputsParams(
+            json=response_schema(args.evidence)
+        ),
+    )
+    return llm, sampling_params
+
+
+def build_chunk_plan(source_rows, tokenizer, chunk_tokens: int, context_paragraphs: int) -> list[dict]:
+    """Prepare identical classification segments for teacher and student completions."""
+    chunk_plan = []
+    for record in source_rows:
+        chunks = chunk_completion(record["text"], tokenizer, chunk_tokens)
+        previous: list[str] = []
+        for chunk in chunks:
+            entry = {
+                "question_idx": int(record["question_idx"]),
+                "sample_idx": int(record["sample_idx"]),
+                **chunk,
+            }
+            if context_paragraphs and previous:
+                entry["context"] = "\n\n".join(previous[-context_paragraphs :])
+            chunk_plan.append(entry)
+            previous = [chunk["text"][s:e] for s, e in paragraph_spans(chunk["text"])]
+    return chunk_plan
+
+
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
@@ -1082,30 +1155,11 @@ def build_run_config(args, teacher_slug: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument("--teacher-model", default="Qwen/Qwen3-1.7B",
-                   help="Whose completions to classify. Names the input and output subdirs; "
-                        "this model is never loaded.")
+def add_classifier_args(p) -> None:
+    """Shared rubric, judge decoding, and execution options."""
     p.add_argument("--classifier-model", default="Qwen/Qwen3.8-27B",
                    help="The labelling model. Hybrid reasoner: thinking is disabled via "
                         "chat_template_kwargs AND structurally by the JSON grammar.")
-    p.add_argument("--completions-root", default="results/teacher_uncertainty_16k",
-                   help="Root eval/teacher_uncertainty.py wrote to (--output-dir there).")
-    p.add_argument("--output-root", default="results/teacher_behaviors_16k",
-                   help="Separate from --completions-root so --force can never overwrite "
-                        "generation output.")
-    p.add_argument("--pi-modes", nargs="+", default=list(PI_MODES), choices=list(PI_MODES),
-                   help="Arms to classify. All five share one problem set, so all five should "
-                        "normally be run together.")
-    p.add_argument("--samples-per-problem", type=int, default=4,
-                   help="Keep sample_idx < N. Thins SAMPLES, never problems: the CI resamples "
-                        "questions, so the marginal sample is cheap to give up and the "
-                        "problem-level pairing across arms is what must survive. 0/None keeps all.")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Cap trajectories per arm (smoke runs). Applied after thinning.")
     # rubric / segmentation
     p.add_argument("--chunk-tokens", type=int, default=1000,
                    help="Target segment size, measured in CLASSIFIER tokens. Paragraphs are "
@@ -1159,6 +1213,30 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Plan the chunking and print the token cost without loading the engine.")
     p.add_argument("--force", action="store_true",
                    help="Reclassify arms whose cached provenance differs from this run's.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--teacher-model", default="Qwen/Qwen3-1.7B",
+                   help="Whose completions to classify. Names the input and output subdirs; "
+                        "this model is never loaded.")
+    p.add_argument("--completions-root", default="results/teacher_uncertainty_16k",
+                   help="Root eval/teacher_uncertainty.py wrote to (--output-dir there).")
+    p.add_argument("--output-root", default="results/teacher_behaviors_16k",
+                   help="Separate from --completions-root so --force can never overwrite "
+                        "generation output.")
+    p.add_argument("--pi-modes", nargs="+", default=list(PI_MODES), choices=list(PI_MODES),
+                   help="Arms to classify. All five share one problem set, so all five should "
+                        "normally be run together.")
+    p.add_argument("--samples-per-problem", type=int, default=4,
+                   help="Keep sample_idx < N. Thins SAMPLES, never problems: the CI resamples "
+                        "questions, so the marginal sample is cheap to give up and the "
+                        "problem-level pairing across arms is what must survive. 0/None keeps all.")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Cap trajectories per arm (smoke runs). Applied after thinning.")
+    add_classifier_args(p)
     return p
 
 
@@ -1206,20 +1284,9 @@ def main() -> None:
         )
         if not source_rows:
             raise SystemExit(f"No completions selected for pi={pi_mode}")
-        chunk_plan = []
-        for record in source_rows:
-            chunks = chunk_completion(record["text"], tokenizer, args.chunk_tokens)
-            previous: list[str] = []
-            for chunk in chunks:
-                entry = {
-                    "question_idx": int(record["question_idx"]),
-                    "sample_idx": int(record["sample_idx"]),
-                    **chunk,
-                }
-                if args.context_paragraphs and previous:
-                    entry["context"] = "\n\n".join(previous[-args.context_paragraphs :])
-                chunk_plan.append(entry)
-                previous = [chunk["text"][s:e] for s, e in paragraph_spans(chunk["text"])]
+        chunk_plan = build_chunk_plan(
+            source_rows, tokenizer, args.chunk_tokens, args.context_paragraphs
+        )
         plans[pi_mode] = {
             "source_rows": source_rows,
             "chunk_plan": chunk_plan,
@@ -1257,47 +1324,7 @@ def main() -> None:
         pending.append(pi_mode)
 
     if pending:
-        from vllm import LLM, SamplingParams
-        from vllm.sampling_params import StructuredOutputsParams
-
-        llm = LLM(
-            model=args.classifier_model,
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            tensor_parallel_size=args.tensor_parallel_size,
-            enable_prefix_caching=args.enable_prefix_caching,
-            max_num_seqs=args.max_num_seqs,
-            # NOT optional, and it has to be set HERE. A JSON grammar admits arbitrary
-            # whitespace between members, and this model exploits it: it emits the four
-            # counts correctly, then runs newlines and tabs until it hits
-            # --max-output-tokens, so the response is truncated before the closing brace and
-            # fails to parse. Measured at 110 of 138 segments before this was set.
-            #
-            # SamplingParams.structured_outputs also has a `disable_any_whitespace` field and
-            # it is IGNORED: vllm/v1/structured_output/backend_xgrammar.py reads
-            # `vllm_config.structured_outputs_config`, i.e. the engine-level config below,
-            # never the per-request one. Setting it per request looks right, changes nothing,
-            # and shows up as a parse-failure rate rather than an error.
-            # `backend` must be named explicitly: the validator rejects
-            # disable_any_whitespace while the backend is still "auto", even though auto
-            # resolves to xgrammar for this schema anyway.
-            structured_outputs_config={
-                "backend": "xgrammar",
-                "disable_any_whitespace": True,
-            },
-            seed=args.seed,
-            trust_remote_code=True,
-        )
-        sampling_params = SamplingParams(
-            n=1,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_output_tokens,
-            seed=args.seed,
-            structured_outputs=StructuredOutputsParams(
-                json=response_schema(args.evidence)
-            ),
-        )
+        llm, sampling_params = create_classifier(args)
         for pi_mode in pending:
             plan = plans[pi_mode]
             print(f"\nClassifying {pi_mode}: {len(plan['chunk_plan'])} segments")
