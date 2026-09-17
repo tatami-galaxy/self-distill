@@ -343,6 +343,115 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 plot_aime_curves(aime, "pass@1");
 
 
+# %% -------------------- VALIDATION-SELECTED AIME -------------------- [markdown]
+# ## AIME avg@16 at validation-selected checkpoints
+#
+# Each row reports the OOD accuracy of the checkpoint selected by the fixed DeepMath
+# validation set, with one row per algorithm, hyperparameter setting, and training run.
+# These results are loaded from `results/selected_ood/` and use `AIME_YEAR` above.
+# They are never selected or ranked by their AIME score. The table shows the chosen
+# checkpoint, validation accuracy, and AIME avg@16.
+#
+# Different validation splits or OOD evaluation settings appear in separate tables.
+# Direct checkpoint evaluations without an embedded validation selection are skipped.
+
+# %% -------------------- TABLE SELECTED AIME AVG@16 --------------------
+# Selected-checkpoint results use the AIME_YEAR chosen above.
+SELECTED_AIME_ROOT = RESULTS / "selected_ood" / AIME_DATASET
+
+
+def load_selected_aime(directory: Path) -> pd.DataFrame:
+    """Read embedded validation selections; never maximize an AIME metric."""
+    import hashlib
+
+    rows, unselected = [], []
+    for path in sorted(directory.rglob("summary.json")):
+        summary = read_json(path)
+        config = summary.get("config") or {}
+        arm = config.get("arm") or {}
+        selection = config.get("selection") or {}
+        is_base = arm.get("algo") == "base"
+        if not selection and not is_base:
+            unselected.append(str(path))
+            continue
+        if (summary.get("metric") != "avg@16" or summary.get("n_samples") != 16
+                or config.get("n") != 16 or config.get("dataset") != directory.name):
+            raise ValueError(f"Unexpected avg@16 evaluation metadata: {path}")
+        accuracy = float(summary["accuracy"])
+        if not math.isfinite(accuracy) or not 0 <= accuracy <= 1:
+            raise ValueError(f"Invalid accuracy: {path}")
+        if not is_base:
+            if config["model"]["model"] != selection["best_checkpoint"]:
+                raise ValueError(f"Evaluated model differs from validation selection: {path}")
+            if selection.get("metric") != "avg@1" or not selection.get("validation_fingerprint"):
+                raise ValueError(f"Missing validation selection provenance: {path}")
+        protocol = {
+            key: config.get(key)
+            for key in ("problems", "max_tokens", "max_model_len", "chat_template_model", "versions")
+        }
+        protocol["sampling"] = summary.get("sampling")
+        protocol["dataset_size"] = summary["dataset_size"]
+        protocol_id = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()[:12]
+        rows.append({
+            "model": arm["model"], "algo": arm["algo"],
+            "train_dataset": arm.get("train_dataset") or "—",
+            "variant": arm.get("variant") or "—",
+            "run": arm.get("run") or (Path(selection["run_dir"]).name if selection else "—"),
+            "run_dir": selection.get("run_dir", "base"),
+            "selected_step": selection.get("best_step"),
+            "validation_accuracy": selection.get("best_accuracy"),
+            "validation_fingerprint": selection.get("validation_fingerprint", "base"),
+            "avg@16": accuracy, "is_base": is_base,
+            "max_tokens": config.get("max_tokens"),
+            "dataset_size": summary["dataset_size"], "protocol": protocol_id,
+            "source": str(path),
+        })
+    if unselected:
+        print(f"Skipped {len(unselected)} direct checkpoint evaluations without a validation selection:")
+        print("\n".join(unselected))
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    identity = ["model", "algo", "train_dataset", "variant", "run_dir", "validation_fingerprint", "protocol"]
+    duplicate = frame.duplicated(identity, keep=False)
+    if duplicate.any():
+        raise ValueError(
+            "Multiple OOD evaluations for the same run/validation protocol. "
+            "Keep the intended selection in this results tree or point SELECTED_AIME_ROOT "
+            "at an unambiguous tree; AIME accuracy must not break the tie.\n"
+            + "\n".join(frame.loc[duplicate, "source"])
+        )
+    return frame.sort_values(["model", "algo", "variant", "run"]).reset_index(drop=True)
+
+
+def display_selected_aime_tables(frame: pd.DataFrame):
+    """Show one row per selected training run, grouped by evaluation protocol."""
+    trained = frame[~frame["is_base"]]
+    if trained.empty:
+        print("Only base results are available; no selected training checkpoints yet.")
+        return
+    groups = trained.groupby(["model", "validation_fingerprint", "protocol"], sort=True)
+    for (model, val_id, protocol), table in groups:
+        table = table.sort_values(["algo", "train_dataset", "variant", "run"])
+        display(
+            table[["algo", "variant", "run", "selected_step", "validation_accuracy", "avg@16"]]
+            .style.set_caption(
+                f"{AIME_LABEL} · {model} · validation-selected checkpoints · "
+                f"validation {val_id[:8]} · protocol {protocol[:8]}"
+            )
+            .format({"selected_step": "{:.0f}", "validation_accuracy": "{:.3f}", "avg@16": "{:.3f}"}, na_rep="—")
+            .background_gradient(subset=["avg@16"], cmap="Blues", vmin=0, vmax=1)
+        )
+
+
+selected_aime = load_selected_aime(SELECTED_AIME_ROOT)
+if selected_aime.empty:
+    print(f"No validation-selected avg@16 results for {AIME_LABEL} yet: {SELECTED_AIME_ROOT}")
+else:
+    print(f"Loaded {len(selected_aime)} avg@16 summaries from {SELECTED_AIME_ROOT}")
+    display_selected_aime_tables(selected_aime)
+
+
 # %% -------------------- PRIVILEGED-INFORMATION PASS@K -------------------- [markdown]
 # ## Privileged-information pass@k
 #
