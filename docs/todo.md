@@ -5,7 +5,7 @@
 - [ ] Countdown-CoT-20k
 - [ ] CodeIO
 - [ ] Hyperparameter sweep, more steps
-- [ ] Validation set
+- [x] Validation set
 
 ### Benchmarks
 
