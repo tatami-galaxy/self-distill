@@ -62,8 +62,21 @@ hint cache and prefix; for other supported DeepMath runs it excludes their entir
 configured source prefix before length filtering. Historical metadata does not
 record actual consumed question IDs or dataset hashes. Current data/caches must
 therefore still match the training sources, and a run configured on **all DeepMath**
-leaves no verifiable held-out pool. The scripts fail rather than call overlapping
-data held out. They do not modify future training loaders; future runs must also
+leaves no verifiable held-out pool. By default, selection rejects this overlap.
+For existing runs, `--allow-training-overlap` lets you reuse the same fixed set
+for checkpoint selection and records the overlap in each score and selection.json.
+This is overlap with the eligible pool; actual exposure before training stopped
+is unknown. For example:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m eval.select_checkpoint \
+  --run-dir /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-1.7B/deepmath_answer \
+  --allow-training-overlap \
+  --output-dir results/validation/Qwen3-1.7B/deepmath_answer
+```
+
+The existing 128 questions are retained; no split regeneration is needed.
+This flag does not bypass missing-cache or other provenance checks. They do not modify future training loaders; future runs must also
 reserve this set explicitly. DeepMath versus benchmark duplicates and pretraining
 exposure are outside this audit.
 

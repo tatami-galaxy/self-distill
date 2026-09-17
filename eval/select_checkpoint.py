@@ -66,6 +66,11 @@ def main():
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument(
+        "--allow-training-overlap",
+        action="store_true",
+        help="Allow the fixed selection set to overlap eligible training data; record overlap in results",
+    )
+    parser.add_argument(
         "--phase",
         choices=["sweep", "summarize"],
         default="sweep",
@@ -76,7 +81,9 @@ def main():
     run_dir = Path(args.run_dir).resolve()
     checkpoints = discover_checkpoints(run_dir)
     split = load_validation(args.validation_file)
-    audit = audit_run(split, run_dir)
+    audit = audit_run(
+        split, run_dir, allow_training_overlap=args.allow_training_overlap
+    )
     problems = split["problems"]
     output_dir = Path(
         args.output_dir

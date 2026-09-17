@@ -167,13 +167,26 @@ class CheckpointSelectionTest(unittest.TestCase):
             )
 
     def test_cached_sweep_writes_selection_and_rejects_partial_scores(self):
+        self._check_cached_sweep()
+
+    def test_cli_allows_and_records_training_overlap(self):
+        self._check_cached_sweep(allow_overlap=True)
+
+    def _check_cached_sweep(self, allow_overlap=False):
         from eval.deepmath_validation import read_json
         from eval.select_checkpoint import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             run, out = root / "run", root / "scores"
-            make_run(run)
+            make_run(
+                run,
+                **(
+                    {"max_samples": None, "num_train_examples": 10}
+                    if allow_overlap
+                    else {}
+                ),
+            )
             problems = sample_problems(
                 source(), {question_key(f"question {i}") for i in range(3)}, 4, 42
             )
@@ -185,7 +198,11 @@ class CheckpointSelectionTest(unittest.TestCase):
             }
             manifest = root / "split.json"
             write_json(manifest, split)
-            _, audit = training_questions(run, source())
+            with patch("utils.load_train_dataset", return_value=source()):
+                if allow_overlap:
+                    with self.assertRaisesRegex(ValueError, "allow-training-overlap"):
+                        audit_run(split, run)
+                audit = audit_run(split, run, allow_training_overlap=allow_overlap)
 
             def config(args, model, problems, n):
                 return {"model": model_stamp(model), "n": n}
@@ -223,6 +240,8 @@ class CheckpointSelectionTest(unittest.TestCase):
                 "--phase",
                 "summarize",
             ]
+            if allow_overlap:
+                argv.append("--allow-training-overlap")
             with (
                 patch("sys.argv", argv),
                 patch("utils.load_train_dataset", return_value=source()),
@@ -235,6 +254,16 @@ class CheckpointSelectionTest(unittest.TestCase):
                 selection = read_json(out / "selection.json")
                 self.assertEqual(selection["best_step"], 20)
                 self.assertEqual(len(selection["scores"]), 2)
+                if allow_overlap:
+                    overlap = selection["training_audit"]["validation_overlap"]
+                    self.assertEqual(overlap["eligible_question_count"], 4)
+                    self.assertEqual(overlap["actual_training_exposure"], "unknown")
+                    self.assertEqual(
+                        overlap["question_ids"],
+                        sorted(row["question_id"] for row in problems),
+                    )
+                else:
+                    self.assertNotIn("validation_overlap", selection["training_audit"])
                 gpu_process.assert_not_called()
                 (out / "checkpoint-100" / "summary.json").unlink()
                 with self.assertRaisesRegex(ValueError, "Missing validation score"):

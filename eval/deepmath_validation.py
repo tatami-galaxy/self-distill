@@ -156,7 +156,7 @@ def load_validation(path) -> dict:
     return split
 
 
-def audit_run(split, run_dir) -> dict:
+def audit_run(split, run_dir, *, allow_training_overlap=False) -> dict:
     run_dir = Path(run_dir).resolve()
     allowed = any(
         row["run_dir"] == str(run_dir)
@@ -165,10 +165,23 @@ def audit_run(split, run_dir) -> dict:
     )
     keys, audit = training_questions(run_dir, allow_missing_cache=allowed)
     overlap = keys.intersection(row["question_id"] for row in split["problems"])
-    if overlap:
+    if overlap and not allow_training_overlap:
         raise ValueError(
             f"Validation overlaps {len(overlap)} eligible training questions in {run_dir}. "
-            "Prepare one common split excluding every run you want to compare."
+            "Use --allow-training-overlap to select on this fixed set while recording "
+            "the overlap, or use a held-out split. Eligible does not mean actually consumed."
+        )
+    if overlap:
+        audit["validation_overlap"] = {
+            "eligible_question_count": len(overlap),
+            "validation_question_count": len(split["problems"]),
+            "question_ids": sorted(overlap),
+            "actual_training_exposure": "unknown",
+            "allowed": True,
+        }
+        print(
+            f"Using fixed selection set with {len(overlap)}/{len(split['problems'])} "
+            "questions in the eligible training pool; actual training exposure is unknown."
         )
     return audit
 
