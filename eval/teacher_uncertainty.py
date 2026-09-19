@@ -91,13 +91,13 @@ def split_think(text: str) -> tuple[str, str, bool]:
 
 
 def measure_completion(text: str, n_tokens: int, finish_reason: str | None,
-                       gold: str) -> dict:
+                       gold: str, dataset: str = "deepmath") -> dict:
     """All per-completion behavior metrics for one teacher generation."""
     think, post, closed = split_think(text)
     e_think = count_epistemic(think)
     e_post = count_epistemic(post)
     e_total = {m: e_think[m] + e_post[m] for m in EPISTEMIC_MARKERS}
-    _, correct = grade(text, gold)
+    _, correct = grade(text, gold, dataset)
     return {
         "text": text,
         "n_tokens": n_tokens,
@@ -171,7 +171,7 @@ def generate_arm(llm, tokenizer, problems, pi_mode, sampling_params) -> list[dic
     for pi, (p, out) in enumerate(zip(problems, outputs, strict=True)):
         for si, comp in enumerate(out.outputs):
             rec = measure_completion(
-                comp.text, len(comp.token_ids), comp.finish_reason, p["answer"]
+                comp.text, len(comp.token_ids), comp.finish_reason, p["answer"], p.get("dataset", "deepmath")
             )
             rec["problem_idx"] = pi
             rec["question_idx"] = p["question_idx"]

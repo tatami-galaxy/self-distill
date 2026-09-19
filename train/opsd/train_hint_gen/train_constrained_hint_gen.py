@@ -12,6 +12,9 @@ For the current multiplier lambda, GRPO receives
       - generated_hint_tokens / hint_budget
       - gamma * sampled_reverse_KL_on_student_rollouts.
 
+Invalid hints receive the worst valid reward in their question group minus
+--invalid-penalty. If every hint is invalid, all rewards are zero.
+
 After every generated hint group, lambda is updated by projected dual ascent from
 that group's mean sufficiency. Its state is saved in every policy checkpoint.
 
@@ -26,11 +29,19 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2048 \
     --tau 0.7 --gamma 4
 
-# LoRA run (checkpoints contain only the adapter)
+# LoRA runs (checkpoints contain only the adapter)
 CUDA_VISIBLE_DEVICES=0 uv run python -m \
     train.opsd.train_hint_gen.train_constrained_hint_gen \
     --model Qwen/Qwen3-4B --dataset deepmath --max-samples 2048 \
     --tau 0.7 --gamma 4 --use-lora --learning-rate 1e-5
+
+CUDA_VISIBLE_DEVICES=4 VLLM_USE_V2_MODEL_RUNNER=0 \
+uv run python -m train.opsd.train_hint_gen.train_constrained_hint_gen \
+    --model Qwen/Qwen3-4B --dataset deepmath --use-lora \
+    --tau 0.7 --gamma 7 --learning-rate 1e-5 \
+    --teacher-backend vllm --teacher-gpu 5 \
+    --teacher-gpu-memory-utilization 0.8 --teacher-max-num-seqs 32
+
 """
 
 from __future__ import annotations
@@ -48,13 +59,17 @@ from train.opsd.train_hint_gen.lib import (
     ConstrainedHintReward,
     ConstrainedHintRewardConfig,
     add_lora_args,
+    add_teacher_backend_args,
+    teacher_backend_kwargs,
+    teacher_backend_meta,
+    validate_teacher_devices,
     build_hint_grpo_dataset,
     lora_config_from_args,
     lora_run_meta,
     make_constrained_reward_function,
     validate_lora_args,
 )
-from utils import DATASET_REGISTRY_TRAIN, validate_resume
+from utils import dataset_provenance, DATASET_REGISTRY_TRAIN, validate_resume
 
 
 class ConstrainedHintGRPOTrainer(GRPOTrainer):
@@ -127,7 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-max-completion-length", type=int, default=8192)
     p.add_argument("--teacher-temperature", type=float, default=1.0)
     p.add_argument("--teacher-top-p", type=float, default=1.0)
-    p.add_argument("--invalid-penalty", type=float, default=1.0)
+    p.add_argument("--teacher-top-k", type=int, default=20, help="Teacher top-k; 0 disables filtering.")
+    p.add_argument(
+        "--invalid-penalty", type=float, default=1.0,
+        help="Positive reward margin below the worst valid hint in each question group. "
+        "All-invalid groups receive equal zero rewards.",
+    )
     p.add_argument(
         "--recompute-student-logps",
         action=argparse.BooleanOptionalAction,
@@ -156,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=4)
     add_lora_args(p)
+    add_teacher_backend_args(p)
     # Colocated vLLM. A generation batch is fixed to one complete hint group.
     p.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.2)
@@ -189,6 +210,8 @@ def reward_config_from_args(args: argparse.Namespace) -> ConstrainedHintRewardCo
         teacher_max_completion_length=args.teacher_max_completion_length,
         teacher_temperature=args.teacher_temperature,
         teacher_top_p=args.teacher_top_p,
+        teacher_top_k=args.teacher_top_k,
+        **teacher_backend_kwargs(args),
         tau=args.tau,
         gamma=args.gamma,
         invalid_penalty=args.invalid_penalty,
@@ -222,6 +245,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 0 < args.generator_top_p <= 1:
         raise ValueError("generator_top_p must be in (0, 1]")
     validate_lora_args(args)
+    validate_teacher_devices(args)
     reward_config_from_args(args).validate()
 
 
@@ -232,6 +256,7 @@ def build_run_meta(args: argparse.Namespace, num_train_examples: int) -> dict:
         "model": args.model,
         "teacher_model": args.model,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "rollout_root": args.rollout_root,
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
@@ -247,6 +272,8 @@ def build_run_meta(args: argparse.Namespace, num_train_examples: int) -> dict:
         "teacher_max_completion_length": args.teacher_max_completion_length,
         "teacher_temperature": args.teacher_temperature,
         "teacher_top_p": args.teacher_top_p,
+        "teacher_top_k": args.teacher_top_k,
+        **teacher_backend_meta(args),
         "invalid_penalty": args.invalid_penalty,
         "recompute_student_logps": args.recompute_student_logps,
         "clamp_transfer": args.clamp_transfer,
@@ -346,7 +373,7 @@ def main() -> None:
             args.resume_from_checkpoint,
             meta,
             args.force_resume,
-            strict_keys=(
+            strict_keys=(("teacher_backend",) if args.teacher_backend == "vllm" else ()) + (
                 ("constrained_hint_gen_version", "use_lora")
                 if args.use_lora
                 else ("constrained_hint_gen_version",)
@@ -357,21 +384,24 @@ def main() -> None:
         with open(os.path.join(output_dir, "run_meta.json"), "w") as handle:
             json.dump(meta, handle, indent=2)
 
-    trainer = ConstrainedHintGRPOTrainer(
-        model=args.model,
-        reward_funcs=reward_func,
-        args=training_args,
-        train_dataset=train_dataset,
-        processing_class=tokenizer,
-        constrained_reward=constrained_reward,
-        allow_incompatible_reward_state=args.force_resume,
-        peft_config=peft_config,
-    )
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    final_dir = os.path.join(output_dir, "final")
-    trainer.save_model(final_dir)
-    constrained_reward.save_state(final_dir)
-    print(f"Saved constrained hint generator -> {final_dir}")
+    try:
+        trainer = ConstrainedHintGRPOTrainer(
+            model=args.model,
+            reward_funcs=reward_func,
+            args=training_args,
+            train_dataset=train_dataset,
+            processing_class=tokenizer,
+            constrained_reward=constrained_reward,
+            allow_incompatible_reward_state=args.force_resume,
+            peft_config=peft_config,
+        )
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+        final_dir = os.path.join(output_dir, "final")
+        trainer.save_model(final_dir)
+        constrained_reward.save_state(final_dir)
+        print(f"Saved constrained hint generator -> {final_dir}")
+    finally:
+        reward_func.close()
 
 
 if __name__ == "__main__":

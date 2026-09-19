@@ -13,7 +13,7 @@
 - [ ] Beyondaime
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
-- [ ] CodeIO
+- [x] CodeIO
 - [ ] Comparison with other SD methods
 
 ### Models
@@ -32,13 +32,11 @@
 ### Analysis
 
 - [x] Self-teacher behavior analysis
-- [ ] Trained student behavior analysis
+- [x] Trained student behavior analysis
 - [ ] PI information content vs Student performance
-- [x] Advantage comparison : OPD, OPSD, Vine
 - [ ] PVF analysis
-- [ ] Soft PQF analysis
-- [ ] Comparison with SDFT
-- [ ] Connecting self-teacher and PI optimization
+- [ ] Distributional analysis, V-information
+
 
 ### Research
 
@@ -47,21 +45,15 @@
   - [x] value warmup
   - [ ] judge instruction
 
-- **PI conditioned Q function actor-critic**
-
-  - [ ] $\sum_{t=1}^T\mathbb{E_{\hat{y_{t}}\sim\pi_\theta}}[\nabla_\theta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t})\cdot(Q_\phi(\hat{y}_t, s_t)-\beta\text{log}\pi_{\theta}(\hat{y_{t}}|x,y_{<t}))]$
-  - [ ] Max Ent ablation
-  - [ ] Reward shaping
-  - [ ] Different Q construction
-  - [ ] Different Q fitting objective
-  - [ ] NLAC
+- **Soft Q, NLAC, reward shaping**
 
 - **Train self-teacher for hint generation**
   - [x] $R(h) = \alpha\,S(h)-\frac{|h|}{B}-\gamma\,T(h)$
+  - [x] Constrained optimization : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad \mathbb E_{h\sim g_\phi}[S(h)]\ge \tau$
   - [ ] Training objective theoretical justification
   - [x] Tune hyperparameters
-  - [ ] Other cost functions
-  - [x] Constrained optimization : $\min_\phi\;\mathbb E_{h\sim g_\phi}\left[C(h)+\gamma\,T(h)\right]\quad\text{subject to}\quad \mathbb E_{h\sim g_\phi}[S(h)]\ge \tau$
+  - [ ] Sufficiency proxy
+  - [ ] V information for minimal hint
   - [ ] Other objectives
   - [x] LoRA on top of self-teacher 
 

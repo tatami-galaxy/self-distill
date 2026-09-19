@@ -978,6 +978,8 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.dataset == "codeio":
+        parser.error("answer_logprobs analyzes math boxed-answer spans; CodeIO JSON spans are not supported. Use hint_gen_compare for CodeIO transfer scoring.")
     if len(set(args.pi_modes)) != len(args.pi_modes):
         parser.error("--pi-modes must not contain duplicates")
     if args.max_model_len is not None and args.max_model_len < 1:

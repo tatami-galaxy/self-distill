@@ -46,7 +46,7 @@ from datasets import Dataset, load_from_disk
 
 from utils import (
     DATASET_REGISTRY_TRAIN,
-    format_prompt_math,
+    format_prompt,
     grade,
     load_hint_cache,
     rollout_path,
@@ -157,7 +157,7 @@ def generate(args, out_dir: str) -> None:
     # The student prompt
     prompts = [
         tokenizer.apply_chat_template(
-            format_prompt_math(row["question"]), tokenize=False, add_generation_prompt=True
+            format_prompt(row["question"], args.dataset), tokenize=False, add_generation_prompt=True
         )
         for row in ds
     ]
@@ -168,7 +168,7 @@ def generate(args, out_dir: str) -> None:
     for question_idx, (row, output) in enumerate(zip(ds, outputs, strict=True)):
         question_id = hashlib.sha256(row["question"].encode()).hexdigest()[:20]
         for sample_idx, completion in enumerate(output.outputs):
-            _, correct = grade(completion.text, row["final_answer"])
+            _, correct = grade(completion.text, row["final_answer"], args.dataset)
             completion_ids = list(completion.token_ids)
             finish_reason = str(completion.finish_reason or "unknown")
             rows.append({
@@ -243,7 +243,7 @@ def score(args, out_dir: str) -> None:
     def student_prompt_ids(question: str) -> list[int]:
         if question not in prompt_cache:
             prompt_cache[question] = tokenizer.apply_chat_template(
-                [format_prompt_math(question)],
+                [format_prompt(question, args.dataset)],
                 add_generation_prompt=True, tokenize=True, return_dict=True,
             )["input_ids"][0]
         return prompt_cache[question]

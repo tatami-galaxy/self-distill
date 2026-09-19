@@ -43,6 +43,22 @@ def generated_hint_cache(generator: str):
     })
 
 
+class SdftRewardDatasetTest(unittest.TestCase):
+    def test_optional_reward_solution_preserves_sdft_default(self):
+        source = Dataset.from_list([
+            {"question": "q", "final_answer": "7", "solution": "worked"}
+        ])
+        with mock.patch.object(train_sdft, "load_train_dataset", return_value=source):
+            ordinary = train_sdft.build_sdft_dataset("answer")
+            with_reward = train_sdft.build_sdft_dataset("answer", include_reward_solution=True)
+
+        self.assertEqual(ordinary.column_names, ["prompt", "privileged_context"])
+        self.assertEqual(
+            set(with_reward.column_names), {"prompt", "privileged_context", "solution"}
+        )
+        self.assertEqual(with_reward[0]["solution"], r"\boxed{7}")
+
+
 class HintSdftDatasetTest(unittest.TestCase):
     def test_explicit_learned_generator_cache_is_loaded_and_wrapped(self):
         generator = "/models/hint-run/checkpoint-100"

@@ -30,7 +30,7 @@ import os
 
 import torch
 from transformers import AutoModelForSequenceClassification, set_seed
-from trl.rewards import accuracy_reward
+from utils import dataset_provenance, accuracy_reward_for_dataset
 
 from train.grpo.train_grpo import build_grpo_dataset
 from train.ppo.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
@@ -50,13 +50,16 @@ VALUE_SYSTEM_PROMPT = (
 VALUE_PROMPT_VERSION = "verifier_v1"
 
 
-def compose_value_messages(policy_messages):
+def compose_value_messages(policy_messages, dataset: str = "deepmath"):
     """Replace policy system messages with the critic's verifier instruction.
 
     Make fresh message dictionaries so constructing the critic input cannot mutate the
     policy conversation retained in the dataset or consumed by GRPOTrainer.
     """
-    return [{"role": "system", "content": VALUE_SYSTEM_PROMPT}] + [
+    instruction = VALUE_SYSTEM_PROMPT
+    if dataset == "codeio":
+        instruction = instruction.replace("mathematics verifier", "code output-prediction verifier").replace("final answer", "JSON output")
+    return [{"role": "system", "content": instruction}] + [
         dict(message) for message in policy_messages if message.get("role") != "system"
     ]
 
@@ -73,7 +76,8 @@ def compose_value_messages(policy_messages):
 class PPOValTrainer(PPOTrainer):
     """PPOTrainer whose critic reads the question under a verifier instruction."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, task_dataset="deepmath", **kwargs):
+        self.task_dataset = task_dataset
         super().__init__(*args, **kwargs)
         self._value_rows = None  # raw rows needed to build the critic-only prompt once
 
@@ -138,7 +142,7 @@ class PPOValTrainer(PPOTrainer):
         boundary, left padding, length logging) is the base class's `_render_value_prompts`,
         shared with every other arm that gives the critic its own prompt.
         """
-        conversations = [compose_value_messages(row["prompt"]) for row in rows]
+        conversations = [compose_value_messages(row["prompt"], getattr(self, "task_dataset", "deepmath")) for row in rows]
         ids, mask, _ = self._render_value_prompts(conversations, device)
         return ids, mask
 
@@ -162,9 +166,10 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "value_prompt_version": VALUE_PROMPT_VERSION,
         "model": args.model,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
-        "reward": "accuracy_reward",
+        "reward": "codeio_accuracy_reward" if args.dataset == "codeio" else "accuracy_reward",
         "gamma": args.gamma,
         "lam": args.lam,
         "vf_coef": args.vf_coef,
@@ -425,8 +430,9 @@ def main():
         print(f"Wrote run metadata -> {os.path.join(output_dir, 'run_meta.json')}")
 
     trainer = PPOValTrainer(
+        task_dataset=args.dataset,
         model=args.model,
-        reward_funcs=accuracy_reward,
+        reward_funcs=accuracy_reward_for_dataset(args.dataset),
         args=training_args,
         train_dataset=train_dataset,
         value_model=value_model,

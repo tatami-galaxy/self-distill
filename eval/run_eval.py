@@ -26,9 +26,10 @@ import time
 from vllm import LLM, SamplingParams
 from utils import (
     grade,
+    dataset_provenance,
     DATASET_REGISTRY_EVAL,
     DATASET_REGISTRY_TRAIN,
-    format_prompt_math,
+    format_prompt,
 )
 
 
@@ -171,9 +172,9 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-def build_prompt(problem: str, tokenizer, template_tok=None) -> str:
+def build_prompt(problem: str, tokenizer, template_tok=None, dataset: str = "deepmath") -> str:
     """Build a prompt string from a problem"""
-    messages = format_prompt_math(problem)
+    messages = format_prompt(problem, dataset)
     tok = template_tok or tokenizer
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     return tok.apply_chat_template(messages, **kwargs)
@@ -251,7 +252,7 @@ def evaluate_model(
     prompts = []
     for p in problems:
         prompts.append(build_prompt(
-            p["problem"], tokenizer, template_tok)
+            p["problem"], tokenizer, template_tok, p.get("dataset", "deepmath"))
         )
 
     # Generate
@@ -267,7 +268,7 @@ def evaluate_model(
         samples = []
         for completion in output.outputs:
             response = completion.text
-            pred_answer, correct = grade(response, prob["answer"])
+            pred_answer, correct = grade(response, prob["answer"], prob.get("dataset", "deepmath"))
             samples.append({
                 "response": response,
                 "pred_answer": pred_answer,
@@ -383,7 +384,7 @@ def save_results(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate models on math benchmarks")
+    parser = argparse.ArgumentParser(description="Evaluate models on math and CodeIO benchmarks")
     parser.add_argument(
         "--model", type=str, required=True,
         help="HuggingFace model name or local checkpoint path",
@@ -522,6 +523,7 @@ def main():
 
     eval_config = {
         "eval_dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "n": args.n,
         "k": args.k,
         "max_tokens": args.max_tokens,

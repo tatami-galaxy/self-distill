@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, LlamaConfig
@@ -13,6 +14,21 @@ from train.opsd.train_hint_gen.lib import (
 
 
 class HintTrainerLoRAConfigTest(unittest.TestCase):
+    def test_both_trainers_expose_dedicated_vllm_teacher_and_record_backend(self):
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "4", "WORLD_SIZE": "1"}):
+            for module in (train_hint_gen, train_constrained_hint_gen):
+                with self.subTest(trainer=module.__name__):
+                    args = module.build_parser().parse_args([
+                        "--teacher-backend", "vllm", "--teacher-gpu", "5",
+                        "--teacher-max-num-seqs", "16", "--teacher-enforce-eager",
+                    ])
+                    module.validate_args(args)
+                    meta = module.build_run_meta(args, num_train_examples=2)
+                    self.assertEqual(meta["teacher_backend"], "vllm")
+                    self.assertEqual(meta["teacher_max_num_seqs"], 16)
+                    self.assertTrue(meta["teacher_enforce_eager"])
+                    self.assertEqual(meta["teacher_top_k"], 20)
+
     def test_both_trainers_expose_matching_lora_configuration(self):
         for trainer in (train_hint_gen, train_constrained_hint_gen):
             with self.subTest(trainer=trainer.__name__):

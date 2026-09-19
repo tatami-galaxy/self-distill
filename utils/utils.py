@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -263,13 +263,16 @@ def extract_answer(text: str) -> str | None:
     return str(parsed[-1]) if parsed else None
 
 
-def grade(response: str, gold: str) -> tuple[str | None, bool]:
+def grade(response: str, gold: str, dataset: str = "deepmath") -> tuple[str | None, bool]:
     """Extract the answer from ``response`` and grade it against ``gold``.
 
     Uses the TRL accuracy-reward logic (math_verify ``parse`` + ``verify``).
     Returns ``(pred_str, correct)``; ``pred_str`` is ``None`` on an extraction
     failure and ``correct`` is ``False`` if the gold answer can't be parsed.
     """
+    if dataset == "codeio":
+        from utils.codeio import grade_output
+        return grade_output(response, gold)
     parsing_timeout, verify_timeout = _timeouts()
     # Our gold answers are bare values (e.g. "\frac{1}{2}", "(3,\pi/2)", "204").
     # Wrapping in \boxed{} lets math_verify parse every form (fractions, roots,
@@ -350,7 +353,7 @@ def load_train_dataset(
     that actually have a demo -- otherwise on DeepScaleR the prefix would be ~82%
     solution-less. For DeepMath the drop is a no-op, so the prefix is unchanged."""
     loader = DATASET_REGISTRY_TRAIN[dataset]
-    if not require_solution:
+    if not require_solution or dataset == "codeio":
         return loader(max_samples=max_samples)
     ds = loader()
     ds = ds.filter(has_solution, num_proc=4)
@@ -437,6 +440,25 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Train loaders
 # ---------------------------------------------------------------------------
+
+
+@register_dataset_train("codeio")
+def load_codeio_train(max_samples: int | None = None):
+    from utils.codeio import load_codeio
+    return load_codeio(max_samples, split="train")
+
+
+@register_dataset_eval("codeio")
+def load_codeio_eval(max_samples: int = 256) -> list[dict]:
+    """Fixed prefix of the function-disjoint holdout; see docs/codeio.md."""
+    import hashlib
+    from utils.codeio import load_codeio
+    return [
+        {"problem": row["question"], "answer": row["final_answer"],
+         "dataset": "codeio",
+         "unique_id": "codeio_" + hashlib.sha256(row["question"].encode()).hexdigest()[:24]}
+        for row in load_codeio(max_samples, split="test")
+    ]
 
 
 @register_dataset_train("deepmath")

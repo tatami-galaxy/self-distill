@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -10,6 +11,22 @@ from eval import hint_gen_compare
 
 
 class IdentityAndDefinitionTest(unittest.TestCase):
+    def test_legacy_hint_validity_cache_is_rejected_before_loading_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "fresh_base"
+            data.mkdir()
+            metadata = root / "fresh_base_meta.json"
+            metadata.write_text(json.dumps({"config": {"schema_version": 1}}))
+            with (
+                patch.object(hint_gen_compare, "expected_generator_ids", return_value=["fresh_base"]),
+                patch.object(hint_gen_compare, "hint_paths", return_value=(data, metadata)),
+                patch.object(hint_gen_compare, "load_from_disk") as load,
+            ):
+                with self.assertRaisesRegex(ValueError, "older answer-leak validator"):
+                    hint_gen_compare.load_all_hints(SimpleNamespace())
+                load.assert_not_called()
+
     def test_question_and_hint_ids_are_stable_and_sample_specific(self):
         question_id = hint_gen_compare.stable_question_id(7, "question", "answer")
         self.assertEqual(
@@ -200,6 +217,7 @@ class CheckpointSpecTest(unittest.TestCase):
             )
             self.assertEqual(config["generator_base_model"], "base")
             self.assertEqual(config["generator_adapter_rank"], 16)
+            self.assertEqual(config["hint_validation_version"], hint_gen_compare.HINT_VALIDATION_VERSION)
             self.assertEqual(
                 config["generator_adapter_path"], str(checkpoint.resolve())
             )

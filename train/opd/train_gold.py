@@ -56,8 +56,10 @@ from torch import nn
 from trl.experimental.gold import GOLDConfig, GOLDTrainer
 
 from utils import (
+    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
-    format_prompt_math,
+    format_prompt,
+    reward_solution,
     load_train_dataset,
     validate_resume,
 )
@@ -84,6 +86,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "model": args.model,
         "teacher_model": args.teacher_model,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
         "use_uld_loss": False,
@@ -189,8 +192,8 @@ def build_gold_dataset(dataset: str = "deepmath", max_samples: int | None = None
     ds = load_train_dataset(dataset, max_samples=max_samples)
 
     def _map(row):
-        messages = format_prompt_math(row["question"]) + [
-            {"role": "assistant", "content": "\\boxed{" + str(row["final_answer"]) + "}"}
+        messages = format_prompt(row["question"], dataset) + [
+            {"role": "assistant", "content": ('{"output": ' + row["final_answer"] + "}" if dataset == "codeio" else reward_solution(str(row["final_answer"]), dataset))}
         ]
         return {"messages": messages}
 

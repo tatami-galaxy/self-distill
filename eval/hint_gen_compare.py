@@ -65,12 +65,13 @@ from utils import (
     DATASET_REGISTRY_TRAIN,
     PI_HINT,
     compose_pi_messages,
-    format_prompt_math,
+    format_prompt,
     grade,
     load_hint_cache,
     load_train_dataset,
     rollout_path,
 )
+from utils.gen_hints import HINT_VALIDATION_VERSION
 from utils.gen_hints import build_messages as build_hint_generator_messages
 from utils.model_adapters import resolve_model_adapter, vllm_model_and_adapter
 
@@ -513,6 +514,7 @@ def generation_config(
     model_spec = resolve_model_adapter(generator_model)
     return {
         "schema_version": SCHEMA_VERSION,
+        "hint_validation_version": HINT_VALIDATION_VERSION,
         "generator_id": generator_id,
         "generator_model": generator_model,
         "generator_base_model": model_spec.base_model,
@@ -564,7 +566,7 @@ def generate_phase(args: argparse.Namespace) -> None:
             f"{model_spec.base_model}"
         )
     conversations = [
-        build_hint_generator_messages(row["question"], row["solution"])
+        build_hint_generator_messages(row["question"], row["solution"], args.dataset)
         for row in cohort
     ]
     prompt_budget = args.max_model_len - args.hint_max_tokens
@@ -601,7 +603,7 @@ def generate_phase(args: argparse.Namespace) -> None:
             raise RuntimeError("vLLM returned the wrong number of hint samples.")
         for sample_idx, candidate in enumerate(output.outputs):
             hint = candidate.text.strip()
-            reason = invalid_hint_reason(hint, problem["final_answer"])
+            reason = invalid_hint_reason(hint, problem["final_answer"], args.dataset)
             token_ids = list(candidate.token_ids)
             rows.append(
                 {
@@ -650,8 +652,13 @@ def load_all_hints(args: argparse.Namespace) -> tuple[list[dict], dict[str, dict
             raise FileNotFoundError(
                 f"Missing hints for generator {generator_id!r}: {path}"
             )
-        dataset = load_from_disk(str(path))
         meta = read_json(meta_path)
+        if meta.get("config", {}).get("hint_validation_version") != HINT_VALIDATION_VERSION:
+            raise ValueError(
+                f"Hint cache for {generator_id!r} uses an older answer-leak validator. "
+                "Regenerate with --phase sweep --force before comparing results."
+            )
+        dataset = load_from_disk(str(path))
         if meta.get("hint_fingerprint") != hint_fingerprint(dataset):
             raise ValueError(f"Hint fingerprint mismatch for {generator_id!r}.")
         rows.extend(dict(row) for row in dataset)
@@ -667,8 +674,8 @@ def load_all_hints(args: argparse.Namespace) -> tuple[list[dict], dict[str, dict
 # ---------------------------------------------------------------------------
 
 
-def hinted_teacher_messages(question: str, hint: str) -> list[dict]:
-    return compose_pi_messages(format_prompt_math(question), PI_HINT.format(hint=hint))
+def hinted_teacher_messages(question: str, hint: str, dataset: str = "deepmath") -> list[dict]:
+    return compose_pi_messages(format_prompt(question, dataset), PI_HINT.format(hint=hint))
 
 
 def sufficiency_config(args: argparse.Namespace, cohort_fp: str, hints_fp: str) -> dict:
@@ -682,6 +689,7 @@ def sufficiency_config(args: argparse.Namespace, cohort_fp: str, hints_fp: str) 
         "teacher_max_tokens": args.teacher_max_tokens,
         "temperature": args.teacher_temperature,
         "top_p": args.teacher_top_p,
+        "top_k": args.teacher_top_k,
         "seed": args.teacher_seed,
         "max_model_len": args.max_model_len,
         "save_teacher_samples": args.save_teacher_samples,
@@ -709,7 +717,7 @@ def sufficiency_phase(args: argparse.Namespace) -> None:
                 "question_id": problem["question_id"],
                 "generator_id": "no_hint",
                 "hint_sample_idx": -1,
-                "messages": format_prompt_math(problem["question"]),
+                "messages": format_prompt(problem["question"], args.dataset),
             }
         )
     for hint in hints:
@@ -721,7 +729,7 @@ def sufficiency_phase(args: argparse.Namespace) -> None:
                 "question_id": hint["question_id"],
                 "generator_id": hint["generator_id"],
                 "hint_sample_idx": int(hint["hint_sample_idx"]),
-                "messages": hinted_teacher_messages(problem["question"], hint["hint"]),
+                "messages": hinted_teacher_messages(problem["question"], hint["hint"], args.dataset),
             }
         )
 
@@ -756,6 +764,7 @@ def sufficiency_phase(args: argparse.Namespace) -> None:
         max_tokens=args.teacher_max_tokens,
         temperature=args.teacher_temperature,
         top_p=args.teacher_top_p,
+        top_k=args.teacher_top_k if args.teacher_top_k > 0 else -1,
         seed=args.teacher_seed,
     )
     outputs = llm.generate(prompts, sampling)
@@ -764,7 +773,7 @@ def sufficiency_phase(args: argparse.Namespace) -> None:
         problem = problems[condition["question_id"]]
         completions = list(output.outputs)
         correct = [
-            bool(grade(candidate.text, problem["final_answer"])[1])
+            bool(grade(candidate.text, problem["final_answer"], args.dataset)[1])
             for candidate in completions
         ]
         row = {
@@ -927,7 +936,7 @@ def transfer_phase(args: argparse.Namespace) -> None:
                 f"Not enough rollouts for question_id={problem['question_id']}"
             )
         prompt_ids = _render_prompt_ids(
-            tokenizer, format_prompt_math(problem["question"])
+            tokenizer, format_prompt(problem["question"], args.dataset)
         )
         scored = []
         for rollout_position, index in enumerate(indices):
@@ -951,7 +960,7 @@ def transfer_phase(args: argparse.Namespace) -> None:
     for hint_number, hint in enumerate(hints, start=1):
         problem = problems[hint["question_id"]]
         prompt_ids = _render_prompt_ids(
-            tokenizer, hinted_teacher_messages(problem["question"], hint["hint"])
+            tokenizer, hinted_teacher_messages(problem["question"], hint["hint"], args.dataset)
         )
         for rollout_position, completion_ids, student_logps in selected_rollouts[
             hint["question_id"]
@@ -1461,6 +1470,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-max-tokens", type=int, default=8192)
     parser.add_argument("--teacher-temperature", type=float, default=1.0)
     parser.add_argument("--teacher-top-p", type=float, default=1.0)
+    parser.add_argument("--teacher-top-k", type=int, default=20, help="Teacher top-k; 0 disables filtering.")
     parser.add_argument("--teacher-seed", type=int, default=314159)
     parser.add_argument("--save-teacher-samples", action="store_true")
     parser.add_argument("--transfer-rollouts", type=int, default=4)
@@ -1512,6 +1522,8 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--max-model-len must leave room for the teacher prompt")
     if args.generator_temperature <= 0 or args.teacher_temperature <= 0:
         parser.error("Sampling temperatures must be > 0")
+    if args.teacher_top_k < 0:
+        parser.error("--teacher-top-k must be >= 0 (0 disables filtering)")
     for value, name in (
         (args.generator_top_p, "--generator-top-p"),
         (args.teacher_top_p, "--teacher-top-p"),

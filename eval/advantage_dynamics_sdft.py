@@ -60,8 +60,8 @@ from typing import Any, Iterable
 
 from datasets import Dataset, load_from_disk
 
-from train.opsd.train_sdft import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT
-from utils import compose_pi_messages, format_prompt_math, grade, load_hint_cache, load_train_dataset, rollout_path
+from train.opsd.train_sdft import PI_FULL, PI_HINT, PI_ROLLOUT
+from utils import answer_context, compose_pi_messages, format_prompt, grade, load_hint_cache, load_train_dataset, rollout_path
 
 
 PI_MODES = ("none", "answer", "hint", "full", "rollout")
@@ -334,7 +334,7 @@ def privileged_context(problem: dict, pi_mode: str) -> str:
     if pi_mode == "none":
         return ""
     if pi_mode == "answer":
-        return PI_ANSWER.format(answer=problem["final_answer"])
+        return answer_context(problem["final_answer"], problem.get("dataset", "deepmath"))
     if pi_mode == "hint":
         return PI_HINT.format(hint=problem["hint"])
     if pi_mode == "full":
@@ -346,7 +346,7 @@ def privileged_context(problem: dict, pi_mode: str) -> str:
 
 def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
     """Build the teacher conversation while leaving the student prompt unchanged."""
-    student = format_prompt_math(problem["question"])
+    student = format_prompt(problem["question"], problem.get("dataset", "deepmath"))
     if pi_mode == "none":
         return student
     return compose_pi_messages(student, privileged_context(problem, pi_mode))
@@ -437,6 +437,7 @@ def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
         hint_row = hints[question_idx]
         problem = {
             "question_idx": question_idx,
+            "dataset": run["dataset"],
             "question": str(hint_row["question"]),
             "final_answer": str(hint_row["final_answer"]),
             "hint": str(hint_row["hint"]),
@@ -460,7 +461,7 @@ def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
         question_id = stable_question_id(problem["question"], problem["final_answer"])
         if question_id in seen_ids:
             question_id = _sha256_text(f"{question_id}\0{question_idx}")[:24]
-        student_messages = format_prompt_math(problem["question"])
+        student_messages = format_prompt(problem["question"], problem.get("dataset", "deepmath"))
         student_ids = tokenizer.apply_chat_template(
             [student_messages], add_generation_prompt=True, tokenize=True, return_dict=True
         )["input_ids"][0]
@@ -607,7 +608,7 @@ def generate_phase(args: argparse.Namespace, run: dict, step: int) -> None:
             if not completion_ids:
                 raise RuntimeError(f"Empty completion for {problem['question_id']}/{sample_idx}")
             finish_reason = str(completion.finish_reason or "unknown")
-            _, correct = grade(completion.text, problem["final_answer"])
+            _, correct = grade(completion.text, problem["final_answer"], run["dataset"])
             rows.append(
                 {
                     "rollout_id": stable_rollout_id(

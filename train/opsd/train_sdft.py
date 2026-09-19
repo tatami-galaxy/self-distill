@@ -59,14 +59,17 @@ from datasets import load_from_disk
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from utils import (
+    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
-    PI_ANSWER,
+    PI_ANSWER as PI_ANSWER,
     PI_FULL,
     PI_HINT,
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
     compose_pi_messages,
-    format_prompt_math,
+    format_prompt,
+    answer_context,
+    reward_solution,
     hint_path,
     load_hint_cache,
     load_train_dataset,
@@ -120,13 +123,17 @@ def build_sdft_dataset(
     `max_samples`, so the result may hold fewer rows.
     """
     if pi_mode == "hint":
-        return build_hint_dataset(
+        ds = build_hint_dataset(
             model,
             dataset,
             max_samples,
             hint_generator_model=hint_generator_model,
             hint_cache=hint_cache,
             include_reward_solution=include_reward_solution,
+        )
+        return filter_long_pi_prompts(
+            ds, pi_mode,
+            model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio"),
         )
     if pi_mode == "rollout":
         ds = build_rollout_dataset(
@@ -138,7 +145,7 @@ def build_sdft_dataset(
             include_reward_solution=include_reward_solution,
         )
         return filter_long_pi_prompts(
-            ds, pi_mode, model=model, max_prompt_length=max_prompt_length
+            ds, pi_mode, model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio")
         )
     if pi_mode not in ("full", "answer"):
         raise ValueError(
@@ -152,21 +159,21 @@ def build_sdft_dataset(
 
     def _map(row):
         if pi_mode == "answer":
-            privileged_context = PI_ANSWER.format(answer=str(row["final_answer"]))
+            privileged_context = answer_context(str(row["final_answer"]), dataset)
         else:  # full
             privileged_context = PI_FULL.format(demo=row["solution"])
         example = {
-            "prompt": format_prompt_math(row["question"]),
+            "prompt": format_prompt(row["question"], dataset),
             "privileged_context": privileged_context,
         }
         if include_reward_solution:
-            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+            example["solution"] = reward_solution(str(row["final_answer"]), dataset)
         return example
 
     ds = ds.map(_map, remove_columns=ds.column_names)
 
     return filter_long_pi_prompts(
-        ds, pi_mode, model=model, max_prompt_length=max_prompt_length
+        ds, pi_mode, model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio")
     )
 
 
@@ -175,9 +182,10 @@ def filter_long_pi_prompts(
     pi_mode: str,
     model: str | None,
     max_prompt_length: int | None,
+    force: bool = False,
 ):
     """Drop long-PI rows that SDFTTrainer would otherwise silently left-truncate."""
-    if pi_mode not in ("full", "rollout") or model is None or max_prompt_length is None:
+    if (not force and pi_mode not in ("full", "rollout")) or model is None or max_prompt_length is None:
         return ds
 
     from transformers import AutoTokenizer
@@ -313,11 +321,11 @@ def build_rollout_dataset(
                 f"rollout={cached_question!r}."
             )
         example = {
-            "prompt": format_prompt_math(row["question"]),
+            "prompt": format_prompt(row["question"], dataset),
             "privileged_context": PI_ROLLOUT.format(attempt=attempt),
         }
         if include_reward_solution:
-            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+            example["solution"] = reward_solution(str(row["final_answer"]), dataset)
         return example
 
     return questions.map(_map, with_indices=True, remove_columns=questions.column_names)
@@ -404,11 +412,11 @@ def build_hint_dataset(
 
     def _map(row):
         example = {
-            "prompt": format_prompt_math(row["question"]),
+            "prompt": format_prompt(row["question"], dataset),
             "privileged_context": PI_HINT.format(hint=row["hint"]),
         }
         if include_reward_solution:
-            example["solution"] = "\\boxed{" + str(row["final_answer"]) + "}"
+            example["solution"] = reward_solution(str(row["final_answer"]), dataset)
         return example
 
     return ds.map(_map, remove_columns=ds.column_names)
@@ -449,6 +457,7 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "hint_cache": hint_cache_path,
         "hint_source": hint_source,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "rollout_pi_root": (
             args.rollout_pi_root if args.pi_mode == "rollout" else None

@@ -36,12 +36,15 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m utils.gen_hints \
 import argparse
 import os
 import re
+from decimal import Decimal, InvalidOperation
 
 from datasets import Dataset, load_from_disk
 from vllm import LLM, SamplingParams
 
 from utils import DATASET_REGISTRY_TRAIN, hint_path, load_train_dataset
 from utils.model_adapters import vllm_model_and_adapter
+
+HINT_VALIDATION_VERSION = 2
 
 HINT_SYSTEM = (
     "You are given a math problem and a full worked solution. Extract a "
@@ -59,29 +62,93 @@ HINT_USER = (
 )
 
 
-def build_messages(problem: str, solution: str) -> list[dict]:
+def build_messages(problem: str, solution: str, dataset: str = "deepmath") -> list[dict]:
+    if dataset == "codeio":
+        return [
+            {"role": "system", "content": "You are given a code output-prediction task and a verified worked response. Extract a SHORT list of useful reasoning hints."},
+            {"role": "user", "content": f"Task:\n{problem}\n\nVerified response (for reference only):\n{solution}\n\nGive only a few brief hints about control flow, intermediate states, or relevant concepts. Do NOT state the final output or an output JSON answer."},
+        ]
     return [
         {"role": "system", "content": HINT_SYSTEM},
         {"role": "user", "content": HINT_USER.format(problem=problem, solution=solution)},
     ]
 
 
-def leaks_answer(hint: str, gold: str) -> bool:
-    """True if the hint reveals the final answer.
+# Decimal points followed by digits belong to numbers; sentence-final periods do not.
+_NUMBER = re.compile(r"(?<![\w.])[-+]?\d+(?:\.\d+)?(?!\w|\.\d)")
+_ANSWER_STATEMENT = re.compile(
+    r"\b(?:answer|final\s+(?:answer|result|value))\s*"
+    r"(?:is(?:\s+equal\s+to)?|equals|=|:)\s*",
+    re.IGNORECASE,
+)
 
-    `\\boxed` is always a leak. For the gold value we require a word-boundary
-    match and skip golds shorter than 2 chars: single-digit answers (0-9) appear
-    incidentally in almost every hint, so substring-matching them would drop
-    nearly everything -- there we rely on the no-answer instruction instead.
-    Dropping is the safe error (lost data, no confound); missing a leak is not,
-    so the check errs toward dropping for distinctive answers.
+
+def _small_integer_words(value: Decimal) -> str | None:
+    """Recognize common spelled-out answers without a language-model verifier."""
+    if value != value.to_integral_value() or not 0 <= value < 100:
+        return None
+    units = (
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
+    ).split()
+    number = int(value)
+    if number < 20:
+        return units[number]
+    tens = "zero ten twenty thirty forty fifty sixty seventy eighty ninety".split()
+    return tens[number // 10] + (rf"[ -]+{units[number % 10]}" if number % 10 else "")
+
+
+def leaks_answer(hint: str, gold: str, dataset: str = "deepmath") -> bool:
+    """Reject boxed answers, distinctive gold values, and explicit short answers.
+
+    Single-digit values remain allowed as incidental intermediate quantities, but
+    not as a standalone hint or in an explicit answer statement. This is a lexical
+    guard, not a guarantee against every mathematical or semantic paraphrase.
     """
+    if dataset == "codeio":
+        from utils.codeio import leaks_output
+        return leaks_output(hint, gold)
     if "\\boxed" in hint:
         return True
     g = str(gold).strip()
-    return len(g) >= 2 and re.search(
-        rf"(?<![\w.]){re.escape(g)}(?![\w.])", hint
-    ) is not None
+    if not g:
+        return False
+    try:
+        numeric_gold = Decimal(g)
+        if not numeric_gold.is_finite():
+            numeric_gold = None
+    except InvalidOperation:
+        numeric_gold = None
+
+    # Keep the conservative distinctive-value check, including punctuation, and
+    # recognize equivalent numeric spellings such as 017 and 17.0.
+    if len(g) >= 2:
+        if numeric_gold is not None:
+            if any(Decimal(match.group()) == numeric_gold for match in _NUMBER.finditer(hint)):
+                return True
+        elif re.search(rf"(?<![\w.]){re.escape(g)}(?!\w|\.\d)", hint):
+            return True
+
+    text = hint
+    for marker in ("\\(", "\\)", "\\[", "\\]", "$", "*", "`", "{", "}"):
+        text = text.replace(marker, "")
+    candidates = [(text.strip(), True)]
+    candidates.extend((text[match.end():].lstrip(), False) for match in _ANSWER_STATEMENT.finditer(text))
+    word_form = _small_integer_words(numeric_gold) if numeric_gold is not None else None
+    for candidate, standalone in candidates:
+        match = _NUMBER.match(candidate) if numeric_gold is not None else None
+        if match and Decimal(match.group()) == numeric_gold:
+            if not standalone or not candidate[match.end():].strip(" .!?;:"):
+                return True
+        if word_form:
+            match = re.match(rf"(?:{word_form})(?![\w-])", candidate, re.IGNORECASE)
+            if match and (not standalone or not candidate[match.end():].strip(" .!?;:")):
+                return True
+        elif numeric_gold is None:
+            match = re.match(rf"{re.escape(g)}(?!\w|\.\d)", candidate)
+            if match and (not standalone or not candidate[match.end():].strip(" .!?;:")):
+                return True
+    return False
 
 
 def strip_thinking(text: str) -> str | None:
@@ -138,7 +205,11 @@ def main():
     if not args.force and os.path.isdir(out_dir):
         cached = load_from_disk(out_dir)
         same_model = set(cached.unique("gen_model")) == {args.model}
-        if same_model and len(cached) >= args.max_samples:
+        same_validation = (
+            "hint_validation_version" in cached.column_names
+            and set(cached.unique("hint_validation_version")) == {HINT_VALIDATION_VERSION}
+        )
+        if same_model and same_validation and len(cached) >= args.max_samples:
             print(f"Reusing {len(cached)} cached hints at {out_dir} "
                   f"(>= {args.max_samples}, model matches). Use --force to regenerate.")
             return
@@ -168,7 +239,7 @@ def main():
     rows, conversations = [], []
     n_too_long = 0
     for row in ds:
-        messages = build_messages(row["question"], row["solution"])
+        messages = build_messages(row["question"], row["solution"], args.dataset)
         # return_dict + input_ids gives the real token count (a bare tokenize=True
         # returns a BatchEncoding whose len() is the field count). enable_thinking
         # is passed straight through to the Qwen chat template, matching llm.chat below.
@@ -206,7 +277,7 @@ def main():
         if not hint:
             n_empty += 1
             continue
-        if leaks_answer(hint, row["final_answer"]):
+        if leaks_answer(hint, row["final_answer"], args.dataset):
             n_leaked += 1
             continue
         kept.append({
@@ -215,6 +286,7 @@ def main():
             "hint": hint,
             "gen_model": args.model,
             "dataset": args.dataset,
+            "hint_validation_version": HINT_VALIDATION_VERSION,
         })
     print(f"Generated {len(outputs)} hints -> kept {len(kept)} "
           f"(dropped {n_leaked} answer leaks, {n_empty} empty, {n_unclosed} unclosed-thinking)")

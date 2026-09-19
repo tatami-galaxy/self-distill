@@ -16,6 +16,7 @@ from train.opsd.train_hint_gen.lib import (
     index_student_rollouts,
     invalid_hint_reason,
     normalized_hint_cost,
+    rank_invalid_hints,
     sampled_reverse_kl,
 )
 
@@ -25,6 +26,11 @@ class FakeBackend:
         self.sufficiency = sufficiency
         self.transfer = transfer
         self.calls = []
+        self.last_metrics = {}
+
+    def score_hints(self, questions, answers, hints):
+        return [(self.score_sufficiency(q, a, h), self.score_transfer(q, h))
+                for q, a, h in zip(questions, answers, hints, strict=True)]
 
     def score_sufficiency(self, question, final_answer, hint):
         self.calls.append(("s", question, final_answer, hint))
@@ -144,7 +150,7 @@ class CompositeHintRewardTest(unittest.TestCase):
         self.assertEqual(metrics["hint/invalid_fraction"], 0.0)
         self.assertEqual(len(backend.calls), 2)
 
-    def test_invalid_hint_gets_penalty_without_teacher_call(self):
+    def test_all_invalid_group_has_zero_reward_without_teacher_call(self):
         config = HintRewardConfig(
             model="m", dataset="d", hint_budget=8, invalid_penalty=1.5
         )
@@ -159,7 +165,7 @@ class CompositeHintRewardTest(unittest.TestCase):
             final_answer=["17"],
         )
 
-        self.assertEqual(values, [-2.0])
+        self.assertEqual(values, [0.0])
         self.assertEqual(backend.calls, [])
 
 
@@ -198,7 +204,7 @@ class ConstrainedHintRewardTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["hint/dual_lambda_next"], 1.995)
         self.assertEqual(len(backend.calls), 2)
 
-    def test_invalid_hint_gets_constraint_violation_and_invalid_penalty(self):
+    def test_all_invalid_group_still_updates_constraint_multiplier(self):
         config = ConstrainedHintRewardConfig(
             model="m",
             dataset="d",
@@ -219,7 +225,7 @@ class ConstrainedHintRewardTest(unittest.TestCase):
             final_answer=["17"],
         )
 
-        self.assertEqual(values, [-3.5])
+        self.assertEqual(values, [0.0])
         self.assertAlmostEqual(reward.dual_lambda, 2.075)
         self.assertEqual(backend.calls, [])
 
@@ -248,6 +254,114 @@ class ConstrainedHintRewardTest(unittest.TestCase):
             ConstrainedHintRewardConfig(
                 model="m", dataset="d", dual_init=2.0, dual_max=1.0
             ).validate()
+
+
+class AnswerLeakRegressionTest(unittest.TestCase):
+    def test_rejects_sentence_punctuation_and_equivalent_numeric_answers(self):
+        for text in [
+            "The answer is 17.", "The answer is 17!", "The answer is 17,",
+            "The answer is 017.", "The answer is 17.0.",
+            "The answer is seventeen.", "17.",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(invalid_hint_reason(text, "17"), "answer_leak")
+
+    def test_rejects_explicit_single_digit_answers_but_allows_intermediate_numbers(self):
+        for text in [
+            "The final answer is 7.", "Answer: 7.", r"The answer is $7$.",
+            r"The answer is \(7\).", "The answer is **7**.",
+            "The final value equals seven.", "7", "seven.",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(invalid_hint_reason(text, "7"), "answer_leak")
+        for text in ["Work modulo 7.", "Consider 7 cases.", "Use 7 as an intermediate value."]:
+            with self.subTest(text=text):
+                self.assertIsNone(invalid_hint_reason(text, "7"))
+
+    def test_does_not_match_substrings_or_parts_of_decimal_numbers(self):
+        for text in ["Use 117 cases.", "Consider 17.5.", "Use 0.17.", "Use .17.", "Use x17.", "Consider -17."]:
+            with self.subTest(text=text):
+                self.assertIsNone(invalid_hint_reason(text, "17"))
+        self.assertIsNone(invalid_hint_reason("The answer is 7.5.", "7"))
+        self.assertIsNone(invalid_hint_reason("The answer is found using parity.", "7"))
+
+    def test_non_numeric_answers_and_boxed_answers(self):
+        self.assertEqual(invalid_hint_reason("The answer is x+y.", "x+y"), "answer_leak")
+        self.assertEqual(invalid_hint_reason(r"Thus \boxed{7}.", "7"), "answer_leak")
+        self.assertEqual(invalid_hint_reason("The answer is forty-two.", "42"), "answer_leak")
+
+
+class InvalidRewardRankingRegressionTest(unittest.TestCase):
+    def test_invalid_hints_have_negative_advantages_even_with_large_transfer_costs(self):
+        for reward_type, config_type in [
+            (CompositeHintReward, HintRewardConfig),
+            (ConstrainedHintReward, ConstrainedHintRewardConfig),
+        ]:
+            for gamma in [7.0, 1000.0]:
+                with self.subTest(reward=reward_type.__name__, gamma=gamma):
+                    config = config_type(model="m", dataset="deepmath", gamma=gamma)
+                    backend = FakeBackend(sufficiency=0.75, transfer=0.3)
+                    reward = reward_type(config, backend)
+                    extras = {}
+                    values = reward(
+                        prompts=[[]] * 4,
+                        completions=["Use parity.", "The answer is 17.", "", "Use symmetry."],
+                        completion_ids=[[1] * 32, [2] * 8, [3], [4] * 64],
+                        question=["q"] * 4, final_answer=["17"] * 4,
+                        log_extra=lambda name, value: extras.__setitem__(name, value),
+                    )
+                    self.assertEqual(values[1], values[2])
+                    self.assertLess(values[1], min(values[0], values[3]))
+                    rewards = torch.tensor(values, dtype=torch.float32)
+                    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+                    self.assertTrue((advantages[[1, 2]] < 0).all())
+                    self.assertEqual(len(backend.calls), 4)  # Only the two valid hints scored.
+                    self.assertEqual(extras['hint_raw_reward'][1:3], [None, None])
+                    self.assertEqual(extras['hint_reward'], values)
+                    self.assertEqual(extras['hint_cost'][1:3], [8 / 128, 1 / 128])
+                    if isinstance(reward, ConstrainedHintReward):
+                        self.assertAlmostEqual(reward.dual_lambda, 1 + 0.05 * (0.7 - 0.375))
+                        self.assertEqual(reward.dual_updates, 1)
+
+    def test_all_invalid_hints_have_zero_advantage_regardless_of_length(self):
+        for reward_type, config_type in [
+            (CompositeHintReward, HintRewardConfig),
+            (ConstrainedHintReward, ConstrainedHintRewardConfig),
+        ]:
+            with self.subTest(reward=reward_type.__name__):
+                backend = FakeBackend()
+                reward = reward_type(config_type(model="m", dataset="deepmath"), backend)
+                values = reward(
+                    prompts=[[]] * 3, completions=["", "The answer is 7.", "<think>hidden</think>"],
+                    completion_ids=[[1], [2] * 20, [3] * 128],
+                    question=["q"] * 3, final_answer=["7"] * 3,
+                )
+                self.assertEqual(values, [0.0, 0.0, 0.0])
+                self.assertEqual(backend.calls, [])
+                if isinstance(reward, ConstrainedHintReward):
+                    self.assertAlmostEqual(reward.dual_lambda, 1.035)
+                    self.assertEqual(reward.dual_updates, 1)
+
+    def test_separate_questions_do_not_share_reward_floors(self):
+        values = rank_invalid_hints(
+            [-10, 0, 5, 0, 0], [0, 1, 0, 1, 1], ['a', 'a', 'b', 'b', 'c'], 1.0,
+        )
+        self.assertEqual(values, [-10, -11, 5, 4, 0])
+
+    def test_floor_remains_strict_after_trl_float32_conversion(self):
+        values = rank_invalid_hints([-1e10, 0], [0, 1], ['q', 'q'], 1.0)
+        values = torch.tensor(values, dtype=torch.float32)
+        self.assertLess(values[1], values[0])
+
+    def test_rejects_nonfinite_rewards_and_nonpositive_margins(self):
+        for value in [float('nan'), float('inf')]:
+            with self.assertRaisesRegex(ValueError, 'finite'):
+                rank_invalid_hints([value, 0], [0, 1], ['q', 'q'], 1.0)
+        for config_type in [HintRewardConfig, ConstrainedHintRewardConfig]:
+            for margin in [0, -1, float('nan'), float('inf')]:
+                with self.subTest(config=config_type.__name__, margin=margin):
+                    with self.assertRaisesRegex(ValueError, 'invalid_penalty'):
+                        config_type(model='m', dataset='deepmath', invalid_penalty=margin).validate()
 
 
 if __name__ == "__main__":

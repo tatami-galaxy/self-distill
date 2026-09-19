@@ -10,6 +10,7 @@ here would drag an inference engine into every `import utils`. Run it as `python
 utils.gen_hints`.
 """
 
+from utils.tasks import dataset_provenance, accuracy_reward_for_dataset, answer_context, format_prompt, reward_solution
 from utils.pi import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT
 from utils.utils import (
     # dataset registries and loaders
@@ -37,6 +38,11 @@ from utils.utils import (
 )
 
 __all__ = [
+    "accuracy_reward_for_dataset",
+    "dataset_provenance",
+    "answer_context",
+    "format_prompt",
+    "reward_solution",
     "DATASET_REGISTRY_EVAL",
     "DATASET_REGISTRY_TRAIN",
     "MATH_SYSTEM_PROMPT",

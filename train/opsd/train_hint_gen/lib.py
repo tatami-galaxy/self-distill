@@ -7,7 +7,8 @@ frozen copy of the original policy then supplies the two expensive reward terms:
 * transfer: sampled-token reverse KL on frozen-student rollouts.
 
 The frozen model is loaded lazily. In colocated vLLM mode, TRL calls the reward only
-after its generation engine has entered level-2 sleep, leaving room for the teacher.
+after its generation engine has entered level-2 sleep, leaving room for HF transfer
+scoring. Optional sufficiency generation runs in a frozen vLLM worker on a second GPU.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -27,7 +30,7 @@ from datasets import Dataset, load_from_disk
 from utils import (
     PI_HINT,
     compose_pi_messages,
-    format_prompt_math,
+    format_prompt,
     grade,
     load_train_dataset,
     rollout_path,
@@ -35,10 +38,63 @@ from utils import (
 from utils.gen_hints import build_messages, leaks_answer
 from utils.model_scoring import per_token_logps
 
-HINT_GEN_VERSION = "composite_sct_v1"
-CONSTRAINED_HINT_GEN_VERSION = "expected_primal_dual_sct_v1"
+HINT_GEN_VERSION = "composite_sct_v2"
+CONSTRAINED_HINT_GEN_VERSION = "expected_primal_dual_sct_v2"
 CONSTRAINED_REWARD_STATE_FILE = "constrained_reward_state.json"
 CONSTRAINED_REWARD_STATE_VERSION = 1
+
+
+
+def add_teacher_backend_args(parser):
+    parser.add_argument("--teacher-backend", choices=["hf", "vllm"], default="hf")
+    parser.add_argument("--teacher-gpu", default=None,
+                        help="Dedicated teacher GPU index/UUID in host CUDA order, not relative to CUDA_VISIBLE_DEVICES.")
+    parser.add_argument("--teacher-gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--teacher-max-model-length", type=int, default=32768)
+    parser.add_argument("--teacher-max-num-seqs", type=int, default=32)
+    parser.add_argument("--teacher-enforce-eager", action="store_true")
+    parser.add_argument("--teacher-timeout", type=float, default=1800.0)
+
+
+def teacher_backend_kwargs(args):
+    return {name: getattr(args, name) for name in (
+        "teacher_backend", "teacher_gpu", "teacher_gpu_memory_utilization",
+        "teacher_max_model_length", "teacher_max_num_seqs", "teacher_enforce_eager",
+        "teacher_timeout",
+    )}
+
+
+def teacher_backend_meta(args):
+    # Device placement may change on resume; it is logged by the worker at startup.
+    return {key: value for key, value in teacher_backend_kwargs(args).items() if key != "teacher_gpu"}
+
+
+def validate_teacher_devices(config):
+    if config.teacher_backend != "vllm":
+        return
+    visible = [gpu.strip() for gpu in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if gpu.strip()]
+    if len(visible) != 1 or int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("Use one training process with CUDA_VISIBLE_DEVICES=<training GPU>; "
+                         "pass the separate teacher GPU with --teacher-gpu.")
+    if str(config.teacher_gpu).strip() == visible[0]:
+        raise ValueError("teacher_gpu must differ from the training GPU")
+
+
+def validate_teacher_backend(config):
+    if config.teacher_backend not in {"hf", "vllm"}:
+        raise ValueError("teacher_backend must be hf or vllm")
+    if config.teacher_backend == "hf":
+        return
+    if not config.teacher_gpu or "," in str(config.teacher_gpu):
+        raise ValueError("vllm teacher backend requires one dedicated teacher_gpu")
+    if not 0 < config.teacher_gpu_memory_utilization < 1:
+        raise ValueError("teacher_gpu_memory_utilization must be in (0, 1)")
+    if config.teacher_max_num_seqs < 1 or config.teacher_max_completion_length < 1:
+        raise ValueError("Teacher sequence count and completion length must be positive")
+    if config.teacher_max_model_length <= config.teacher_max_completion_length:
+        raise ValueError("teacher_max_model_length must leave room for the teacher prompt")
+    if not math.isfinite(config.teacher_timeout) or config.teacher_timeout <= 0:
+        raise ValueError("teacher_timeout must be finite and positive")
 
 
 def add_lora_args(parser: argparse.ArgumentParser) -> None:
@@ -240,7 +296,7 @@ def build_hint_grpo_dataset(
                 skipped_outcomes += 1
                 continue
 
-        prompt = build_messages(question, str(row["solution"]))
+        prompt = build_messages(question, str(row["solution"]), dataset)
         encoded = tokenizer.apply_chat_template(
             [prompt],
             add_generation_prompt=True,
@@ -286,7 +342,7 @@ def completion_text(completion: Any) -> str:
     return ""
 
 
-def invalid_hint_reason(hint: str, final_answer: str) -> str | None:
+def invalid_hint_reason(hint: str, final_answer: str, dataset: str = "deepmath") -> str | None:
     """Return why a sampled hint is inadmissible, or ``None`` when usable."""
     if not hint:
         return "empty"
@@ -294,7 +350,7 @@ def invalid_hint_reason(hint: str, final_answer: str) -> str | None:
         # Thinking is disabled in the generator template. Reject it if the model
         # nevertheless opens the hidden channel: otherwise it receives uncharged tokens.
         return "thinking"
-    if leaks_answer(hint, final_answer):
+    if leaks_answer(hint, final_answer, dataset):
         return "answer_leak"
     return None
 
@@ -346,6 +402,43 @@ def constrained_reward(
     )
 
 
+def rank_invalid_hints(
+    rewards: list[float], invalids: list[float], questions: list[str], margin: float,
+) -> list[float]:
+    """Put invalid outputs below every valid output for the same question.
+
+    Both trainers generate one complete question group per reward call. Grouping
+    by question also keeps independent questions separate in larger local batches.
+    Equal invalid scores give zero reward advantage in all-invalid groups.
+    """
+    if not math.isfinite(margin) or margin <= 0:
+        raise ValueError("invalid_penalty must be finite and > 0")
+    if not torch.isfinite(torch.tensor(rewards, dtype=torch.float32)).all():
+        raise ValueError("Hint rewards must be finite in float32 before group ranking")
+    groups = defaultdict(list)
+    for i, (_, _, question) in enumerate(zip(rewards, invalids, questions, strict=True)):
+        groups[str(question)].append(i)
+    adjusted = list(rewards)
+    for indices in groups.values():
+        valid = [rewards[i] for i in indices if not invalids[i]]
+        if not valid:
+            for i in indices:
+                adjusted[i] = 0.0
+            continue
+        if not any(invalids[i] for i in indices):
+            continue
+        worst = torch.tensor(min(valid), dtype=torch.float32)
+        # TRL casts rewards to float32. Preserve strict ordering even when a
+        # small margin would otherwise round back to the worst valid reward.
+        floor = torch.minimum(worst - margin, torch.nextafter(worst, torch.tensor(-math.inf)))
+        if not torch.isfinite(floor):
+            raise ValueError("Invalid-hint reward floor is not representable in float32")
+        for i in indices:
+            if invalids[i]:
+                adjusted[i] = floor.item()
+    return adjusted
+
+
 def dual_ascent_step(
     dual_lambda: float,
     tau: float,
@@ -371,6 +464,14 @@ class HintRewardConfig:
     teacher_max_completion_length: int = 4096
     teacher_temperature: float = 1.0
     teacher_top_p: float = 1.0
+    teacher_top_k: int = 20
+    teacher_backend: str = "hf"
+    teacher_gpu: str | None = None
+    teacher_gpu_memory_utilization: float = 0.8
+    teacher_max_model_length: int = 32768
+    teacher_max_num_seqs: int = 32
+    teacher_enforce_eager: bool = False
+    teacher_timeout: float = 1800.0
     alpha: float = 1.0
     gamma: float = 1.0
     invalid_penalty: float = 1.0
@@ -378,6 +479,7 @@ class HintRewardConfig:
     clamp_transfer: bool = True
 
     def validate(self) -> None:
+        validate_teacher_backend(self)
         if self.hint_budget < 1:
             raise ValueError("hint_budget must be >= 1")
         if self.teacher_rollouts < 1 or self.transfer_rollouts < 1:
@@ -386,8 +488,12 @@ class HintRewardConfig:
             raise ValueError("teacher_temperature must be > 0 for stochastic reliability rollouts")
         if not 0 < self.teacher_top_p <= 1:
             raise ValueError("teacher_top_p must be in (0, 1]")
-        if self.alpha < 0 or self.gamma < 0 or self.invalid_penalty < 0:
-            raise ValueError("alpha, gamma, and invalid_penalty must be nonnegative")
+        if self.teacher_top_k < 0:
+            raise ValueError("teacher_top_k must be >= 0 (0 disables top-k)")
+        if self.alpha < 0 or self.gamma < 0:
+            raise ValueError("alpha and gamma must be nonnegative")
+        if not math.isfinite(self.invalid_penalty) or self.invalid_penalty <= 0:
+            raise ValueError("invalid_penalty must be finite and > 0")
 
 
 @dataclass(frozen=True)
@@ -403,6 +509,14 @@ class ConstrainedHintRewardConfig:
     teacher_max_completion_length: int = 4096
     teacher_temperature: float = 1.0
     teacher_top_p: float = 1.0
+    teacher_top_k: int = 20
+    teacher_backend: str = "hf"
+    teacher_gpu: str | None = None
+    teacher_gpu_memory_utilization: float = 0.8
+    teacher_max_model_length: int = 32768
+    teacher_max_num_seqs: int = 32
+    teacher_enforce_eager: bool = False
+    teacher_timeout: float = 1800.0
     tau: float = 0.7
     gamma: float = 1.0
     invalid_penalty: float = 1.0
@@ -413,6 +527,7 @@ class ConstrainedHintRewardConfig:
     clamp_transfer: bool = True
 
     def validate(self) -> None:
+        validate_teacher_backend(self)
         if self.hint_budget < 1:
             raise ValueError("hint_budget must be >= 1")
         if self.teacher_rollouts < 1 or self.transfer_rollouts < 1:
@@ -421,10 +536,14 @@ class ConstrainedHintRewardConfig:
             raise ValueError("teacher_temperature must be > 0 for stochastic reliability rollouts")
         if not 0 < self.teacher_top_p <= 1:
             raise ValueError("teacher_top_p must be in (0, 1]")
+        if self.teacher_top_k < 0:
+            raise ValueError("teacher_top_k must be >= 0 (0 disables top-k)")
         if not 0.0 <= self.tau <= 1.0:
             raise ValueError("tau must be in [0, 1]")
-        if self.gamma < 0 or self.invalid_penalty < 0:
-            raise ValueError("gamma and invalid_penalty must be nonnegative")
+        if self.gamma < 0:
+            raise ValueError("gamma must be nonnegative")
+        if not math.isfinite(self.invalid_penalty) or self.invalid_penalty <= 0:
+            raise ValueError("invalid_penalty must be finite and > 0")
         if self.dual_lr <= 0:
             raise ValueError("dual_lr must be > 0")
         if self.dual_max <= 0:
@@ -434,7 +553,7 @@ class ConstrainedHintRewardConfig:
 
 
 class FrozenHintTeacher:
-    """Lazy single-GPU backend for sufficiency and sampled reverse-KL scoring."""
+    """Frozen HF scoring with optional asynchronous vLLM sufficiency on a second GPU."""
 
     def __init__(
         self,
@@ -466,9 +585,79 @@ class FrozenHintTeacher:
             self.rollout_dataset, config.model, config.dataset
         )
         self.model = None
+        self._vllm_teacher = None
+        self.last_metrics = {}
         # Recomputed unhinted logps are stable while the teacher stays frozen. Keeping
         # them on CPU avoids both repeat forwards within a GRPO group and GPU growth.
         self._student_logps: dict[str, torch.Tensor] = {}
+
+    def close(self):
+        if self._vllm_teacher is not None:
+            self._vllm_teacher.close()
+            self._vllm_teacher = None
+
+    def _teacher_client(self):
+        if self._vllm_teacher is None:
+            from train.opsd.train_hint_gen.teacher_vllm import FrozenVLLMClient
+            validate_teacher_devices(self.config)
+            self._vllm_teacher = FrozenVLLMClient(self.config)
+            print(f"Frozen vLLM teacher ready: {self._vllm_teacher.info}", flush=True)
+        return self._vllm_teacher
+
+    def _submit_sufficiency(self, questions, hints):
+        prompts = [self._render_prompt(self._hinted_messages(q, h))
+                   for q, h in zip(questions, hints, strict=True)]
+        client = self._teacher_client()
+        # Use the trainer's checkpointed CPU RNG, not a counter that resets on resume.
+        seed = int(torch.randint(0, 2**31 - 1, (1,), device="cpu").item())
+        client.submit(prompts, seed=seed)
+        return client
+
+    def _finish_sufficiency(self, client, answers):
+        reply = client.result()
+        samples = reply["samples"]
+        if len(samples) != len(answers):
+            raise ValueError("Teacher returned the wrong number of hint scores")
+        started = time.perf_counter()
+        scores, lengths, truncated = [], [], []
+        for answer, candidates in zip(answers, samples, strict=True):
+            if len(candidates) != self.config.teacher_rollouts:
+                raise ValueError("Teacher returned the wrong number of rollouts")
+            correct = [grade(item["text"], answer, self.config.dataset)[1] for item in candidates]
+            scores.append(sum(correct) / len(correct))
+            lengths.extend(len(item["token_ids"]) for item in candidates)
+            truncated.extend(item["finish_reason"] == "length" for item in candidates)
+        self.last_metrics.update({
+            "hint/teacher_generation_seconds": reply["generation_seconds"],
+            "hint/teacher_grading_seconds": time.perf_counter() - started,
+            "hint/teacher_generated_tokens": sum(lengths),
+            "hint/teacher_mean_completion_length": sum(lengths) / max(len(lengths), 1),
+            "hint/teacher_truncated_fraction": sum(truncated) / max(len(truncated), 1),
+        })
+        return scores
+
+    def score_hints(self, questions, answers, hints):
+        """Score valid hints together; overlap vLLM generation with HF transfer."""
+        self.last_metrics = {}
+        if not hints:
+            return []
+        started = time.perf_counter()
+        if self.config.teacher_backend == "hf":
+            pairs = [(self.score_sufficiency(q, a, h), self.score_transfer(q, h))
+                     for q, a, h in zip(questions, answers, hints, strict=True)]
+        else:
+            client = self._submit_sufficiency(questions, hints)
+            try:
+                transfer_started = time.perf_counter()
+                transfers = [self.score_transfer(q, h) for q, h in zip(questions, hints, strict=True)]
+                self.last_metrics["hint/transfer_seconds"] = time.perf_counter() - transfer_started
+                successes = self._finish_sufficiency(client, answers)
+            except BaseException:
+                self.close()
+                raise
+            pairs = list(zip(successes, transfers, strict=True))
+        self.last_metrics["hint/scoring_seconds"] = time.perf_counter() - started
+        return pairs
 
     def _ensure_model(self):
         if self.model is not None:
@@ -495,9 +684,12 @@ class FrozenHintTeacher:
 
     def _hinted_messages(self, question: str, hint: str) -> list[dict]:
         context = PI_HINT.format(hint=hint)
-        return compose_pi_messages(format_prompt_math(question), context)
+        return compose_pi_messages(format_prompt(question, self.config.dataset), context)
 
     def score_sufficiency(self, question: str, final_answer: str, hint: str) -> float:
+        if self.config.teacher_backend == "vllm":
+            client = self._submit_sufficiency([question], [hint])
+            return self._finish_sufficiency(client, [final_answer])[0]
         model = self._ensure_model()
         prompt_ids = torch.tensor(
             self._render_prompt(self._hinted_messages(question, hint)),
@@ -512,6 +704,7 @@ class FrozenHintTeacher:
             "do_sample": True,
             "temperature": self.config.teacher_temperature,
             "top_p": self.config.teacher_top_p,
+            "top_k": self.config.teacher_top_k,
             "max_new_tokens": self.config.teacher_max_completion_length,
             "pad_token_id": (
                 self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
@@ -525,7 +718,7 @@ class FrozenHintTeacher:
         solutions = self.tokenizer.batch_decode(
             output_ids[:, prompt_length:], skip_special_tokens=True
         )
-        correct = [grade(solution, final_answer)[1] for solution in solutions]
+        correct = [grade(solution, final_answer, self.config.dataset)[1] for solution in solutions]
         return sum(correct) / len(correct)
 
     @staticmethod
@@ -559,7 +752,7 @@ class FrozenHintTeacher:
                 f"Question has {len(question_rollout_indices)} cached rollouts, but "
                 f"transfer_rollouts={self.config.transfer_rollouts}."
             )
-        base_prompt_ids = self._render_prompt(format_prompt_math(question))
+        base_prompt_ids = self._render_prompt(format_prompt(question, self.config.dataset))
         hinted_prompt_ids = self._render_prompt(self._hinted_messages(question, hint))
         estimates = []
         for rollout_idx in question_rollout_indices[: self.config.transfer_rollouts]:
@@ -613,19 +806,24 @@ class CompositeHintReward:
         del prompts  # all reward prompts are reconstructed from the raw question
         rewards, successes, costs, transfers, invalids = [], [], [], [], []
         reasons = []
-        for completion, token_ids, q, answer in zip(
-            completions, completion_ids, question, final_answer, strict=True
-        ):
-            hint = completion_text(completion)
+        hints = [completion_text(completion) for completion in completions]
+        hint_reasons = [invalid_hint_reason(hint, str(answer), self.config.dataset)
+                        for hint, answer in zip(hints, final_answer, strict=True)]
+        valid_indices = [i for i, reason in enumerate(hint_reasons) if reason is None]
+        scored = self.backend.score_hints(
+            [str(question[i]) for i in valid_indices],
+            [str(final_answer[i]) for i in valid_indices],
+            [hints[i] for i in valid_indices],
+        )
+        scores = dict(zip(valid_indices, scored, strict=True))
+        for i, (token_ids, reason) in enumerate(zip(completion_ids, hint_reasons, strict=True)):
             cost = normalized_hint_cost(token_ids, self.config.hint_budget)
-            reason = invalid_hint_reason(hint, str(answer))
             if reason is not None:
                 success, transfer = 0.0, 0.0
-                reward = -self.config.invalid_penalty - cost
+                reward = 0.0  # assigned after all valid rewards are known
                 invalid = 1.0
             else:
-                success = self.backend.score_sufficiency(str(q), str(answer), hint)
-                transfer = self.backend.score_transfer(str(q), hint)
+                success, transfer = scores[i]
                 reward = composite_reward(
                     success,
                     cost,
@@ -642,12 +840,21 @@ class CompositeHintReward:
             invalids.append(invalid)
             reasons.append(reason)
 
+        raw_rewards = [None if invalid else reward for reward, invalid in zip(rewards, invalids, strict=True)]
+        rewards = rank_invalid_hints(rewards, invalids, question, self.config.invalid_penalty)
+
+        if not successes:
+            return rewards
         if log_extra is not None:
             log_extra("hint_sufficiency", successes)
             log_extra("hint_cost", costs)
             log_extra("hint_transfer", transfers)
             log_extra("hint_invalid_reason", reasons)
+            log_extra("hint_raw_reward", raw_rewards)
+            log_extra("hint_reward", rewards)
         if log_metric is not None:
+            for name, value in self.backend.last_metrics.items():
+                log_metric(name, value)
             log_metric("hint/sufficiency", sum(successes) / len(successes))
             log_metric("hint/cost", sum(costs) / len(costs))
             log_metric("hint/transfer", sum(transfers) / len(transfers))
@@ -746,26 +953,24 @@ class ConstrainedHintReward:
         rewards, successes, costs, transfers, invalids = [], [], [], [], []
         reasons = []
         dual_lambda = self.dual_lambda
-        for completion, token_ids, q, answer in zip(
-            completions, completion_ids, question, final_answer, strict=True
-        ):
-            hint = completion_text(completion)
+        hints = [completion_text(completion) for completion in completions]
+        hint_reasons = [invalid_hint_reason(hint, str(answer), self.config.dataset)
+                        for hint, answer in zip(hints, final_answer, strict=True)]
+        valid_indices = [i for i, reason in enumerate(hint_reasons) if reason is None]
+        scored = self.backend.score_hints(
+            [str(question[i]) for i in valid_indices],
+            [str(final_answer[i]) for i in valid_indices],
+            [hints[i] for i in valid_indices],
+        )
+        scores = dict(zip(valid_indices, scored, strict=True))
+        for i, (token_ids, reason) in enumerate(zip(completion_ids, hint_reasons, strict=True)):
             cost = normalized_hint_cost(token_ids, self.config.hint_budget)
-            reason = invalid_hint_reason(hint, str(answer))
             if reason is not None:
                 success, transfer = 0.0, 0.0
-                reward = constrained_reward(
-                    success,
-                    cost,
-                    transfer,
-                    self.config.tau,
-                    self.config.gamma,
-                    dual_lambda,
-                ) - self.config.invalid_penalty
+                reward = 0.0  # assigned after all valid rewards are known
                 invalid = 1.0
             else:
-                success = self.backend.score_sufficiency(str(q), str(answer), hint)
-                transfer = self.backend.score_transfer(str(q), hint)
+                success, transfer = scores[i]
                 reward = constrained_reward(
                     success,
                     cost,
@@ -782,6 +987,9 @@ class ConstrainedHintReward:
             transfers.append(float(transfer))
             invalids.append(invalid)
             reasons.append(reason)
+
+        raw_rewards = [None if invalid else reward for reward, invalid in zip(rewards, invalids, strict=True)]
+        rewards = rank_invalid_hints(rewards, invalids, question, self.config.invalid_penalty)
 
         if not successes:
             return rewards
@@ -801,10 +1009,14 @@ class ConstrainedHintReward:
             log_extra("hint_cost", costs)
             log_extra("hint_transfer", transfers)
             log_extra("hint_invalid_reason", reasons)
+            log_extra("hint_raw_reward", raw_rewards)
+            log_extra("hint_reward", rewards)
             log_extra("hint_constraint_margin", [s - self.config.tau for s in successes])
             log_extra("hint_feasible", [float(s >= self.config.tau) for s in successes])
             log_extra("hint_dual_lambda", [dual_lambda] * len(successes))
         if log_metric is not None:
+            for name, value in self.backend.last_metrics.items():
+                log_metric(name, value)
             log_metric("hint/sufficiency", mean_sufficiency)
             log_metric("hint/cost", sum(costs) / len(costs))
             log_metric("hint/transfer", sum(transfers) / len(transfers))
@@ -831,6 +1043,7 @@ def make_reward_function(config: HintRewardConfig, tokenizer):
     def hint_composite_reward(**kwargs):
         return reward(**kwargs)
 
+    hint_composite_reward.close = backend.close
     return hint_composite_reward
 
 
@@ -845,4 +1058,5 @@ def make_constrained_reward_function(
     def hint_constrained_reward(**kwargs):
         return reward(**kwargs)
 
+    hint_constrained_reward.close = backend.close
     return hint_constrained_reward, reward

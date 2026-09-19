@@ -40,16 +40,18 @@ import os
 
 import torch
 from transformers import AutoModelForSequenceClassification, set_seed
-from trl.rewards import accuracy_reward
+from utils import accuracy_reward_for_dataset
 
 from train.ppo.train_ppo import PPOConfig, PPOTrainer, is_bitsandbytes_optim
 from utils import (
+    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
-    PI_ANSWER,
     PI_FULL,
     PI_HINT,
     compose_pi_messages,
-    format_prompt_math,
+    format_prompt,
+    answer_context,
+    reward_solution,
     hint_path,
     load_hint_cache,
     load_train_dataset,
@@ -88,9 +90,9 @@ def build_ppo_pi_dataset(
     """
     if pi_mode not in PI_MODES:
         raise ValueError(f"unknown pi_mode {pi_mode!r}; expected one of {PI_MODES}")
-    if pi_mode in ("full", "hint") and dataset != "deepmath":
+    if pi_mode in ("full", "hint") and dataset not in {"deepmath", "codeio"}:
         raise ValueError(
-            f"pi_mode={pi_mode!r} is currently supported only for dataset='deepmath'; "
+            f"pi_mode={pi_mode!r} is currently supported only for dataset='deepmath' or 'codeio'; "
             f"got {dataset!r}."
         )
     if pi_mode in ("full", "hint") and model is None:
@@ -117,7 +119,7 @@ def build_ppo_pi_dataset(
     def _map(row):
         answer = str(row["final_answer"])
         if pi_mode == "answer":
-            privileged_context = PI_ANSWER.format(answer=answer)
+            privileged_context = answer_context(answer, dataset)
         elif pi_mode == "full":
             privileged_context = PI_FULL.format(demo=row["solution"])
         elif pi_mode == "hint":
@@ -125,8 +127,8 @@ def build_ppo_pi_dataset(
         else:  # none
             privileged_context = ""
         return {
-            "prompt": format_prompt_math(row["question"]),
-            "solution": "\\boxed{" + answer + "}",
+            "prompt": format_prompt(row["question"], dataset),
+            "solution": reward_solution(answer, dataset),
             "privileged_context": privileged_context,
         }
 
@@ -358,9 +360,10 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         ),
         "model": args.model,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
-        "reward": "accuracy_reward",
+        "reward": "codeio_accuracy_reward" if args.dataset == "codeio" else "accuracy_reward",
         "gamma": args.gamma,
         "lam": args.lam,
         "vf_coef": args.vf_coef,
@@ -394,7 +397,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-1.7B",
                    help="Policy to train; the value model is this arch + a scalar head.")
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
-                   help="Training dataset. 'full' and 'hint' are currently DeepMath-only.")
+                   help="Training dataset. 'full' and 'hint' support DeepMath and CodeIO.")
     p.add_argument("--pi-mode", default="answer", choices=PI_MODES,
                    help="PI exposed only to the critic: none, gold answer, worked solution, "
                         "or a generated self-hint from data/pi/hint.")
@@ -597,7 +600,7 @@ def main():
 
     trainer = PPOPITrainer(
         model=args.model,
-        reward_funcs=accuracy_reward,
+        reward_funcs=accuracy_reward_for_dataset(args.dataset),
         args=training_args,
         train_dataset=train_dataset,
         value_model=value_model,

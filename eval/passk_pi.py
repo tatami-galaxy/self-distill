@@ -44,13 +44,12 @@ from vllm import LLM, SamplingParams
 
 from eval.run_eval import compute_pass_at_k, pass_at_k
 from train.opsd.train_sdft import (
-    PI_ANSWER,
     PI_FULL,
     PI_HINT,
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
 )
-from utils import DATASET_REGISTRY_TRAIN, format_prompt_math, grade, hint_path, rollout_path
+from utils import DATASET_REGISTRY_TRAIN, format_prompt, answer_context, grade, hint_path, rollout_path
 
 
 PI_MODES = ("none", "rollout", "answer", "hint", "full")
@@ -67,13 +66,13 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
     keep the system turn, fold the privileged context into the user turn via
     TEACHER_PROMPT_TEMPLATE. `none` is the plain student prompt (no PI)."""
     q = problem["question"]
-    messages = format_prompt_math(q)  # [system, user(question)]
+    messages = format_prompt(q, problem.get("dataset", "deepmath"))  # [system, user(question)]
     if pi_mode == "none":
         return messages
     if pi_mode == "full":
         privileged_context = PI_FULL.format(demo=problem["solution"])
     elif pi_mode == "answer":
-        privileged_context = PI_ANSWER.format(answer=problem["answer"])
+        privileged_context = answer_context(problem["answer"], problem.get("dataset", "deepmath"))
     elif pi_mode == "hint":
         privileged_context = PI_HINT.format(hint=problem["hint"])
     elif pi_mode == "rollout":
@@ -130,6 +129,7 @@ def load_eval_problems(
     problems = [
         {
             "question_idx": question_idx,
+            "dataset": dataset,
             "question": row["question"],
             "answer": str(row["final_answer"]),
             "hint": row["hint"],
@@ -434,7 +434,7 @@ def eval_pi_mode(llm, tokenizer, problems, pi_mode, sampling_params) -> list[dic
     outputs = llm.generate(prompts, sampling_params)
     results = []
     for p, out in zip(problems, outputs, strict=True):
-        n_correct = sum(grade(comp.text, p["answer"])[1] for comp in out.outputs)
+        n_correct = sum(grade(comp.text, p["answer"], p.get("dataset", "deepmath"))[1] for comp in out.outputs)
         results.append({
             "question_idx": p["question_idx"],
             "n_samples": len(out.outputs),

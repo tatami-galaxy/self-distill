@@ -56,8 +56,9 @@ import os
 from trl import SFTConfig, SFTTrainer
 
 from utils import (
+    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
-    format_prompt_math,
+    format_prompt,
     load_train_dataset,
     validate_resume,
 )
@@ -108,13 +109,13 @@ def format_think_completion(solution: str) -> str | None:
     return None
 
 
-def to_sft_example(question: str, solution: str) -> dict | None:
+def to_sft_example(question: str, solution: str, dataset: str = "deepmath") -> dict | None:
     """One row in TRL's prompt-completion conversational format, or None to drop it."""
-    completion = format_think_completion(solution)
+    completion = solution.strip() if dataset == "codeio" else format_think_completion(solution)
     if completion is None:
         return None
     return {
-        "prompt": format_prompt_math(question),
+        "prompt": format_prompt(question, dataset),
         "completion": [{"role": "assistant", "content": completion}],
     }
 
@@ -144,13 +145,13 @@ def build_sft_dataset(
     ds = load_train_dataset(dataset, max_samples=max_samples, require_solution=True)
 
     n_raw = len(ds)
-    ds = ds.filter(lambda row: format_think_completion(row["solution"]) is not None, num_proc=4)
+    ds = ds.filter(lambda row: bool(row["solution"].strip()) if dataset == "codeio" else format_think_completion(row["solution"]) is not None, num_proc=4)
     if len(ds) < n_raw:
         print(f"  dropped {n_raw - len(ds)}/{n_raw} rows whose trace is not a single "
               f"well-formed reasoning block (see format_think_completion)")
 
     ds = ds.map(
-        lambda row: to_sft_example(row["question"], row["solution"]),
+        lambda row: to_sft_example(row["question"], row["solution"], dataset),
         remove_columns=ds.column_names,
     )
 
@@ -214,10 +215,11 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "method": "sft",
         "model": args.model,
         "dataset": args.dataset,
+        **dataset_provenance(args.dataset),
         # Which traces were imitated. A bare "sft" would not distinguish this arm from one
         # trained on teacher-sampled or rejection-sampled completions later.
         "source": "reference_trace",
-        "completion_format": COMPLETION_FORMAT_VERSION,
+        "completion_format": "codeio_plain_v1" if args.dataset == "codeio" else COMPLETION_FORMAT_VERSION,
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
         # resume-critical: both caps decide which rows survive build_sft_dataset's filter, so
