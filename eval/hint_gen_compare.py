@@ -35,9 +35,16 @@ Constrained runs use the same evaluator; only their run directory changes:
       --num-problems 64 --hints-per-problem 4 \
       --teacher-rollouts 4 --k 1 4
 
+With ``--gpus 4 5`` (or ``CUDA_VISIBLE_DEVICES=4,5``), sufficiency runs on the
+first GPU concurrently with clean-process HF transfer on the second. Base/LoRA
+hint arms share one generator engine on the first GPU. Full-model checkpoints
+retain their own generation processes.
+
 The default ``--phase sweep`` prepares the fixed cohort, generates hints, scores
 sufficiency and transfer, and writes ``summary.json``.  Every expensive stage is
-provenance-checked and reusable; pass ``--force`` to replace incompatible caches.
+provenance-checked and reusable. Scores are saved per condition under
+``score_cache/``; adding a checkpoint reuses old scores automatically. Pass
+``--force`` to regenerate the requested hints and scores.
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ import random
 import re
 import shutil
 import statistics
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -59,6 +67,7 @@ from typing import Any
 
 from datasets import Dataset, load_from_disk
 
+from eval.hint_compare_cache import CACHE_VERSION, ConditionCache, model_identity
 from eval.run_eval import pass_at_k
 from train.opsd.train_hint_gen.lib import invalid_hint_reason
 from utils import (
@@ -532,7 +541,7 @@ def generation_config(
     }
 
 
-def generate_phase(args: argparse.Namespace) -> None:
+def generate_phase(args: argparse.Namespace, *, engine=None, adapter_request=None) -> None:
     if not args.generator_id or not args.generator_model:
         raise ValueError(
             "Internal generate phase requires --generator-id and --generator-model."
@@ -551,14 +560,18 @@ def generate_phase(args: argparse.Namespace) -> None:
         args.generator_model,
         adapter_name=args.generator_id,
     )
-    llm = LLM(
-        **model_kwargs,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        tensor_parallel_size=args.tensor_parallel_size,
-        seed=args.seed,
-        trust_remote_code=True,
-    )
+    llm = engine
+    if llm is None:
+        llm = LLM(
+            **model_kwargs,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            seed=args.seed,
+            trust_remote_code=True,
+        )
+    else:
+        lora_request = adapter_request
     tokenizer = llm.get_tokenizer()
     if model_spec.is_adapter:
         print(
@@ -643,6 +656,44 @@ def generate_phase(args: argparse.Namespace) -> None:
     gc.collect()
 
 
+def generate_group_phase(args: argparse.Namespace) -> None:
+    """Generate all uncached base/LoRA arms with one frozen-base vLLM engine."""
+    from vllm import LLM
+
+    _, cohort_meta = load_cohort(args)
+    pending = []
+    for adapter_id, (label, model) in enumerate(args.generator_group, start=1):
+        config = generation_config(args, label, model, cohort_meta["cohort_fingerprint"])
+        if cache_matches(*hint_paths(args, label), config, args.force):
+            continue
+        kwargs, request, spec = vllm_model_and_adapter(
+            model, adapter_name=label, adapter_id=adapter_id
+        )
+        if spec.base_model != args.model:
+            raise ValueError("A shared generator engine requires the same base model.")
+        pending.append((label, model, kwargs, request))
+    if not pending:
+        return
+    ranks = [kwargs["max_lora_rank"] for _, _, kwargs, _ in pending if kwargs.get("enable_lora")]
+    lora_kwargs = {"enable_lora": True, "max_lora_rank": max(ranks)} if ranks else {}
+    started = time.monotonic()
+    llm = LLM(
+        model=args.model,
+        **lora_kwargs,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
+        seed=args.seed,
+        trust_remote_code=True,
+    )
+    print(f"Shared generator engine loaded in {time.monotonic() - started:.1f}s; {len(pending)} arms", flush=True)
+    for label, model, _, request in pending:
+        values = dict(vars(args), generator_id=label, generator_model=model)
+        generate_phase(argparse.Namespace(**values), engine=llm, adapter_request=request)
+    del llm
+    gc.collect()
+
+
 def load_all_hints(args: argparse.Namespace) -> tuple[list[dict], dict[str, dict]]:
     rows: list[dict] = []
     metadata = {}
@@ -682,6 +733,8 @@ def sufficiency_config(args: argparse.Namespace, cohort_fp: str, hints_fp: str) 
     return {
         "schema_version": SCHEMA_VERSION,
         "base_teacher": args.model,
+        "model_identity": model_identity(args.model),
+        "condition_cache_version": CACHE_VERSION,
         "dataset": args.dataset,
         "cohort_fingerprint": cohort_fp,
         "hint_fingerprint": hints_fp,
@@ -696,17 +749,22 @@ def sufficiency_config(args: argparse.Namespace, cohort_fp: str, hints_fp: str) 
     }
 
 
-def sufficiency_phase(args: argparse.Namespace) -> None:
-    from vllm import LLM, SamplingParams
+def condition_config(config: dict) -> dict:
+    """Scope provenance to a request, independent of the current checkpoint cohort."""
+    return {
+        key: value for key, value in config.items()
+        if key not in {"cohort_fingerprint", "hint_fingerprint", "rollout_root"}
+    }
 
+
+def sufficiency_phase(args: argparse.Namespace) -> None:
+    started = time.monotonic()
     cohort, cohort_meta = load_cohort(args)
     hints, _ = load_all_hints(args)
     hints_fp = hint_fingerprint(hints)
     out, meta_path = score_paths(args, "sufficiency")
     config = sufficiency_config(args, cohort_meta["cohort_fingerprint"], hints_fp)
-    if cache_matches(out, meta_path, config, args.force):
-        return
-
+    cache = ConditionCache(output_root(args), "sufficiency", condition_config(config), args.force)
     problems = {row["question_id"]: dict(row) for row in cohort}
     conditions = []
     for problem in cohort:
@@ -732,84 +790,93 @@ def sufficiency_phase(args: argparse.Namespace) -> None:
                 "messages": hinted_teacher_messages(problem["question"], hint["hint"], args.dataset),
             }
         )
+    rows = [None] * len(conditions)
+    pending = []
+    for index, condition in enumerate(conditions):
+        key = cache.key({
+            **condition,
+            "final_answer": problems[condition["question_id"]]["final_answer"],
+        })
+        row = cache.load(key)
+        if row is None:
+            pending.append((index, condition, key))
+        else:
+            rows[index] = row
+    write_json_atomic(meta_path, {"status": "in_progress", "method": METHOD, "config": config})
+    print(f"Sufficiency cache: {cache.hits} reused, {len(pending)} pending", flush=True)
+    if pending:
+        from vllm import LLM, SamplingParams
 
-    llm = LLM(
-        model=args.model,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        tensor_parallel_size=args.tensor_parallel_size,
-        seed=args.teacher_seed,
-        trust_remote_code=True,
-    )
-    tokenizer = llm.get_tokenizer()
-    prompt_budget = args.max_model_len - args.teacher_max_tokens
-    prompts = []
-    for condition in conditions:
-        ids = tokenizer.apply_chat_template(
-            condition["messages"], add_generation_prompt=True, tokenize=True
+        llm = LLM(
+            model=args.model,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            seed=args.teacher_seed,
+            trust_remote_code=True,
         )
-        if len(ids) > prompt_budget:
-            raise ValueError(
-                f"Teacher prompt for {condition['condition_id']} has {len(ids)} tokens but "
-                f"budget is {prompt_budget}. Increase --max-model-len or lower "
-                "--teacher-max-tokens."
-            )
-        prompts.append(
-            tokenizer.apply_chat_template(
-                condition["messages"], add_generation_prompt=True, tokenize=False
-            )
+        tokenizer = llm.get_tokenizer()
+        prompt_budget = args.max_model_len - args.teacher_max_tokens
+        # Each request has its own explicit seed, as in the original batched call.
+        # Cache hits and condition batching must not advance a shared RNG stream.
+        sampling = SamplingParams(
+            n=args.teacher_rollouts,
+            max_tokens=args.teacher_max_tokens,
+            temperature=args.teacher_temperature,
+            top_p=args.teacher_top_p,
+            top_k=args.teacher_top_k if args.teacher_top_k > 0 else -1,
+            seed=args.teacher_seed,
         )
-    sampling = SamplingParams(
-        n=args.teacher_rollouts,
-        max_tokens=args.teacher_max_tokens,
-        temperature=args.teacher_temperature,
-        top_p=args.teacher_top_p,
-        top_k=args.teacher_top_k if args.teacher_top_k > 0 else -1,
-        seed=args.teacher_seed,
-    )
-    outputs = llm.generate(prompts, sampling)
-    rows = []
-    for condition, output in zip(conditions, outputs, strict=True):
-        problem = problems[condition["question_id"]]
-        completions = list(output.outputs)
-        correct = [
-            bool(grade(candidate.text, problem["final_answer"], args.dataset)[1])
-            for candidate in completions
-        ]
-        row = {
-            "condition_id": condition["condition_id"],
-            "hint_id": condition["hint_id"],
-            "question_id": condition["question_id"],
-            "generator_id": condition["generator_id"],
-            "hint_sample_idx": condition["hint_sample_idx"],
-            "n_samples": len(completions),
-            "n_correct": sum(correct),
-            "n_truncated": sum(
-                candidate.finish_reason == "length" for candidate in completions
-            ),
-        }
-        if args.save_teacher_samples:
-            row["completion_texts"] = [candidate.text for candidate in completions]
-            row["completion_correct"] = correct
-        rows.append(row)
+        batch_size = args.teacher_condition_batch_size
+        for offset in range(0, len(pending), batch_size):
+            batch = pending[offset:offset + batch_size]
+            prompts = []
+            for _, condition, _ in batch:
+                ids = tokenizer.apply_chat_template(
+                    condition["messages"], add_generation_prompt=True, tokenize=True
+                )
+                if len(ids) > prompt_budget:
+                    raise ValueError(
+                        f"Teacher prompt for {condition['condition_id']} has {len(ids)} tokens but "
+                        f"budget is {prompt_budget}. Increase --max-model-len or lower --teacher-max-tokens."
+                    )
+                prompts.append(tokenizer.apply_chat_template(
+                    condition["messages"], add_generation_prompt=True, tokenize=False
+                ))
+            outputs = llm.generate(prompts, sampling)
+            for (index, condition, key), output in zip(batch, outputs, strict=True):
+                problem = problems[condition["question_id"]]
+                completions = list(output.outputs)
+                if len(completions) != args.teacher_rollouts:
+                    raise RuntimeError("vLLM returned the wrong number of teacher samples.")
+                correct = [
+                    bool(grade(candidate.text, problem["final_answer"], args.dataset)[1])
+                    for candidate in completions
+                ]
+                row = {k: v for k, v in condition.items() if k != "messages"}
+                row.update(
+                    n_samples=len(completions), n_correct=sum(correct),
+                    n_truncated=sum(candidate.finish_reason == "length" for candidate in completions),
+                )
+                if args.save_teacher_samples:
+                    row["completion_texts"] = [candidate.text for candidate in completions]
+                    row["completion_correct"] = correct
+                cache.save(key, row)
+                rows[index] = row
+            print(f"  teacher conditions {min(offset + batch_size, len(pending))}/{len(pending)} saved", flush=True)
+        del llm
+        gc.collect()
     scores = Dataset.from_list(rows)
     save_dataset_atomic(scores, out)
-    write_json_atomic(
-        meta_path,
-        {
-            "status": "complete",
-            "method": METHOD,
-            "config": config,
-            "num_conditions": len(scores),
-            "score_fingerprint": fingerprint(
-                (row["condition_id"], row["n_samples"], row["n_correct"])
-                for row in scores
-            ),
-        },
-    )
-    print(f"Scored {len(scores)} teacher conditions -> {out}")
-    del llm
-    gc.collect()
+    write_json_atomic(meta_path, {
+        "status": "complete", "method": METHOD, "config": config,
+        "num_conditions": len(scores), "condition_cache": cache.stats(),
+        "elapsed_seconds": time.monotonic() - started,
+        "score_fingerprint": fingerprint(
+            (row["condition_id"], row["n_samples"], row["n_correct"]) for row in scores
+        ),
+    })
+    print(f"Scored {len(scores)} teacher conditions -> {out}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +888,8 @@ def transfer_config(args: argparse.Namespace, cohort_fp: str, hints_fp: str) -> 
     return {
         "schema_version": SCHEMA_VERSION,
         "student_and_teacher_model": args.model,
+        "model_identity": model_identity(args.model),
+        "condition_cache_version": CACHE_VERSION,
         "dataset": args.dataset,
         "rollout_root": str(Path(args.rollout_root).resolve()),
         "cohort_fingerprint": cohort_fp,
@@ -882,132 +951,120 @@ def raw_sampled_transfer(student_logps, teacher_logps) -> tuple[float, float, in
 
 
 def transfer_phase(args: argparse.Namespace) -> None:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
+    started = time.monotonic()
     cohort, cohort_meta = load_cohort(args)
     hints, _ = load_all_hints(args)
-    hints_fp = hint_fingerprint(hints)
+    config = transfer_config(args, cohort_meta["cohort_fingerprint"], hint_fingerprint(hints))
     out, meta_path = score_paths(args, "transfer")
-    config = transfer_config(args, cohort_meta["cohort_fingerprint"], hints_fp)
-    if cache_matches(out, meta_path, config, args.force):
-        return
+    cache = ConditionCache(output_root(args), "transfer", condition_config(config), args.force)
+    student_cache = ConditionCache(output_root(args), "student_logps", {
+        "model_identity": config["model_identity"], "dataset": args.dataset,
+        "dtype": args.dtype, "scorer": "unpadded_batch_one_fp32_logps_v1",
+    }, args.force)
 
-    rollout_cache_path = rollout_path(args.model, args.dataset, args.rollout_root)
-    rollouts = load_from_disk(rollout_cache_path)
+    rollouts = load_from_disk(rollout_path(args.model, args.dataset, args.rollout_root))
     indices_by_question: dict[str, list[int]] = defaultdict(list)
-    sample_indices = (
-        rollouts["sample_idx"]
-        if "sample_idx" in rollouts.column_names
-        else [0] * len(rollouts)
-    )
-    rollout_ids = (
-        rollouts["rollout_id"]
-        if "rollout_id" in rollouts.column_names
-        else [""] * len(rollouts)
-    )
+    sample_indices = rollouts["sample_idx"] if "sample_idx" in rollouts.column_names else [0] * len(rollouts)
+    rollout_ids = rollouts["rollout_id"] if "rollout_id" in rollouts.column_names else [""] * len(rollouts)
     for index, question in enumerate(rollouts["question"]):
         indices_by_question[str(question)].append(index)
     for indices in indices_by_question.values():
         indices.sort(key=lambda idx: (int(sample_indices[idx]), str(rollout_ids[idx])))
-
-    dtype = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }[args.dtype]
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = (
-        AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=dtype, trust_remote_code=True
-        )
-        .eval()
-        .to("cuda")
-    )
     problems = {row["question_id"]: dict(row) for row in cohort}
-    selected_rollouts: dict[str, list[tuple[int, list[int], Any]]] = {}
-    print(f"Scoring unhinted student log probabilities for {len(cohort)} questions")
-    for problem_number, problem in enumerate(cohort, start=1):
-        indices = indices_by_question.get(problem["question"], [])[
-            : args.transfer_rollouts
-        ]
+    selected_rollouts = {}
+    for problem in cohort:
+        indices = indices_by_question.get(problem["question"], [])[:args.transfer_rollouts]
         if len(indices) != args.transfer_rollouts:
-            raise ValueError(
-                f"Not enough rollouts for question_id={problem['question_id']}"
-            )
-        prompt_ids = _render_prompt_ids(
-            tokenizer, format_prompt(problem["question"], args.dataset)
-        )
-        scored = []
-        for rollout_position, index in enumerate(indices):
-            completion_ids = list(rollouts[index]["completion_ids"])
+            raise ValueError(f"Not enough rollouts for question_id={problem['question_id']}")
+        selected = []
+        for index in indices:
+            ids = list(rollouts[index]["completion_ids"])
             if args.transfer_max_completion_tokens:
-                completion_ids = completion_ids[: args.transfer_max_completion_tokens]
-            if len(prompt_ids) + len(completion_ids) > args.max_model_len:
-                raise ValueError(
-                    f"Unhinted transfer sequence exceeds --max-model-len for "
-                    f"question_id={problem['question_id']}. Set "
-                    "--transfer-max-completion-tokens."
-                )
-            student_logps = _score_completion(model, prompt_ids, completion_ids)
-            scored.append((rollout_position, completion_ids, student_logps))
-        selected_rollouts[problem["question_id"]] = scored
-        if problem_number % 10 == 0:
-            print(f"  student {problem_number}/{len(cohort)}")
+                ids = ids[:args.transfer_max_completion_tokens]
+            if not ids:
+                raise ValueError("Cannot score an empty student completion.")
+            selected.append(ids)
+        selected_rollouts[problem["question_id"]] = selected
+    config["selected_rollout_fingerprint"] = fingerprint(selected_rollouts.items())
 
     rows = []
-    print(f"Scoring {len(hints)} hinted-teacher conditions")
-    for hint_number, hint in enumerate(hints, start=1):
+    pending = []
+    for hint in hints:
         problem = problems[hint["question_id"]]
-        prompt_ids = _render_prompt_ids(
-            tokenizer, hinted_teacher_messages(problem["question"], hint["hint"], args.dataset)
-        )
-        for rollout_position, completion_ids, student_logps in selected_rollouts[
-            hint["question_id"]
-        ]:
-            if len(prompt_ids) + len(completion_ids) > args.max_model_len:
+        student_messages = format_prompt(problem["question"], args.dataset)
+        teacher_messages = hinted_teacher_messages(problem["question"], hint["hint"], args.dataset)
+        for position, completion_ids in enumerate(selected_rollouts[hint["question_id"]]):
+            identity = {
+                "hint_id": hint["hint_id"], "question_id": hint["question_id"],
+                "generator_id": hint["generator_id"], "hint_sample_idx": int(hint["hint_sample_idx"]),
+                "rollout_position": position,
+            }
+            key = cache.key({
+                **identity, "student_messages": student_messages,
+                "teacher_messages": teacher_messages, "completion_ids": completion_ids,
+            })
+            row = cache.load(key)
+            rows.append(row)
+            if row is None:
+                pending.append((len(rows) - 1, key, identity, student_messages, teacher_messages, completion_ids))
+    write_json_atomic(meta_path, {"status": "in_progress", "method": METHOD, "config": config})
+    print(f"Transfer cache: {cache.hits} reused, {len(pending)} pending", flush=True)
+    if pending:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=dtype, trust_remote_code=True
+        ).eval().to("cuda")
+        student_values = {}
+        prompt_ids_by_messages = {}
+
+        def render(messages):
+            text = json.dumps(messages, sort_keys=True)
+            if text not in prompt_ids_by_messages:
+                prompt_ids_by_messages[text] = _render_prompt_ids(tokenizer, messages)
+            return prompt_ids_by_messages[text]
+
+        for number, (index, key, identity, student_messages, teacher_messages, completion_ids) in enumerate(pending, start=1):
+            student_prompt = render(student_messages)
+            teacher_prompt = render(teacher_messages)
+            if max(len(student_prompt), len(teacher_prompt)) + len(completion_ids) > args.max_model_len:
                 raise ValueError(
-                    f"Hinted transfer sequence exceeds --max-model-len for hint_id="
-                    f"{hint['hint_id']}. Set --transfer-max-completion-tokens or increase "
-                    "--max-model-len."
+                    f"Transfer sequence exceeds --max-model-len for hint_id={identity['hint_id']}. "
+                    "Set --transfer-max-completion-tokens or increase --max-model-len."
                 )
-            teacher_logps = _score_completion(model, prompt_ids, completion_ids)
-            raw_mean, log_ratio_sum, n_tokens = raw_sampled_transfer(
-                student_logps, teacher_logps
-            )
-            rows.append(
-                {
-                    "hint_id": hint["hint_id"],
-                    "question_id": hint["question_id"],
-                    "generator_id": hint["generator_id"],
-                    "hint_sample_idx": int(hint["hint_sample_idx"]),
-                    "rollout_position": rollout_position,
-                    "raw_transfer": raw_mean,
-                    "log_ratio_sum": log_ratio_sum,
-                    "num_tokens": n_tokens,
-                }
-            )
-        if hint_number % 10 == 0:
-            print(f"  hinted teacher {hint_number}/{len(hints)}")
+            student_key = student_cache.key({"messages": student_messages, "completion_ids": completion_ids})
+            if student_key not in student_values:
+                values = student_cache.load(student_key)
+                if values is None:
+                    values = _score_completion(model, student_prompt, completion_ids).tolist()
+                    student_cache.save(student_key, values)
+                if len(values) != len(completion_ids):
+                    raise ValueError("Cached student log probabilities have the wrong token count.")
+                student_values[student_key] = torch.tensor(values, dtype=torch.float32)
+            teacher_logps = _score_completion(model, teacher_prompt, completion_ids)
+            raw_mean, log_ratio_sum, n_tokens = raw_sampled_transfer(student_values[student_key], teacher_logps)
+            row = dict(identity, raw_transfer=raw_mean, log_ratio_sum=log_ratio_sum, num_tokens=n_tokens)
+            cache.save(key, row)
+            rows[index] = row
+            if number % 10 == 0:
+                print(f"  transfer conditions {number}/{len(pending)} saved", flush=True)
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
     scores = Dataset.from_list(rows)
     save_dataset_atomic(scores, out)
-    write_json_atomic(
-        meta_path,
-        {
-            "status": "complete",
-            "method": METHOD,
-            "config": config,
-            "num_rows": len(scores),
-            "score_fingerprint": fingerprint(
-                (row["hint_id"], row["rollout_position"], row["raw_transfer"])
-                for row in scores
-            ),
-        },
-    )
-    print(f"Saved {len(scores)} raw transfer estimates -> {out}")
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+    write_json_atomic(meta_path, {
+        "status": "complete", "method": METHOD, "config": config,
+        "num_rows": len(scores), "condition_cache": cache.stats(),
+        "student_cache": student_cache.stats(), "elapsed_seconds": time.monotonic() - started,
+        "score_fingerprint": fingerprint(
+            (row["hint_id"], row["rollout_position"], row["raw_transfer"]) for row in scores
+        ),
+    })
+    print(f"Saved {len(scores)} raw transfer estimates -> {out}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1143,10 @@ def _load_score_dataset(args: argparse.Namespace, kind: str) -> tuple[list[dict]
     path, meta_path = score_paths(args, kind)
     if not path.is_dir() or not meta_path.is_file():
         raise FileNotFoundError(f"Missing {kind} scores; run --phase {kind} first.")
-    return [dict(row) for row in load_from_disk(str(path))], read_json(meta_path)
+    meta = read_json(meta_path)
+    if meta.get("status") != "complete":
+        raise ValueError(f"Incomplete {kind} scores; resume --phase {kind} first.")
+    return [dict(row) for row in load_from_disk(str(path))], meta
 
 
 def summarize_generator_subset(
@@ -1219,6 +1279,12 @@ def summarize_phase(args: argparse.Namespace) -> dict:
     hints, hint_meta = load_all_hints(args)
     sufficiency, suff_meta = _load_score_dataset(args, "sufficiency")
     transfer, transfer_meta = _load_score_dataset(args, "transfer")
+    for kind, meta in (("sufficiency", suff_meta), ("transfer", transfer_meta)):
+        if (
+            meta["config"].get("cohort_fingerprint") != cohort_meta["cohort_fingerprint"]
+            or meta["config"].get("hint_fingerprint") != hint_fingerprint(hints)
+        ):
+            raise ValueError(f"Stale {kind} scores for the current hints/cohort; rerun --phase {kind}.")
 
     sufficiency_by_hint = {
         row["hint_id"]: row for row in sufficiency if row["generator_id"] != "no_hint"
@@ -1368,39 +1434,110 @@ def summarize_phase(args: argparse.Namespace) -> dict:
 
 
 def _phase_worker(payload: dict, phase: str, extras: dict | None = None) -> None:
-    values = dict(payload)
-    values["phase"] = phase
+    values = dict(payload, phase=phase)
     if extras:
         values.update(extras)
-    dispatch(argparse.Namespace(**values))
+    started = time.monotonic()
+    print(f"Starting {phase}: pid={os.getpid()}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
+    if phase == "generate_group":
+        generate_group_phase(argparse.Namespace(**values))
+    else:
+        dispatch(argparse.Namespace(**values))
+    print(f"Finished {phase} in {time.monotonic() - started:.1f}s", flush=True)
 
 
-def _spawn_phase(
-    args: argparse.Namespace, phase: str, extras: dict | None = None
-) -> None:
-    print(
-        f"\n=== {phase}" + (f" {extras.get('generator_id')}" if extras else "") + " ==="
-    )
+def _start_phase(args, phase, extras=None, gpu=None):
     process = multiprocessing.get_context("spawn").Process(
-        target=_phase_worker, args=(vars(args), phase, extras)
+        target=_phase_worker, args=(vars(args), phase, extras), name=f"hint-compare-{phase}"
     )
-    process.start()
-    process.join()
-    if process.exitcode != 0:
-        raise RuntimeError(f"Phase {phase!r} failed with exit code {process.exitcode}.")
+    # Set visibility in the spawning environment, before the child imports Torch
+    # or vLLM. Restore it immediately so the next worker gets its own GPU.
+    overrides = {}
+    if gpu is not None:
+        overrides["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        # A TP=1 worker owns its engine in-process so cancellation also frees GPU memory.
+        overrides["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        for key in os.environ:
+            if key in {"RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"} or key.startswith(("TORCHELASTIC_", "ACCELERATE_")):
+                overrides[key] = None
+    original = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        process.start()
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return process
+
+
+def _stop_phases(processes):
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def _wait_phases(processes):
+    from multiprocessing.connection import wait
+
+    pending = list(processes)
+    try:
+        while pending:
+            ready = wait([process.sentinel for process in pending])
+            for process in list(pending):
+                if process.sentinel in ready:
+                    process.join()
+                    pending.remove(process)
+                    if process.exitcode != 0:
+                        raise RuntimeError(f"Phase {process.name!r} failed with exit code {process.exitcode}.")
+    finally:
+        _stop_phases(pending)
+
+
+def _spawn_phase(args, phase, extras=None, gpu=None):
+    _wait_phases([_start_phase(args, phase, extras, gpu)])
 
 
 def sweep_phase(args: argparse.Namespace) -> None:
+    started = time.monotonic()
     prepare_phase(args)
-    for generator_id, generator_model in generator_variants(args):
-        _spawn_phase(
-            args,
-            "generate",
-            {"generator_id": generator_id, "generator_model": generator_model},
-        )
-    _spawn_phase(args, "sufficiency")
-    _spawn_phase(args, "transfer")
+    gpus = getattr(args, "gpus", None)
+    generation_gpu = gpus[0] if gpus else None
+    shared, standalone = [], []
+    for label, model in generator_variants(args):
+        spec = resolve_model_adapter(model)
+        if model == args.model or (spec.is_adapter and spec.base_model == args.model):
+            shared.append((label, model))
+        else:
+            standalone.append((label, model))
+    if shared:
+        _spawn_phase(args, "generate_group", {"generator_group": shared}, generation_gpu)
+    for label, model in standalone:
+        _spawn_phase(args, "generate", {"generator_id": label, "generator_model": model}, generation_gpu)
+    if gpus:
+        processes = []
+        try:
+            processes.append(_start_phase(args, "sufficiency", gpu=gpus[0]))
+            processes.append(_start_phase(args, "transfer", gpu=gpus[1]))
+            _wait_phases(processes)
+        finally:
+            _stop_phases(processes)
+    else:
+        _spawn_phase(args, "sufficiency")
+        _spawn_phase(args, "transfer")
     summarize_phase(args)
+    print(f"Sweep finished in {time.monotonic() - started:.1f}s", flush=True)
 
 
 def dispatch(args: argparse.Namespace) -> None:
@@ -1466,6 +1603,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generator-temperature", type=float, default=1.0)
     parser.add_argument("--generator-top-p", type=float, default=1.0)
     parser.add_argument("--teacher-rollouts", type=int, default=4)
+    parser.add_argument("--teacher-condition-batch-size", type=int, default=64,
+                        help="Teacher conditions per resumable vLLM batch; each has --teacher-rollouts samples.")
     parser.add_argument("--k", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--teacher-max-tokens", type=int, default=8192)
     parser.add_argument("--teacher-temperature", type=float, default=1.0)
@@ -1487,6 +1626,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--gpus", nargs=2, metavar=("GENERATION_GPU", "TRANSFER_GPU"),
+                        help="Two physical GPU indices or two UUIDs. Teacher sampling and HF transfer run "
+                             "concurrently. Defaults to CUDA_VISIBLE_DEVICES when it lists exactly two GPUs.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force", action="store_true")
     # Internal arguments populated by the sweep's spawned generation processes.
@@ -1508,6 +1650,8 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--num-problems must be >= 1")
     if args.hints_per_problem < 1 or args.hint_max_tokens < 1:
         parser.error("--hints-per-problem and --hint-max-tokens must be >= 1")
+    if args.teacher_condition_batch_size < 1:
+        parser.error("--teacher-condition-batch-size must be >= 1")
     if args.teacher_rollouts < 1 or args.transfer_rollouts < 1:
         parser.error("--teacher-rollouts and --transfer-rollouts must be >= 1")
     if any(k < 1 or k > args.teacher_rollouts for k in args.k):
@@ -1531,6 +1675,23 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     ):
         if not 0 < value <= 1:
             parser.error(f"{name} must be in (0, 1]")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_gpus = [gpu.strip() for gpu in visible.split(",") if gpu.strip()] if visible is not None else None
+    if args.gpus is None and visible_gpus and len(visible_gpus) == 2 and args.tensor_parallel_size == 1:
+        args.gpus = visible_gpus
+    if args.gpus:
+        numeric = all(gpu.isdigit() for gpu in args.gpus)
+        uuids = all(gpu.startswith("GPU-") for gpu in args.gpus)
+        if not numeric and not uuids:
+            parser.error("--gpus requires two numeric indices or two GPU UUIDs; do not mix selector types")
+        if numeric:
+            args.gpus = [str(int(gpu)) for gpu in args.gpus]
+        if len(set(args.gpus)) != 2 or (uuids and any(a.startswith(b) for a, b in [args.gpus, args.gpus[::-1]])):
+            parser.error("--gpus requires two distinct GPUs")
+        if args.tensor_parallel_size != 1:
+            parser.error("Two-GPU phase parallelism requires --tensor-parallel-size 1")
+        if visible_gpus is not None and not set(args.gpus).issubset(visible_gpus):
+            parser.error("--gpus must select physical IDs already present in CUDA_VISIBLE_DEVICES")
     # Discover once before the sweep starts. Training may continue writing later
     # checkpoints, but every phase in this invocation must see the same frozen arm list.
     try:
@@ -1543,7 +1704,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     validate_args(args, parser)
-    dispatch(args)
+    if args.gpus and args.phase in {"generate", "sufficiency", "transfer"}:
+        gpu = args.gpus[1] if args.phase == "transfer" else args.gpus[0]
+        _spawn_phase(args, args.phase, gpu=gpu)
+    else:
+        dispatch(args)
 
 
 if __name__ == "__main__":
