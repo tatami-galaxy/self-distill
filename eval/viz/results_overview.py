@@ -24,8 +24,9 @@
 #
 # - Data source : JSON files under `results/`
 # - Best-checkpoint tables select the highest configured pass@k within each
-#   algorithm/variant across repeated runs. Hint-trained generator settings remain
-#   separate even though schema-v2 records those setting names in the `run` field.
+#   algorithm/variant across repeated runs. For SDFT `hint_trained` and
+#   `hint_trained_legacy`, each generator setting/run gets its own best checkpoint.
+#   Their directory names distinguish the variants, including relocated legacy results.
 # - Older AIME summaries do not contain `arm` or `eval_config`;
 #   their identities are recovered from the directory layout and are marked as schema 0.
 # - Scores are shown on a 0–1 scale in tables and as percentages in plots.
@@ -81,7 +82,7 @@ print(f"Results:    {RESULTS}")
 #
 
 # %% -------------------- LOAD AIME RESULTS --------------------
-AIME_YEAR = 25  # Select 24, 25, 26, ...
+AIME_YEAR = 24  # Select 24, 25, 26, ...
 AIME_DATASET = f"aime{AIME_YEAR}"
 AIME_LABEL = AIME_DATASET.upper()
 AIME_DIR = RESULTS / AIME_DATASET
@@ -93,6 +94,9 @@ if not AIME_DIR.is_dir():
         f"No results directory for {AIME_LABEL}: {AIME_DIR}. "
         f"Available AIME datasets: {AVAILABLE_AIME_DATASETS}"
     )
+
+HINT_TRAINED_VARIANTS = {"hint_trained", "hint_trained_legacy"}
+
 
 def read_json(path: Path) -> dict:
     with path.open() as handle:
@@ -125,12 +129,12 @@ def fallback_aime_arm(path: Path) -> dict:
     train_dataset, model, algo = parts[:3]
     step = parts[-1]
     extras = list(parts[3:-1])
-    if algo == "sdft" and len(extras) >= 2 and extras[0] == "hint_trained":
+    if algo == "sdft" and len(extras) >= 2 and extras[0] in HINT_TRAINED_VARIANTS:
         return {
             "algo": algo,
             "model": model,
             "train_dataset": train_dataset,
-            "variant": "hint_trained",
+            "variant": extras[0],
             "run": "/".join(extras[1:]),
             "step": step,
         }
@@ -152,6 +156,10 @@ def load_aime() -> pd.DataFrame:
         summary = read_json(path)
         fallback = fallback_aime_arm(path)
         arm = {**fallback, **(summary.get("arm") or {})}
+        # Legacy directories were renamed without rewriting their recorded arm.
+        # The directory distinguishes the learned-hint variants and generator runs.
+        if fallback["algo"] == "sdft" and fallback["variant"] in HINT_TRAINED_VARIANTS:
+            arm.update(variant=fallback["variant"], run=fallback["run"])
         eval_config = summary.get("eval_config") or {}
         recorded_eval_dataset = eval_config.get("eval_dataset")
         if recorded_eval_dataset not in (None, AIME_DATASET):
@@ -202,7 +210,7 @@ display(
 
 
 # %% -------------------- BEST AIME CHECKPOINTS BY MODEL --------------------
-AIME_BEST_K = 8  # Choose 1, 8, or 16.
+AIME_BEST_K = 1  # Choose 1, 8, or 16.
 AIME_BEST_METRIC = f"pass@{AIME_BEST_K}"
 if AIME_BEST_K not in {1, 8, 16}:
     raise ValueError(f"AIME_BEST_K must be one of 1, 8, or 16; got {AIME_BEST_K}")
@@ -222,8 +230,9 @@ def method_label(row: pd.Series, include_run: bool = True) -> str:
 def best_aime_by_algo(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
     """Select the best checkpoint per model, dataset, algorithm, and variant.
 
-    Repeated runs compete, but each ``hint_trained`` run names a distinct hint-generator
-    setting and therefore remains separate. If scores tie, prefer the earlier checkpoint,
+    Repeated runs compete, but each SDFT ``hint_trained`` or ``hint_trained_legacy`` run
+    names a distinct hint-generator setting and remains separate within its variant.
+    If scores tie, prefer the earlier checkpoint,
     then the run name for a deterministic result. The base evaluation is treated as the
     ``base`` algorithm with no variant.
     """
@@ -232,7 +241,7 @@ def best_aime_by_algo(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
     candidates["_dataset_key"] = candidates["train_dataset"].fillna("")
     candidates["_variant_key"] = candidates["variant"].fillna("")
     candidates["_setting_key"] = candidates["run"].where(
-        candidates["variant"].eq("hint_trained"), ""
+        candidates["algo"].eq("sdft") & candidates["variant"].isin(HINT_TRAINED_VARIANTS), ""
     ).fillna("")
     candidates["_run_sort"] = candidates["run"].fillna("")
     candidates = candidates.sort_values(
@@ -263,7 +272,9 @@ for model, model_results in aime_best.groupby("model", sort=True):
         ]
     ].copy()
     table["algorithm"] = table.pop("algo").str.upper()
-    table["setting"] = table["run"].where(table["variant"].eq("hint_trained"))
+    table["setting"] = table["run"].where(
+        table["algorithm"].eq("SDFT") & table["variant"].isin(HINT_TRAINED_VARIANTS)
+    )
     table["checkpoint"] = table.pop("step")
     for column in ("variant", "run", "setting", "checkpoint", "train_dataset"):
         table[column] = table[column].fillna("—")
