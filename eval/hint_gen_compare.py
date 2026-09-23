@@ -29,11 +29,10 @@ Example (run separately for each base-model size):
 
 Constrained runs use the same evaluator; only their run directory changes:
 
-    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.hint_gen_compare \
-      --run-dir /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-1.7B/deepmath_t0.7_g4 \
-      --output-dir results/hint_gen_compare/Qwen3-1.7B/deepmath_t0.7_g4 \
-      --num-problems 64 --hints-per-problem 4 \
-      --teacher-rollouts 4 --k 1 4
+   CUDA_VISIBLE_DEVICES=5,7 uv run python -m eval.hint_gen_compare \
+    --run-dir /mnt/data/ujan/self-distill/outputs/hint_gen/Qwen3-4B/deepmath_t0.7_g6_lora_r16 \
+    --output-dir results/hint_gen_compare/Qwen3-4B/deepmath_t0.7_g6_lora_16 \
+    --steps 20 40 60 80 100 
 
 With ``--gpus 4 5`` (or ``CUDA_VISIBLE_DEVICES=4,5``), sufficiency runs on the
 first GPU concurrently with clean-process HF transfer on the second. Base/LoRA
