@@ -39,7 +39,6 @@ import re
 from decimal import Decimal, InvalidOperation
 
 from datasets import Dataset, load_from_disk
-from vllm import LLM, SamplingParams
 
 from utils import DATASET_REGISTRY_TRAIN, hint_path, load_train_dataset
 from utils.model_adapters import vllm_model_and_adapter
@@ -170,6 +169,8 @@ def strip_thinking(text: str) -> str | None:
 
 
 def main():
+    from vllm import LLM, SamplingParams
+
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
