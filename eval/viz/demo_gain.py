@@ -104,6 +104,34 @@ def plot(output_dir):
         ax.legend()
         fig.savefig(figures / "hint_length_gain.png", dpi=160)
         plt.close(fig)
+    regions = ("thinking", "final", "first_5pct", "remaining_95pct")
+    if all(
+        f"{region}_normalized_gain" in summary["conditions"][arms[0]]
+        for region in regions
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4), layout="constrained")
+        for ax, selected in zip(axes, (regions[:2], regions[2:]), strict=True):
+            for j, region in enumerate(selected):
+                means = [
+                    summary["conditions"][arm][f"{region}_normalized_gain"]["mean"]
+                    for arm in arms
+                ]
+                x = np.arange(len(arms)) + (j - 0.5) * 0.35
+                ax.bar(x, means, width=0.35, label=region)
+                for pos, arm in zip(x, arms, strict=True):
+                    ax.vlines(
+                        pos,
+                        *summary["conditions"][arm][f"{region}_normalized_gain"][
+                            "ci95"
+                        ],
+                        color="black",
+                    )
+            ax.axhline(0, color="gray", lw=0.8)
+            ax.set_xticks(range(len(arms)), arms, rotation=30, ha="right")
+            ax.set_ylabel("Normalized gain (nats/token)")
+            ax.legend(fontsize=8)
+        fig.savefig(figures / "region_gain.png", dpi=160)
+        plt.close(fig)
     print(f"Saved plots -> {figures}")
 
 

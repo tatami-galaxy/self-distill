@@ -1,5 +1,10 @@
 # Demonstration likelihood gain
 
+For the independent AM-Qwen3 math experiment, see [am_demo_gain.md](am_demo_gain.md).
+It uses `eval.am_demo_gain` with the same prepare → generate PI → score →
+aggregate → visualize workflow and report layout. Cohorts and settings are
+chosen independently for each experiment.
+
 This experiment scores DeepMath's `r1_solution_1` with a frozen model. It measures
 how PI changes the likelihood of the complete reference trace, including its
 reasoning, final answer, and assistant terminator. It is a model-specific

@@ -1,4 +1,4 @@
-"""Frozen-model PI gain on complete R1 demonstrations. See docs/demo_gain.md.
+"""Frozen-model PI gain on complete reasoning demonstrations. See docs/demo_gain.md.
 
 Prepare a common cohort, generate hint variants in a separate process, score,
 then aggregate. No training, sliding windows, or silent prompt/target truncation.
@@ -67,11 +67,11 @@ def question_id(question, answer):
 
 
 def messages_for(row, condition, hint=None):
-    messages = format_prompt(row["question"], "deepmath")
+    messages = row.get("base_messages") or format_prompt(row["question"], "deepmath")
     if condition == "none":
         return messages
     if condition == "answer":
-        context = answer_context(row["final_answer"], "deepmath")
+        context = answer_context(row.get("answer_pi", row["final_answer"]), "deepmath")
     elif condition == "full":
         context = PI_FULL.format(demo=row["solution"])
     elif condition == "rollout":
@@ -338,64 +338,79 @@ def score(args):
         raise ValueError("Scorer model differs from prepared model")
     if digest(model_identity(manifest["model"])) != digest(manifest["model_identity"]):
         raise ValueError("Local scoring model changed")
-    variant_conditions = [c for c in conditions if c in VARIANTS]
-    variants, variant_meta, tok = {}, None, None
-    if variant_conditions:
-        variants, variant_meta = load_variants(
-            args.hint_variants_dir or out / "hints", cohort
+    pi_artifacts = []
+    if manifest.get("dataset") == "am_qwen3_math":
+        from eval.am_demo_gain import preflight_am
+
+        jobs, exclusions, pi_artifacts, diagnostics = preflight_am(
+            args, manifest, cohort, conditions
         )
-        tok = AutoTokenizer.from_pretrained(
-            manifest["model"], revision=manifest["revision"], trust_remote_code=True
-        )
-        if tokenizer_hash(tok) != manifest["tokenizer_hash"]:
-            raise ValueError("Scoring tokenizer changed")
-    # Complete preflight before GPU loading. All conditions use one common set.
-    jobs, exclusions = [], Counter()
-    for row in cohort:
-        arms = {"none": [{"prompt_ids": row["prompt_ids"]["none"], "sample_idx": 0}]}
-        reason = None
-        for condition in conditions:
-            if condition in CORE:
-                if condition not in row["prompt_ids"]:
-                    raise ValueError(
-                        f"{condition} was not prepared; use a new cohort directory"
-                    )
-                arms[condition] = [
-                    {"prompt_ids": row["prompt_ids"][condition], "sample_idx": 0}
-                ]
-            else:
-                hints = variants.get((row["question_id"], condition), [])
-                expected = variant_meta["config"]["samples_per_level"]
-                if {h["sample_idx"] for h in hints} != set(range(expected)):
-                    raise ValueError(
-                        f"Missing {condition} samples for {row['question_id']}; generate them first"
-                    )
-                arms[condition] = []
-                for hint in hints:
-                    if hint["invalid_reason"] or hint["truncated"]:
-                        reason = f"invalid_or_truncated_{condition}"
-                        break
-                    ids, target = render_target(
-                        tok, messages_for(row, condition, hint["hint"]), row["solution"]
-                    )
-                    if target != row["target_ids"]:
-                        raise ValueError("Variant target tokens differ from baseline")
-                    if len(ids) + len(target) > manifest["max_model_len"]:
-                        reason = f"over_context_{condition}"
-                        break
-                    arms[condition].append(
-                        {
-                            "prompt_ids": ids,
-                            "sample_idx": hint["sample_idx"],
-                            "hint_tokens": hint["n_tokens"],
-                        }
-                    )
+        variant_meta = None
+    else:
+        variant_conditions = [c for c in conditions if c in VARIANTS]
+        variants, variant_meta, tok = {}, None, None
+        if variant_conditions:
+            variants, variant_meta = load_variants(
+                args.hint_variants_dir or out / "hints", cohort
+            )
+            tok = AutoTokenizer.from_pretrained(
+                manifest["model"], revision=manifest["revision"], trust_remote_code=True
+            )
+            if tokenizer_hash(tok) != manifest["tokenizer_hash"]:
+                raise ValueError("Scoring tokenizer changed")
+        # Complete preflight before GPU loading. All conditions use one common set.
+        jobs, exclusions = [], Counter()
+        for row in cohort:
+            arms = {
+                "none": [{"prompt_ids": row["prompt_ids"]["none"], "sample_idx": 0}]
+            }
+            reason = None
+            for condition in conditions:
+                if condition in CORE:
+                    if condition not in row["prompt_ids"]:
+                        raise ValueError(
+                            f"{condition} was not prepared; use a new cohort directory"
+                        )
+                    arms[condition] = [
+                        {"prompt_ids": row["prompt_ids"][condition], "sample_idx": 0}
+                    ]
+                else:
+                    hints = variants.get((row["question_id"], condition), [])
+                    expected = variant_meta["config"]["samples_per_level"]
+                    if {h["sample_idx"] for h in hints} != set(range(expected)):
+                        raise ValueError(
+                            f"Missing {condition} samples for {row['question_id']}; generate them first"
+                        )
+                    arms[condition] = []
+                    for hint in hints:
+                        if hint["invalid_reason"] or hint["truncated"]:
+                            reason = f"invalid_or_truncated_{condition}"
+                            break
+                        ids, target = render_target(
+                            tok,
+                            messages_for(row, condition, hint["hint"]),
+                            row["solution"],
+                        )
+                        if target != row["target_ids"]:
+                            raise ValueError(
+                                "Variant target tokens differ from baseline"
+                            )
+                        if len(ids) + len(target) > manifest["max_model_len"]:
+                            reason = f"over_context_{condition}"
+                            break
+                        arms[condition].append(
+                            {
+                                "prompt_ids": ids,
+                                "sample_idx": hint["sample_idx"],
+                                "hint_tokens": hint["n_tokens"],
+                            }
+                        )
+                if reason:
+                    break
             if reason:
-                break
-        if reason:
-            exclusions[reason] += 1
-        else:
-            jobs.append((row, arms))
+                exclusions[reason] += 1
+            else:
+                jobs.append((row, arms))
     if not jobs:
         raise ValueError(f"No common valid questions: {dict(exclusions)}")
     config = {
@@ -461,6 +476,7 @@ def score(args):
             {
                 "question_id": row["question_id"],
                 "n_tokens": row["target_tokens"],
+                "thinking_end": row.get("thinking_end"),
                 "scores": references,
             }
         )
@@ -469,6 +485,8 @@ def score(args):
         out / "score_index.json",
         {
             "version": VERSION,
+            "dataset": manifest.get("dataset", "deepmath"),
+            "pi_artifacts": pi_artifacts,
             "cohort_hash": manifest["cohort_hash"],
             "conditions": conditions,
             "cache_config": config,
@@ -482,9 +500,13 @@ def score(args):
             )
             if variant_meta
             else None,
-            "hint_generation_diagnostics": variant_meta.get("diagnostics")
-            if variant_meta
-            else None,
+            "hint_generation_diagnostics": (
+                diagnostics
+                if pi_artifacts
+                else variant_meta.get("diagnostics")
+                if variant_meta
+                else None
+            ),
         },
     )
 
@@ -556,7 +578,12 @@ def estimate(values, draws):
 def aggregate(args):
     out = Path(args.output_dir)
     manifest, cohort = load_cohort(out)
-    index = read_json(out / "score_index.json")
+    report_dir = out
+    index = read_json(report_dir / "score_index.json")
+    if index.get("pi_artifacts"):
+        from eval.am_demo_gain import verify_artifacts
+
+        verify_artifacts(index["pi_artifacts"], cohort)
     if index["cohort_hash"] != manifest["cohort_hash"]:
         raise ValueError("Score index belongs to another cohort")
     if args.conditions and args.conditions != index["conditions"]:
@@ -585,6 +612,10 @@ def aggregate(args):
                 gains = logps - base
                 samples.append(gains)
                 metrics = token_metrics(gains, args.position_bins, args.early_tokens)
+                if row.get("thinking_end") is not None:
+                    from eval.am_demo_gain import region_metrics
+
+                    metrics.update(region_metrics(gains, row["thinking_end"]))
                 records.append(
                     {
                         "question_id": row["question_id"],
@@ -598,11 +629,13 @@ def aggregate(args):
                         **metrics,
                     }
                 )
-            by_arm[condition].append(
-                token_metrics(
-                    np.mean(samples, axis=0), args.position_bins, args.early_tokens
-                )
-            )
+            averaged = np.mean(samples, axis=0)
+            metrics = token_metrics(averaged, args.position_bins, args.early_tokens)
+            if row.get("thinking_end") is not None:
+                from eval.am_demo_gain import region_metrics
+
+                metrics.update(region_metrics(averaged, row["thinking_end"]))
+            by_arm[condition].append(metrics)
     if not lengths:
         raise ValueError("No scored questions")
     draws = np.random.default_rng(args.seed).integers(
@@ -620,6 +653,9 @@ def aggregate(args):
                 "early_gain",
             )
         }
+        for field in rows[0]:
+            if field not in summaries[condition]:
+                summaries[condition][field] = estimate([r[field] for r in rows], draws)
         summaries[condition]["pooled_token_gain"] = sum(
             r["total_gain"] for r in rows
         ) / sum(lengths)
@@ -636,6 +672,9 @@ def aggregate(args):
             for field in ("total_gain", "normalized_gain")
         }
     summary = {
+        "dataset": manifest.get("dataset", "deepmath"),
+        "source": manifest.get("source"),
+        "region_definition": "thinking includes closing think tag; final includes answer wrapper and assistant terminator; early fraction is first 5%",
         "method": "frozen_demonstration_log_likelihood_gain",
         "version": VERSION,
         "model": manifest["model"],
@@ -660,13 +699,15 @@ def aggregate(args):
             "mean": float(np.mean(lengths)),
         },
     }
-    write_rows(out / "per_question.jsonl", records)
-    write_json(out / "summary.json", summary)
-    print(f"Aggregated {len(lengths)} paired questions -> {out / 'summary.json'}")
+    write_rows(report_dir / "per_question.jsonl", records)
+    write_json(report_dir / "summary.json", summary)
+    print(
+        f"Aggregated {len(lengths)} paired questions -> {report_dir / 'summary.json'}"
+    )
     return summary
 
 
-def build_parser():
+def build_parser(*, deepmath=True):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--phase", choices=["prepare", "score", "aggregate", "all"], default="all"
@@ -679,9 +720,10 @@ def build_parser():
     )
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=None)
-    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k")
-    p.add_argument("--rollout-pi-sample-idx", type=int, default=0)
-    p.add_argument("--hint-variants-dir", default=None)
+    if deepmath:
+        p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k")
+        p.add_argument("--rollout-pi-sample-idx", type=int, default=0)
+        p.add_argument("--hint-variants-dir", default=None)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     p.add_argument("--block-size", type=int, default=1024)
@@ -697,8 +739,7 @@ def build_parser():
     return p
 
 
-def main():
-    args = build_parser().parse_args()
+def validate_args(args):
     if (
         min(
             args.block_size,
@@ -711,10 +752,15 @@ def main():
         raise ValueError(
             "Block size, bin count, early tokens, and bootstrap count must be positive"
         )
-    if args.num_problems < 0 or args.rollout_pi_sample_idx < 0:
+    if args.num_problems < 0 or getattr(args, "rollout_pi_sample_idx", 0) < 0:
         raise ValueError("Question count and rollout sample index must be nonnegative")
     if args.conditions and len(set(args.conditions)) != len(args.conditions):
         raise ValueError("Duplicate conditions")
+
+
+def main():
+    args = build_parser().parse_args()
+    validate_args(args)
     if args.phase in ("prepare", "all"):
         prepare(args)
     if args.phase in ("score", "all"):
