@@ -11,13 +11,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from eval.demo_gain import read_json, read_rows
+from eval.demo_gain import TARGET_FORMAT, read_json, read_rows
 from eval.hint_compare_cache import digest
 
 
 def plot(output_dir):
     root = Path(output_dir)
     summary = read_json(root / "summary.json")
+    if summary.get("target_format") != TARGET_FORMAT:
+        raise ValueError(
+            "Expected a solution-only report; rerun prepare, score, and aggregate"
+        )
     if summary["score_index_hash"] != digest(read_json(root / "score_index.json")):
         raise ValueError("Summary is stale; rerun aggregate")
     figures = root / "figures"
@@ -28,7 +32,7 @@ def plot(output_dir):
     for ax, metric, label in zip(
         axes,
         ("total_gain", "normalized_gain"),
-        ("Total gain (nats/demo)", "Normalized gain (nats/token)"),
+        ("Total gain (nats/solution)", "Normalized gain (nats/token)"),
         strict=True,
     ):
         for i, arm in enumerate(arms):
@@ -38,7 +42,10 @@ def plot(output_dir):
         ax.axhline(0, color="gray", lw=0.8)
         ax.set_xticks(range(len(arms)), arms, rotation=30, ha="right")
         ax.set_ylabel(label)
-    fig.suptitle(f"{summary['model']} — {summary['n_questions']} paired questions")
+    fig.suptitle(
+        f"{summary['model']} — {summary['n_questions']} paired questions — "
+        "final solution, no trace history"
+    )
     fig.savefig(figures / "gain.png", dpi=160)
     plt.close(fig)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), layout="constrained")
@@ -53,9 +60,9 @@ def plot(output_dir):
             ax.plot(x, values["mean"], label=arm, color=colors[arm])
             ax.fill_between(x, ci[:, 0], ci[:, 1], alpha=0.12, color=colors[arm])
         ax.axhline(0, color="gray", lw=0.8)
-        ax.set_xlabel("Demonstration position (%)")
+        ax.set_xlabel("Solution position (%)")
     axes[0].set_ylabel("Mean token gain (nats/token)")
-    axes[1].set_ylabel("Cumulative gain (nats/demo)")
+    axes[1].set_ylabel("Cumulative gain (nats/solution)")
     axes[1].legend(fontsize=8)
     fig.savefig(figures / "position_gain.png", dpi=160)
     plt.close(fig)
@@ -77,7 +84,7 @@ def plot(output_dir):
     axes[0].legend(fontsize=8)
     axes[1].plot(x, values["n_questions"], color="black")
     axes[1].set_ylabel("Contributing questions")
-    axes[1].set_xlabel("Demonstration token position")
+    axes[1].set_xlabel("Solution token position")
     fig.savefig(figures / "early_gain.png", dpi=160)
     plt.close(fig)
     rows = [
@@ -99,38 +106,10 @@ def plot(output_dir):
                     s=15,
                 )
         ax.set_xlabel("Generated hint tokens")
-        ax.set_ylabel("Demonstration gain (nats/token)")
+        ax.set_ylabel("Solution gain (nats/token)")
         ax.axhline(0, color="gray", lw=0.8)
         ax.legend()
         fig.savefig(figures / "hint_length_gain.png", dpi=160)
-        plt.close(fig)
-    regions = ("thinking", "final", "first_5pct", "remaining_95pct")
-    if all(
-        f"{region}_normalized_gain" in summary["conditions"][arms[0]]
-        for region in regions
-    ):
-        fig, axes = plt.subplots(1, 2, figsize=(13, 4), layout="constrained")
-        for ax, selected in zip(axes, (regions[:2], regions[2:]), strict=True):
-            for j, region in enumerate(selected):
-                means = [
-                    summary["conditions"][arm][f"{region}_normalized_gain"]["mean"]
-                    for arm in arms
-                ]
-                x = np.arange(len(arms)) + (j - 0.5) * 0.35
-                ax.bar(x, means, width=0.35, label=region)
-                for pos, arm in zip(x, arms, strict=True):
-                    ax.vlines(
-                        pos,
-                        *summary["conditions"][arm][f"{region}_normalized_gain"][
-                            "ci95"
-                        ],
-                        color="black",
-                    )
-            ax.axhline(0, color="gray", lw=0.8)
-            ax.set_xticks(range(len(arms)), arms, rotation=30, ha="right")
-            ax.set_ylabel("Normalized gain (nats/token)")
-            ax.legend(fontsize=8)
-        fig.savefig(figures / "region_gain.png", dpi=160)
         plt.close(fig)
     print(f"Saved plots -> {figures}")
 

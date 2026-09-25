@@ -26,7 +26,7 @@ class CharacterTokenizer:
 
 
 class AlignmentTest(unittest.TestCase):
-    def test_same_target_every_pi_with_single_think_and_terminator(self):
+    def test_same_solution_target_every_pi_without_trace_and_with_terminator(self):
         row = {
             "question": "Compute x",
             "solution": "Reasoning.</think>Answer: 42",
@@ -36,14 +36,15 @@ class AlignmentTest(unittest.TestCase):
         }
         expected = None
         for condition in ("none",) + dg.CONDITIONS:
-            _, target = dg.render_target(
+            prompt, target = dg.render_target(
                 CharacterTokenizer(),
                 dg.messages_for(row, condition, "A hint"),
                 row["solution"],
             )
             text = "".join(map(chr, target))
-            self.assertEqual(text.count("<think>"), 1)
-            self.assertTrue(text.endswith("<end>"))
+            self.assertEqual(text, "Answer: 42<end>")
+            if condition != "full":
+                self.assertNotIn("Reasoning.", "".join(map(chr, prompt)))
             if expected is not None:
                 self.assertEqual(expected, target)
             expected = target
@@ -84,9 +85,48 @@ class AlignmentTest(unittest.TestCase):
         ]
         self.assertTrue(all(t == targets[0] for t in targets))
         decoded = tok.decode(targets[0])
-        self.assertEqual(decoded.count("<think>"), 1)
-        self.assertIn("Compute 2+2=4.", decoded)
-        self.assertIn("<|im_end|>", decoded)
+        self.assertEqual(decoded, "The answer is \\boxed{4}.<|im_end|>\n")
+        prompt, target = dg.render_target(tok, dg.messages_for(row, "none"), solution)
+        self.assertTrue(tok.decode(prompt).endswith("<think>\n\n</think>\n\n"))
+        self.assertNotIn("Compute 2+2=4.", tok.decode(prompt))
+        # Changing hidden reasoning cannot affect either scoring input. This
+        # would fail if we merely sliced the loss after a teacher-forced trace.
+        alternative = (
+            "Entirely different hidden reasoning.</think>\nThe answer is \\boxed{4}."
+        )
+        self.assertEqual(
+            (prompt, target),
+            dg.render_target(tok, dg.messages_for(row, "none"), alternative),
+        )
+
+    def test_missing_empty_or_ambiguous_solution_is_rejected(self):
+        for source, message in [
+            ("No delimiter", "malformed_thinking_trace"),
+            ("Trace</think>   ", "empty_final_solution"),
+            ("Trace</think>Answer</think>Extra", "malformed_thinking_trace"),
+        ]:
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                dg.render_target(CharacterTokenizer(), [], source)
+
+    def test_template_that_leaves_thinking_in_target_is_rejected(self):
+        tok = CharacterTokenizer()
+        with (
+            mock.patch.object(
+                tok,
+                "apply_chat_template",
+                side_effect=[
+                    "header",
+                    "header<think></think>Final solution",
+                ],
+            ),
+            self.assertRaisesRegex(
+                ValueError, "solution_target_contains_thinking_tags"
+            ),
+        ):
+            dg.render_target(tok, [], "Private reasoning</think>Final solution")
 
 
 class RealScoringTest(unittest.TestCase):
@@ -162,6 +202,8 @@ class PipelineTest(unittest.TestCase):
         ]
         manifest = {
             "version": dg.VERSION,
+            "dataset": "deepmath",
+            "target_format": dg.TARGET_FORMAT,
             "model": "test",
             "model_identity": model_identity("test"),
             "revision": "revision",
@@ -246,6 +288,24 @@ class PipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "contents changed"):
                 dg.load_cohort(root)
 
+    def test_whole_trace_cohorts_are_rejected_before_scoring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.fixture(root)
+            manifest = dg.read_json(root / "manifest.json")
+            manifest["version"] = 1
+            dg.write_json(root / "manifest.json", manifest)
+            with (
+                mock.patch(
+                    "transformers.AutoModelForCausalLM.from_pretrained"
+                ) as loader,
+                self.assertRaisesRegex(
+                    ValueError, "prepare a new solution-only cohort"
+                ),
+            ):
+                dg.score(args)
+            loader.assert_not_called()
+
     def test_cache_keys_cover_exact_prompt_target_and_numerics(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = ConditionCache(Path(directory), "x", {"dtype": "float32"})
@@ -277,20 +337,21 @@ class HintTest(unittest.TestCase):
 
 
 class PreparationTest(unittest.TestCase):
-    def test_common_context_filter_includes_both_full_demo_copies(self):
+    def test_context_filter_counts_full_pi_but_only_solution_target(self):
         import types
 
         hints = [
             {"question": str(i), "final_answer": "42", "hint": "Use algebra"}
-            for i in range(4)
+            for i in range(5)
         ]
         solutions = [
             {**hints[0], "solution": "Reasoning</think>42"},
-            {**hints[1], "solution": "x" * 600 + "</think>42"},
+            {**hints[1], "solution": "x" * 1200 + "</think>42"},
             {**hints[2], "solution": "No thinking boundary"},
             {**hints[3], "solution": "First</think>42"},
             {**hints[3], "solution": "Different</think>42"},
             {**hints[3], "solution": "First</think>42"},
+            {**hints[4], "solution": "x" * 600 + "</think>42"},
         ]
         tok = CharacterTokenizer()
         tok.get_vocab = lambda: {chr(i): i for i in range(128)}
@@ -326,7 +387,11 @@ class PreparationTest(unittest.TestCase):
             ):
                 dg.prepare(args)
             manifest, cohort = dg.load_cohort(directory)
-            self.assertEqual(len(cohort), 1)
+            self.assertEqual(len(cohort), 2)
+            self.assertEqual(manifest["target_format"], dg.TARGET_FORMAT)
+            self.assertTrue(
+                all(r["target_ids"] == list(map(ord, "42<end>")) for r in cohort)
+            )
             self.assertEqual(manifest["ambiguous_source_question_answers"], 1)
             self.assertEqual(
                 manifest["exclusions_in_scanned_candidates"]["ambiguous_demo"], 1
