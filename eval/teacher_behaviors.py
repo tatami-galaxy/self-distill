@@ -85,14 +85,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from eval.advantage_dynamics_sdft import (
-    fingerprint_ids,
     question_cluster_bootstrap_ci,
     read_json,
     write_json_atomic,
 )
+from eval.passk_pi import PI_MODES
 from eval.teacher_uncertainty import EPISTEMIC_MARKERS
 
-PI_MODES = ("none", "rollout", "answer", "hint", "full")
+LEGACY_PI_MODES = ("none", "rollout", "answer", "hint", "full")
 
 BEHAVIORS = ("verification", "backtracking", "subgoal_setting", "backward_chaining")
 
@@ -798,8 +798,10 @@ def trajectory_key(record: dict) -> str:
 
 
 def source_fingerprint(rows: list[dict]) -> str:
-    """Identity of the exact set of trajectories classified, in order."""
-    return fingerprint_ids(trajectory_key(row) for row in rows)
+    """Fingerprint identities, completion text, and metrics used by the report."""
+    return hashlib.sha256(
+        json.dumps(rows, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1217,25 @@ def add_classifier_args(p) -> None:
                    help="Reclassify arms whose cached provenance differs from this run's.")
 
 
+def validate_common_sources(sources):
+    """Reject missing/duplicated trajectories before spending judge compute."""
+    expected, question_ids = None, {}
+    for mode, rows in sources.items():
+        keys = [(int(r["question_idx"]), int(r["sample_idx"])) for r in rows]
+        if len(set(keys)) != len(keys):
+            raise ValueError(f"Duplicate question/sample identity in {mode}")
+        if expected is None:
+            expected = set(keys)
+        elif set(keys) != expected:
+            raise ValueError(f"Completion arms must share the same question/sample set: {mode}")
+        for row in rows:
+            idx, qid = int(row["question_idx"]), row.get("question_id")
+            if qid is not None:
+                if idx in question_ids and question_ids[idx] != qid:
+                    raise ValueError(f"Question identity differs across completion arms: {idx}")
+                question_ids[idx] = qid
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1227,9 +1248,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-root", default="results/teacher_behaviors_16k",
                    help="Separate from --completions-root so --force can never overwrite "
                         "generation output.")
-    p.add_argument("--pi-modes", nargs="+", default=list(PI_MODES), choices=list(PI_MODES),
-                   help="Arms to classify. All five share one problem set, so all five should "
-                        "normally be run together.")
+    p.add_argument("--pi-modes", nargs="+", default=list(LEGACY_PI_MODES), choices=list(PI_MODES),
+                   help="Arms to classify, including hint_short, hint_medium and hint_detailed. "
+                        "Selected arms must share question/sample identities.")
     p.add_argument("--samples-per-problem", type=int, default=4,
                    help="Keep sample_idx < N. Thins SAMPLES, never problems: the CI resamples "
                         "questions, so the marginal sample is cheap to give up and the "
@@ -1242,6 +1263,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if len(set(args.pi_modes)) != len(args.pi_modes):
+        raise SystemExit("PI modes must be unique")
     if args.chunk_tokens < 1:
         raise SystemExit("--chunk-tokens must be >= 1")
     if args.context_paragraphs < 0:
@@ -1296,6 +1319,8 @@ def main() -> None:
         print(f"  {pi_mode:8s} {len(source_rows):5d} trajectories -> {len(chunk_plan):6d} "
               f"segments, {segment_tokens / 1e6:5.2f}M segment tokens "
               f"(+{len(chunk_plan) * system_tokens / 1e6:5.2f}M cached prefix)")
+
+    validate_common_sources({mode: plan["source_rows"] for mode, plan in plans.items()})
 
     if args.dry_run:
         total = sum(
