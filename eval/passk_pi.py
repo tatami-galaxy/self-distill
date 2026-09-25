@@ -1,58 +1,44 @@
-"""
-Measure how each privileged context (PI) lifts the SDFT self-teacher's pass@k on
-the (DeepMath) train set: full solution, answer, hint, an unverified rollout, or no PI.
+"""Compare self-teacher pass@k under fixed privileged-information conditions.
 
-The self-teacher is the model conditioned on the query + privileged context. With
-teacher_model_kind="base" the teacher IS the base student at initialization, so
-this is training-free: we sample from the base model under each PI's teacher
-prompt (built exactly as SDFTTrainer builds it) and grade against the gold answer.
-pass@k(PI) - pass@k(none) is the informativeness of that PI; `answer` is a near-
-trivial ceiling (the value is in the prompt), `hint` is the interesting middle, and
-`rollout` tests whether another sample from the same model helps without verifier
-information, expert demonstrations, or environment feedback.
+Use --cohort-dir to reuse demo-gain questions, full references, unverified
+rollouts, and short/medium/detailed self-generated hints. All requested arms
+share one validity- and context-filtered question set. Responses are generated
+freely (thinking enabled by default), graded against the gold answer, and cached
+per prompt. Report pass@k and paired differences against the no-PI baseline.
 
-Eval set = a random subset of the hint cache (utils/gen_hints.py), which carries
-question + final_answer + hint; `full` solutions are rejoined from DeepMath. For
-`rollout`, one fixed sample_idx from gen_rollouts.py is joined by its source hint-cache
-index (so repeated question text remains unambiguous). Selection never reads the rollout's
-reward. All arms are evaluated on the SAME problems and
-restricted to prompts that fit every requested PI arm, so every pass@k shares a denominator.
-
-When both `none` and `rollout` are requested, the script also computes a paired
-`rollout - none` pass@k difference per problem, split by whether the fixed cached attempt
-was correct. The cached reward is used only for this post-hoc split, never for selection.
-
-Reuses run_eval.pass_at_k / compute_pass_at_k and utils.grade.
-
-# Generate the rollout cache with ``python -m utils.gen_rollouts`` first.
-CUDA_VISIBLE_DEVICES=0 uv run python -m eval.passk_pi \
-    --model Qwen/Qwen3-1.7B --pi-modes none answer hint full rollout \
-    --num-problems 128 --n 8 --k 1 8 --save-samples \
-    --rollout-pi-root data/pi/attempted_solution_16k --rollout-pi-sample-idx 0 \
-    --output-dir results/passk_pi_16k --max-tokens 16384
+See docs/passk_pi.md for both-model commands and interpretation.
 """
 
 import argparse
-import json
 import os
 import random
 import time
+from collections import Counter
+from pathlib import Path
 from typing import NamedTuple
 
 from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
+from eval.demo_gain import load_cohort, load_variants, tokenizer_hash, write_json
+from eval.hint_compare_cache import ConditionCache, digest, model_identity
 from eval.run_eval import compute_pass_at_k, pass_at_k
-from train.opsd.train_sdft import (
+from utils import (
+    DATASET_REGISTRY_TRAIN,
     PI_FULL,
     PI_HINT,
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
+    answer_context,
+    format_prompt,
+    grade,
+    hint_path,
+    rollout_path,
 )
-from utils import DATASET_REGISTRY_TRAIN, format_prompt, answer_context, grade, hint_path, rollout_path
 
-
-PI_MODES = ("none", "rollout", "answer", "hint", "full")
+HINT_VARIANTS = ("hint_short", "hint_medium", "hint_detailed")
+PI_MODES = ("none", "answer", "rollout", "full", *HINT_VARIANTS, "hint")
+DEFAULT_PI_MODES = ("none", "answer", "rollout", "full", *HINT_VARIANTS)
 
 
 class RolloutAttempt(NamedTuple):
@@ -66,20 +52,26 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
     keep the system turn, fold the privileged context into the user turn via
     TEACHER_PROMPT_TEMPLATE. `none` is the plain student prompt (no PI)."""
     q = problem["question"]
-    messages = format_prompt(q, problem.get("dataset", "deepmath"))  # [system, user(question)]
+    messages = format_prompt(
+        q, problem.get("dataset", "deepmath")
+    )  # [system, user(question)]
     if pi_mode == "none":
         return messages
     if pi_mode == "full":
         privileged_context = PI_FULL.format(demo=problem["solution"])
     elif pi_mode == "answer":
-        privileged_context = answer_context(problem["answer"], problem.get("dataset", "deepmath"))
-    elif pi_mode == "hint":
-        privileged_context = PI_HINT.format(hint=problem["hint"])
+        privileged_context = answer_context(
+            problem["answer"], problem.get("dataset", "deepmath")
+        )
+    elif pi_mode == "hint" or pi_mode in HINT_VARIANTS:
+        privileged_context = PI_HINT.format(hint=problem[pi_mode])
     elif pi_mode == "rollout":
         privileged_context = PI_ROLLOUT.format(attempt=problem["rollout"])
     else:
         raise ValueError(f"unknown pi_mode {pi_mode!r}")
-    user_text = TEACHER_PROMPT_TEMPLATE.format(prompt=q, privileged_context=privileged_context)
+    user_text = TEACHER_PROMPT_TEMPLATE.format(
+        prompt=q, privileged_context=privileged_context
+    )
     return messages[:-1] + [{"role": "user", "content": user_text}]
 
 
@@ -106,7 +98,9 @@ def load_eval_problems(
     hints = load_from_disk(path)
     gen_models = set(hints.unique("gen_model"))
     if gen_models != {model}:
-        raise ValueError(f"Hint cache at {path} was generated by {gen_models}, not {model!r}.")
+        raise ValueError(
+            f"Hint cache at {path} was generated by {gen_models}, not {model!r}."
+        )
     if "dataset" in hints.column_names and set(hints.unique("dataset")) != {dataset}:
         raise ValueError(
             f"Hint cache at {path} was generated for dataset "
@@ -117,10 +111,14 @@ def load_eval_problems(
     if required_question_indices is not None:
         eligible_idx = [idx for idx in eligible_idx if idx in required_question_indices]
         if not eligible_idx:
-            raise ValueError("The hint and rollout-PI caches have no source indices in common.")
+            raise ValueError(
+                "The hint and rollout-PI caches have no source indices in common."
+            )
         if len(eligible_idx) < num_problems:
-            print(f"  warning: rollout-PI cache covers only {len(eligible_idx)} eligible "
-                  f"hint questions; requested {num_problems}")
+            print(
+                f"  warning: rollout-PI cache covers only {len(eligible_idx)} eligible "
+                f"hint questions; requested {num_problems}"
+            )
 
     n = min(num_problems, len(eligible_idx))
     idx = sorted(random.Random(seed).sample(eligible_idx, n))
@@ -139,13 +137,137 @@ def load_eval_problems(
 
     if need_full:
         # Rejoin worked solutions by question (hints came from these dataset rows).
-        sol_by_q = {r["question"]: r["solution"] for r in DATASET_REGISTRY_TRAIN[dataset]()}
+        sol_by_q = {
+            r["question"]: r["solution"] for r in DATASET_REGISTRY_TRAIN[dataset]()
+        }
         for p in problems:
             p["solution"] = sol_by_q.get(p["question"])
         missing = sum(p["solution"] is None for p in problems)
         if missing:
-            print(f"  warning: {missing}/{len(problems)} problems had no {dataset} solution to rejoin")
+            print(
+                f"  warning: {missing}/{len(problems)} problems had no {dataset} solution to rejoin"
+            )
     return problems
+
+
+def load_demo_problems(cohort_dir, model, pi_modes, num_problems, hint_sample_idx=0):
+    """Reuse fixed PI artifacts; validity selection never observes generated answers."""
+    manifest, cohort = load_cohort(cohort_dir)
+    if manifest["model"] != model or manifest["model_identity"] != model_identity(
+        model
+    ):
+        raise ValueError("Self-teacher must match the prepared cohort model")
+    modes = [mode for mode in pi_modes if mode in HINT_VARIANTS]
+    variants, hint_meta = {}, None
+    if modes:
+        hints_dir = Path(cohort_dir) / "hints"
+        if not all(
+            (hints_dir / name).is_file() for name in ("manifest.json", "hints.jsonl")
+        ):
+            raise FileNotFoundError(
+                f"Hint artifacts are incomplete at {hints_dir}; finish "
+                "python -m utils.gen_hint_variants for this cohort before evaluating"
+            )
+        variants, hint_meta = load_variants(hints_dir, cohort)
+        config = hint_meta["config"]
+        if (
+            config["model"] != model
+            or config["model_identity"] != manifest["model_identity"]
+            or config["revision"] != manifest["revision"]
+        ):
+            raise ValueError(
+                "Hint generator must match the self-teacher model and revision"
+            )
+        if not 0 <= hint_sample_idx < config["samples_per_level"]:
+            raise ValueError("Hint sample index is outside the generated sample range")
+    problems, excluded = [], Counter()
+    for row in cohort:
+        problem = dict(row, answer=row["final_answer"], dataset="deepmath")
+        invalid = []
+        for mode in modes:
+            matches = [
+                h
+                for h in variants.get((row["question_id"], mode), [])
+                if h["sample_idx"] == hint_sample_idx
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Missing fixed {mode} sample for {row['question_id']}"
+                )
+            hint = matches[0]
+            if hint["invalid_reason"] or hint["truncated"]:
+                invalid.append(mode)
+            problem[mode] = hint["hint"]
+        if invalid:
+            excluded[f"invalid_or_truncated_{invalid[0]}"] += 1
+            continue
+        if "rollout" in pi_modes and not problem.get("rollout"):
+            excluded["missing_rollout"] += 1
+            continue
+        # Scoring token IDs are irrelevant: accuracy uses fresh free-running responses.
+        for key in ("prompt_ids", "target_ids"):
+            problem.pop(key, None)
+        problems.append(problem)
+    n_valid = len(problems)
+    if num_problems:
+        problems = problems[:num_problems]
+    return problems, {
+        "cohort_dir": str(Path(cohort_dir).resolve()),
+        "cohort_hash": manifest["cohort_hash"],
+        "revision": manifest["revision"],
+        "tokenizer_hash": manifest["tokenizer_hash"],
+        "n_prepared": len(cohort),
+        "n_valid_pi": n_valid,
+        "exclusions": dict(excluded),
+        "hint_sample_idx": hint_sample_idx,
+        "hint_selection": "fixed_sample_idx_without_teacher_outcomes",
+        "hints_hash": hint_meta["hints_hash"] if hint_meta else None,
+        "rollout_pi_root": manifest["rollout_pi_root"],
+        "rollout_pi_sample_idx": manifest["rollout_pi_sample_idx"],
+    }
+
+
+def paired_against_none(results_by_mode, ks, bootstrap_samples, seed):
+    """Paired question-level differences, including CIs for each arm's accuracy."""
+    import numpy as np
+
+    baseline = results_by_mode["none"]
+    ids = [r["question_idx"] for r in baseline]
+    if not ids or len(set(ids)) != len(ids):
+        raise ValueError("Baseline question IDs must be nonempty and unique")
+    draws = np.random.default_rng(seed).integers(
+        len(ids), size=(bootstrap_samples, len(ids))
+    )
+    report = {}
+    for mode, results in results_by_mode.items():
+        indexed = {r["question_idx"]: r for r in results}
+        if len(indexed) != len(results) or set(indexed) != set(ids):
+            raise ValueError(f"Cannot pair {mode}: question IDs differ")
+        metrics = {}
+        for k in ks:
+
+            def values(rows, k=k):
+                if any(
+                    not 0 <= r["n_correct"] <= r["n_samples"] or r["n_samples"] < k
+                    for r in rows
+                ):
+                    raise ValueError("Invalid sample counts for pass@k")
+                return np.array(
+                    [pass_at_k(r["n_samples"], r["n_correct"], k) for r in rows]
+                )
+
+            arm = values([indexed[qid] for qid in ids])
+            delta = arm - values(baseline)
+            metrics[f"pass@{k}"] = {
+                "mean": float(arm.mean()),
+                "ci95": np.quantile(arm[draws].mean(axis=1), [0.025, 0.975]).tolist(),
+                "delta_vs_none": float(delta.mean()),
+                "delta_ci95": np.quantile(
+                    delta[draws].mean(axis=1), [0.025, 0.975]
+                ).tolist(),
+            }
+        report[mode] = metrics
+    return report
 
 
 def load_rollout_pi(
@@ -194,7 +316,9 @@ def load_rollout_pi(
             f"{set(cache.unique('dataset'))}, not {dataset!r}."
         )
     if set(cache.unique("question_source")) != {"hints"}:
-        raise ValueError(f"Rollout-PI cache at {path} was not generated from the hint cache.")
+        raise ValueError(
+            f"Rollout-PI cache at {path} was not generated from the hint cache."
+        )
     if set(cache.unique("mixed_only")) != {False}:
         raise ValueError(
             "The rollout-PI cache was generated with --mixed-only. That selection uses "
@@ -205,8 +329,12 @@ def load_rollout_pi(
     # Select solely on sample_idx. Reward is read only after that choice, as the label for the
     # post-hoc paired analysis; it never affects cache membership or prompt construction.
     for question_idx, question, completion, reward, cached_sample_idx in zip(
-        cache["question_idx"], cache["question"], cache["completion_text"],
-        cache["reward"], cache["sample_idx"], strict=True,
+        cache["question_idx"],
+        cache["question"],
+        cache["completion_text"],
+        cache["reward"],
+        cache["sample_idx"],
+        strict=True,
     ):
         if int(cached_sample_idx) != sample_idx:
             continue
@@ -282,8 +410,7 @@ def paired_bootstrap_ci(
     rng = random.Random(seed)
     n = len(deltas)
     bootstrap_means = sorted(
-        sum(deltas[rng.randrange(n)] for _ in range(n)) / n
-        for _ in range(num_samples)
+        sum(deltas[rng.randrange(n)] for _ in range(n)) / n for _ in range(num_samples)
     )
     return [
         _percentile(bootstrap_means, 0.025),
@@ -308,7 +435,9 @@ def paired_rollout_minus_none(
         for result in results_by_mode[mode]:
             question_idx = int(result["question_idx"])
             if question_idx in by_question:
-                raise ValueError(f"Duplicate {mode} result for question_idx={question_idx}.")
+                raise ValueError(
+                    f"Duplicate {mode} result for question_idx={question_idx}."
+                )
             by_question[question_idx] = result
         indexed[mode] = by_question
 
@@ -336,15 +465,17 @@ def paired_rollout_minus_none(
                 "rollout": rollout_value,
                 "delta": rollout_value - none_value,
             }
-        per_problem.append({
-            "question_idx": question_idx,
-            "attempt_correct": bool(problem["attempt_correct"]),
-            "none_n_samples": none["n_samples"],
-            "none_n_correct": none["n_correct"],
-            "rollout_n_samples": rollout["n_samples"],
-            "rollout_n_correct": rollout["n_correct"],
-            "pass_at_k": pass_values,
-        })
+        per_problem.append(
+            {
+                "question_idx": question_idx,
+                "attempt_correct": bool(problem["attempt_correct"]),
+                "none_n_samples": none["n_samples"],
+                "none_n_correct": none["n_correct"],
+                "rollout_n_samples": rollout["n_samples"],
+                "rollout_n_correct": rollout["n_correct"],
+                "pass_at_k": pass_values,
+            }
+        )
 
     paired = {
         "comparison": "rollout - none",
@@ -377,7 +508,9 @@ def paired_rollout_minus_none(
     return paired, per_problem
 
 
-def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str]):
+def restrict_to_pi_feasible(
+    problems, tokenizer, budget: int, pi_modes: list[str], enable_thinking=True
+):
     """Keep the common subset whose prompt fits under every requested PI condition."""
     feasible = []
     modes = list(dict.fromkeys(pi_modes))
@@ -393,6 +526,7 @@ def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
+                enable_thinking=enable_thinking,
             )["input_ids"][0]
             if len(ids) > budget:
                 fits = False
@@ -400,8 +534,10 @@ def restrict_to_pi_feasible(problems, tokenizer, budget: int, pi_modes: list[str
         if fits:
             feasible.append(problem)
     dropped = len(problems) - len(feasible)
-    print(f"  common eval set = {len(feasible)} problems whose {modes} PI prompts fit "
-          f"{budget} tokens (dropped {dropped})")
+    print(
+        f"  common eval set = {len(feasible)} problems whose {modes} PI prompts fit "
+        f"{budget} tokens (dropped {dropped})"
+    )
     return feasible
 
 
@@ -414,32 +550,99 @@ def restrict_to_full_feasible(problems, tokenizer, budget: int):
             continue
         ids = tokenizer.apply_chat_template(
             [build_teacher_messages(p, "full")],
-            add_generation_prompt=True, tokenize=True, return_dict=True,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
         )["input_ids"][0]
         if len(ids) <= budget:
             feasible.append(p)
     dropped = len(problems) - len(feasible)
-    print(f"  common eval set = {len(feasible)} problems whose full-PI prompt fits "
-          f"{budget} tokens (dropped {dropped})")
+    print(
+        f"  common eval set = {len(feasible)} problems whose full-PI prompt fits "
+        f"{budget} tokens (dropped {dropped})"
+    )
     return feasible
 
 
-def eval_pi_mode(llm, tokenizer, problems, pi_mode, sampling_params) -> list[dict]:
-    prompts = [
-        tokenizer.apply_chat_template(
-            build_teacher_messages(p, pi_mode), tokenize=False, add_generation_prompt=True
-        )
-        for p in problems
-    ]
-    outputs = llm.generate(prompts, sampling_params)
+def eval_pi_mode(
+    llm,
+    tokenizer,
+    problems,
+    pi_mode,
+    sampling_params,
+    *,
+    enable_thinking=True,
+    cache=None,
+    batch_size=16,
+):
+    """Generate and grade in resumable batches, retaining response text for analysis."""
     results = []
-    for p, out in zip(problems, outputs, strict=True):
-        n_correct = sum(grade(comp.text, p["answer"], p.get("dataset", "deepmath"))[1] for comp in out.outputs)
-        results.append({
-            "question_idx": p["question_idx"],
-            "n_samples": len(out.outputs),
-            "n_correct": n_correct,
-        })
+    for start in range(0, len(problems), batch_size):
+        batch = problems[start : start + batch_size]
+        pending, entries = [], []
+        for problem in batch:
+            prompt = tokenizer.apply_chat_template(
+                build_teacher_messages(problem, pi_mode),
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            key = (
+                cache.key(
+                    {
+                        "prompt": prompt,
+                        "answer": problem["answer"],
+                        "dataset": problem.get("dataset", "deepmath"),
+                    }
+                )
+                if cache
+                else None
+            )
+            saved = cache.load(key) if cache else None
+            entries.append([problem, saved])
+            if saved is None:
+                pending.append((len(entries) - 1, key, prompt))
+        if pending:
+            outputs = llm.generate([item[2] for item in pending], sampling_params)
+            for (index, key, _), output in zip(pending, outputs, strict=True):
+                problem = entries[index][0]
+                if len(output.outputs) != sampling_params.n:
+                    raise ValueError("Generator returned an unexpected sample count")
+                samples = []
+                for completion in output.outputs:
+                    correct = bool(
+                        grade(
+                            completion.text,
+                            problem["answer"],
+                            problem.get("dataset", "deepmath"),
+                        )[1]
+                    )
+                    samples.append(
+                        {
+                            "text": completion.text,
+                            "correct": correct,
+                            "finish_reason": completion.finish_reason,
+                            "n_tokens": len(completion.token_ids),
+                        }
+                    )
+                saved = {
+                    "n_samples": len(samples),
+                    "n_correct": sum(s["correct"] for s in samples),
+                    "n_truncated": sum(s["finish_reason"] == "length" for s in samples),
+                    "samples": samples,
+                }
+                if cache:
+                    cache.save(key, saved)
+                entries[index][1] = saved
+        for problem, saved in entries:
+            results.append(
+                dict(
+                    saved,
+                    question_idx=problem["question_idx"],
+                    question_id=problem.get("question_id"),
+                )
+            )
+        print(f"  {pi_mode}: {len(results)}/{len(problems)} questions", flush=True)
     return results
 
 
@@ -447,104 +650,279 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--model", default="Qwen/Qwen3-1.7B",
-                   help="Self-teacher = this base model. Must match the hint cache's gen_model.")
-    p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
-                   help="Dataset whose hint cache defines the eval set (and source of "
-                        "rejoined full solutions). Must match the hint cache's dataset.")
-    p.add_argument("--pi-modes", nargs="+", default=["none", "answer", "hint", "full"],
-                   choices=list(PI_MODES),
-                   help="PI arms to compare. 'none' is the no-PI student baseline; 'rollout' "
-                        "is a fixed, unverified sample from the same model.")
-    p.add_argument("--num-problems", type=int, default=128,
-                   help="Random subset of the train (hint) set to evaluate on.")
+    p.add_argument(
+        "--model",
+        default="Qwen/Qwen3-1.7B",
+        help="Self-teacher = this base model. Must match the hint cache's gen_model.",
+    )
+    p.add_argument(
+        "--dataset",
+        default="deepmath",
+        choices=list(DATASET_REGISTRY_TRAIN.keys()),
+        help="Dataset whose hint cache defines the eval set (and source of "
+        "rejoined full solutions). Must match the hint cache's dataset.",
+    )
+    p.add_argument(
+        "--pi-modes",
+        nargs="+",
+        default=list(DEFAULT_PI_MODES),
+        choices=list(PI_MODES),
+        help="PI arms to compare. 'none' is the no-PI student baseline; 'rollout' "
+        "is a fixed, unverified sample from the same model.",
+    )
+    p.add_argument(
+        "--num-problems",
+        type=int,
+        default=128,
+        help="Question limit; 0 uses all valid questions with --cohort-dir.",
+    )
     p.add_argument("--n", type=int, default=8, help="Samples per problem (n >= max k).")
-    p.add_argument("--k", type=int, nargs="+", default=[1, 8], help="pass@k values to report.")
-    p.add_argument("--max-tokens", type=int, default=8192,
-                   help="Completion budget. Keep generous so full reasoning isn't "
-                        "truncated (truncation -> no \\boxed -> undercounts pass@k).")
+    p.add_argument(
+        "--k",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8],
+        help="pass@k values to report.",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="Completion budget. Keep generous so full reasoning isn't "
+        "truncated (truncation -> no \\boxed -> undercounts pass@k).",
+    )
     p.add_argument("--output-dir", default="results/passk_pi")
-    p.add_argument("--rollout-pi-root", default="data/pi/attempted_solution_8k",
-                   help="Root passed as --output-root to gen_rollouts.py for the rollout PI.")
-    p.add_argument("--rollout-pi-sample-idx", type=int, default=0,
-                   help="Fixed cached sample_idx used as PI for every problem. Selection does "
-                        "not inspect correctness rewards.")
-    p.add_argument("--paired-bootstrap-samples", type=int, default=10_000,
-                   help="Problem-level bootstrap replicates for the paired rollout-minus-none "
-                        "95%% confidence intervals.")
-    p.add_argument("--save-samples", action="store_true",
-                   help="Also save per-problem n_correct values and paired pass@k deltas.")
+    p.add_argument(
+        "--rollout-pi-root",
+        default="data/pi/attempted_solution_8k",
+        help="Root passed as --output-root to gen_rollouts.py for the rollout PI.",
+    )
+    p.add_argument(
+        "--rollout-pi-sample-idx",
+        type=int,
+        default=0,
+        help="Fixed cached sample_idx used as PI for every problem. Selection does "
+        "not inspect correctness rewards.",
+    )
+    p.add_argument(
+        "--paired-bootstrap-samples",
+        type=int,
+        default=10_000,
+        help="Question-level bootstrap replicates for accuracy and paired differences.",
+    )
+    p.add_argument(
+        "--save-samples",
+        action="store_true",
+        help="Also save per-problem n_correct values and paired pass@k deltas.",
+    )
     # vLLM
     p.add_argument("--max-model-len", type=int, default=40000)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--cohort-dir", help="Prepared demo-gain cohort with generated hints."
+    )
+    p.add_argument("--hint-sample-idx", type=int, default=0)
+    p.add_argument(
+        "--enable-thinking", action=argparse.BooleanOptionalAction, default=True
+    )
+    p.add_argument("--temperature", type=float, default=0.6)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Validate and save the cohort without loading weights.",
+    )
+    p.add_argument("--force", action="store_true", help="Recompute cached generations.")
     args = p.parse_args()
 
+    if args.n < 1 or not args.k or min(args.k) < 1:
+        p.error("--n and --k must be positive")
+    if args.num_problems < 0 or args.hint_sample_idx < 0 or args.batch_size < 1:
+        p.error(
+            "Problem count and hint index must be nonnegative; batch size must be positive"
+        )
+    if args.max_tokens < 1 or args.max_model_len <= args.max_tokens:
+        p.error("Need 0 < --max-tokens < --max-model-len")
+    if (
+        args.temperature <= 0
+        or not 0 < args.top_p <= 1
+        or args.top_k not in (-1,)
+        and args.top_k < 1
+    ):
+        p.error("Use positive temperature, 0 < top-p <= 1, and top-k >= 1 or -1")
+    if len(set(args.pi_modes)) != len(args.pi_modes) or "none" not in args.pi_modes:
+        p.error("PI modes must be unique and include none")
+    if any(mode in HINT_VARIANTS for mode in args.pi_modes) and not args.cohort_dir:
+        p.error("Generated hint variants require --cohort-dir")
+    if args.cohort_dir and args.dataset != "deepmath":
+        p.error("Demo-gain cohorts require --dataset deepmath")
+    if not args.cohort_dir and args.num_problems == 0:
+        p.error("--num-problems 0 (all) requires --cohort-dir")
     if max(args.k) > args.n:
         p.error(f"--k values must be <= --n ({args.n}); got --k {args.k}")
     if args.rollout_pi_sample_idx < 0:
         p.error("--rollout-pi-sample-idx must be >= 0")
+    if not 0 < args.gpu_memory_utilization <= 1 or args.tensor_parallel_size < 1:
+        p.error(
+            "GPU memory utilization must be in (0, 1]; tensor parallel size must be positive"
+        )
     if args.paired_bootstrap_samples < 1:
         p.error("--paired-bootstrap-samples must be >= 1")
 
-    rollout_attempts = None
     rollout_metadata = None
-    if "rollout" in args.pi_modes:
-        rollout_attempts, rollout_metadata = load_rollout_pi(
+    cohort_metadata = None
+    if args.cohort_dir:
+        problems, cohort_metadata = load_demo_problems(
+            args.cohort_dir,
             args.model,
-            args.dataset,
-            args.rollout_pi_root,
-            args.rollout_pi_sample_idx,
+            args.pi_modes,
+            args.num_problems,
+            args.hint_sample_idx,
         )
+    else:
+        rollout_attempts = None
+        if "rollout" in args.pi_modes:
+            rollout_attempts, rollout_metadata = load_rollout_pi(
+                args.model,
+                args.dataset,
+                args.rollout_pi_root,
+                args.rollout_pi_sample_idx,
+            )
+        problems = load_eval_problems(
+            args.model,
+            args.num_problems,
+            args.seed,
+            need_full=("full" in args.pi_modes),
+            dataset=args.dataset,
+            required_question_indices=set(rollout_attempts)
+            if rollout_attempts is not None
+            else None,
+        )
+        if rollout_attempts is not None:
+            problems = attach_rollout_pi(problems, rollout_attempts)
+    print(f"Loaded {len(problems)} eval problems for {args.model}", flush=True)
 
-    problems = load_eval_problems(
-        args.model, args.num_problems, args.seed,
-        need_full=("full" in args.pi_modes), dataset=args.dataset,
-        required_question_indices=(
-            set(rollout_attempts) if rollout_attempts is not None else None
-        ),
+    from transformers import AutoConfig, AutoTokenizer
+
+    revision = cohort_metadata["revision"] if cohort_metadata else None
+    config = AutoConfig.from_pretrained(
+        args.model, revision=revision, trust_remote_code=True
     )
-    if rollout_attempts is not None:
-        problems = attach_rollout_pi(problems, rollout_attempts)
-    print(f"Loaded {len(problems)} eval problems for {args.model}")
+    revision = getattr(config, "_commit_hash", None) or revision
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, revision=revision, trust_remote_code=True
+    )
+    tok_hash = tokenizer_hash(tokenizer)
+    if cohort_metadata and tok_hash != cohort_metadata["tokenizer_hash"]:
+        raise ValueError("Tokenizer differs from the prepared cohort")
+    before_context_filter = len(problems)
+    problems = restrict_to_pi_feasible(
+        problems,
+        tokenizer,
+        args.max_model_len - args.max_tokens,
+        args.pi_modes,
+        enable_thinking=args.enable_thinking,
+    )
+    if not problems:
+        raise RuntimeError("No common eval problems fit every requested PI prompt.")
+    out_dir = Path(args.output_dir) / args.model.replace("/", "_")
+    generation_config = {
+        "version": 1,
+        "model_identity": model_identity(args.model),
+        "revision": revision,
+        "tokenizer_hash": tok_hash,
+        "n": args.n,
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "seed": args.seed,
+        "enable_thinking": args.enable_thinking,
+        "max_model_len": args.max_model_len,
+        "dtype": "bfloat16",
+        "vllm_version": __import__("vllm").__version__,
+    }
+    run_meta = {
+        "model": args.model,
+        "dataset": args.dataset,
+        "pi_modes": args.pi_modes,
+        "cohort": cohort_metadata,
+        "n_problems": len(problems),
+        "n_context_excluded": before_context_filter - len(problems),
+        "question_indices": [r["question_idx"] for r in problems],
+        "question_ids": [r.get("question_id") for r in problems],
+        "problems_hash": digest(problems),
+        "generation": generation_config,
+    }
+    meta_path = out_dir / "run_meta.json"
+    if meta_path.exists():
+        from eval.demo_gain import read_json
 
+        if read_json(meta_path) != run_meta:
+            raise ValueError("Run settings or cohort changed; use a new --output-dir")
+    write_json(meta_path, run_meta)
+    if args.prepare_only:
+        print(f"Prepared {len(problems)} questions -> {out_dir}", flush=True)
+        return
+    cache = ConditionCache(
+        out_dir, "passk_generation", generation_config, force=args.force
+    )
     llm = LLM(
         model=args.model,
+        revision=revision,
+        tokenizer_revision=revision,
         max_model_len=args.max_model_len,
+        dtype="bfloat16",
+        generation_config="vllm",
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         seed=args.seed,
         trust_remote_code=True,
     )
-    tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
-        n=args.n, max_tokens=args.max_tokens, seed=args.seed,
+        n=args.n,
+        max_tokens=args.max_tokens,
+        seed=args.seed,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
     )
-
-    # Fix a common problem set across arms. A long attempted solution can be more binding
-    # than the reference solution, so check every requested prompt rather than assuming full.
-    budget = args.max_model_len - args.max_tokens
-    problems = restrict_to_pi_feasible(problems, tokenizer, budget, args.pi_modes)
-    if not problems:
-        raise RuntimeError("No common eval problems fit every requested PI prompt.")
 
     summary = {mode: {} for mode in args.pi_modes}
     results_by_mode = {}
     per_problem_n_correct = {}
     t0 = time.time()
     for mode in args.pi_modes:
-        results = eval_pi_mode(llm, tokenizer, problems, mode, sampling_params)
+        results = eval_pi_mode(
+            llm,
+            tokenizer,
+            problems,
+            mode,
+            sampling_params,
+            enable_thinking=args.enable_thinking,
+            cache=cache,
+            batch_size=args.batch_size,
+        )
+        write_json(out_dir / f"{mode}_results.json", results)
         results_by_mode[mode] = results
         pak = compute_pass_at_k(results, args.k)
         summary[mode] = {f"pass@{k}": pak[k] for k in args.k}
         per_problem_n_correct[mode] = [r["n_correct"] for r in results]
-        print(f"  {mode:7s} " + "  ".join(f"pass@{k}={pak[k]*100:5.1f}%" for k in args.k))
+        print(
+            f"  {mode:7s} "
+            + "  ".join(f"pass@{k}={pak[k] * 100:5.1f}%" for k in args.k)
+        )
     elapsed = time.time() - t0
 
     paired_summary = None
     paired_per_problem = None
-    if {"none", "rollout"}.issubset(results_by_mode):
+    if {"none", "rollout"}.issubset(results_by_mode) and all(
+        "attempt_correct" in r for r in problems
+    ):
         paired_summary, paired_per_problem = paired_rollout_minus_none(
             problems,
             results_by_mode,
@@ -554,11 +932,13 @@ def main():
         )
 
     # Report table
-    print(f"\n{'='*60}\npass@k by PI ({len(problems)} problems, n={args.n})")
+    print(f"\n{'=' * 60}\npass@k by PI ({len(problems)} problems, n={args.n})")
     header = "PI mode  " + "  ".join(f"pass@{k:<3}" for k in args.k)
     print(header)
     for mode in args.pi_modes:
-        row = f"{mode:7s}  " + "  ".join(f"{summary[mode][f'pass@{k}']*100:6.1f}" for k in args.k)
+        row = f"{mode:7s}  " + "  ".join(
+            f"{summary[mode][f'pass@{k}'] * 100:6.1f}" for k in args.k
+        )
         print(row)
 
     if paired_summary is not None:
@@ -570,10 +950,10 @@ def main():
                 metric = group["pass_at_k"][f"pass@{k}"]
                 ci_low, ci_high = metric["delta_ci95"]
                 print(
-                    f"    pass@{k}: none={metric['none']*100:5.1f}%  "
-                    f"rollout={metric['rollout']*100:5.1f}%  "
-                    f"delta={metric['delta']*100:+5.1f} pp  "
-                    f"95% CI [{ci_low*100:+5.1f}, {ci_high*100:+5.1f}] pp"
+                    f"    pass@{k}: none={metric['none'] * 100:5.1f}%  "
+                    f"rollout={metric['rollout'] * 100:5.1f}%  "
+                    f"delta={metric['delta'] * 100:+5.1f} pp  "
+                    f"95% CI [{ci_low * 100:+5.1f}, {ci_high * 100:+5.1f}] pp"
                 )
 
     # Save
@@ -585,7 +965,21 @@ def main():
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "elapsed_s": elapsed,
+        "schema_version": 2,
         "pass_at_k": summary,
+        "bootstrap_samples": args.paired_bootstrap_samples,
+        "bootstrap_seed": args.seed,
+        "uncertainty_unit": "question",
+        "run_meta": run_meta,
+        "paired_against_none": paired_against_none(
+            results_by_mode, args.k, args.paired_bootstrap_samples, args.seed
+        ),
+        "truncation_rate": {
+            mode: sum(r["n_truncated"] for r in results)
+            / sum(r["n_samples"] for r in results)
+            for mode, results in results_by_mode.items()
+        },
+        "cache_stats": cache.stats(),
     }
     if rollout_metadata is not None:
         out["rollout_pi"] = rollout_metadata
@@ -595,11 +989,8 @@ def main():
         out["per_problem_n_correct"] = per_problem_n_correct
         if paired_per_problem is not None:
             out["paired_rollout_minus_none_per_problem"] = paired_per_problem
-    out_dir = os.path.join(args.output_dir, args.model.replace("/", "_"))
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "passk_pi_summary.json")
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
+    out_path = out_dir / "passk_pi_summary.json"
+    write_json(out_path, out)
     print(f"\nSaved -> {out_path}")
 
 
