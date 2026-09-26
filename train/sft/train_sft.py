@@ -276,13 +276,13 @@ def main():
                    help="Optimizer. Default 8-bit Adam; use adamw_torch_fused otherwise. "
                         "Nothing here uses vLLM, so train_ppo.py's server-mode 8-bit hazard "
                         "does not apply.")
-    p.add_argument("--max-steps", type=int, default=400, help="Total optimizer steps")
+    p.add_argument("--max-steps", type=int, default=200, help="Total optimizer steps")
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=16)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     # bookkeeping
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=50)
+    p.add_argument("--save-steps", type=int, default=20)
     p.add_argument("--report-to", default="tensorboard")
     p.add_argument("--seed", type=int, default=42)
     # resume
