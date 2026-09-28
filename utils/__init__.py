@@ -11,7 +11,7 @@ utils.gen_hints`.
 """
 
 from utils.tasks import dataset_provenance, accuracy_reward_for_dataset, answer_context, format_prompt, reward_solution
-from utils.pi import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT
+from utils.pi import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT, extract_final_solution
 from utils.utils import (
     # dataset registries and loaders
     DATASET_REGISTRY_EVAL,
@@ -53,6 +53,7 @@ __all__ = [
     "TEACHER_PROMPT_TEMPLATE",
     "compose_pi_messages",
     "extract_answer",
+    "extract_final_solution",
     "format_prompt_math",
     "grade",
     "grade_answer",

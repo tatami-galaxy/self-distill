@@ -1,6 +1,6 @@
 # Self-teacher pass@k across PI types
 
-Compare the same frozen model under seven conditions on a common question set:
+Compare the same frozen model under eight conditions on a common question set:
 
 | CLI condition | Privileged information |
 | --- | --- |
@@ -8,9 +8,15 @@ Compare the same frozen model under seven conditions on a common question set:
 | `answer` | Gold final answer |
 | `rollout` | One fixed, unverified cached attempt from the same model |
 | `full` | Complete reference demonstration, including thinking and final solution |
+| `solution` | Complete reference response after `</think>`, without the thinking trace |
 | `hint_short` | Cached short self-generated hint |
 | `hint_medium` | Cached medium self-generated hint |
 | `hint_detailed` | Cached detailed self-generated hint |
+
+`solution` uses the same worked-solution prompt wrapper as `full`, but removes
+all reference text through `</think>`. It keeps the entire worked final response,
+not just the boxed answer. Missing, repeated, or empty thinking boundaries are
+rejected rather than falling back to the complete trace.
 
 These are **free-running accuracy** evaluations. The model generates its own
 thinking and final response; no reference solution tokens are teacher-forced.
@@ -71,7 +77,7 @@ Model-provided generation defaults are disabled in favor of these settings.
 CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
   --model Qwen/Qwen3-1.7B \
   --cohort-dir results/demo_gain/solution/Qwen3-1.7B \
-  --pi-modes none answer rollout full hint_short hint_medium hint_detailed \
+  --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
   --num-problems 0 --hint-sample-idx 0 \
   --n 8 --k 1 2 4 8 \
   --enable-thinking --max-tokens 8192 --max-model-len 40000 \
@@ -86,8 +92,8 @@ CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
 CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
   --model Qwen/Qwen3-4B \
   --cohort-dir results/demo_gain/solution/Qwen3-4B \
-  --pi-modes none answer rollout full hint_short hint_medium hint_detailed \
-  --num-problems 0 --hint-sample-idx 0 \
+  --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
+  --num-problems 200 --hint-sample-idx 0 \
   --n 8 --k 1 2 4 8 \
   --enable-thinking --max-tokens 8192 --max-model-len 40000 \
   --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
@@ -106,17 +112,17 @@ for model in Qwen3-1.7B Qwen3-4B; do
   CUDA_VISIBLE_DEVICES='' .venv/bin/python -m eval.passk_pi \
     --model "Qwen/$model" \
     --cohort-dir "results/demo_gain/solution/$model" \
-    --pi-modes none answer rollout full hint_short hint_medium hint_detailed \
+    --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
     --num-problems 0 --hint-sample-idx 0 \
     --n 8 --k 1 2 4 8 \
     --enable-thinking --max-tokens 8192 --max-model-len 40000 \
     --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
-    --output-dir results/passk_pi/demo_gain --prepare-only
+    --output-dir results/passk_pi/demo_gain_solution --prepare-only
 done
 ```
 
 A small pilot can use `--num-problems 4 --n 2 --k 1 2` with a separate output
-root such as `results/passk_pi/demo_gain_pilot`.
+root such as `results/passk_pi/demo_gain_solution_pilot`.
 
 ## Resume and outputs
 
@@ -136,8 +142,8 @@ run still initializes the vLLM model.
 Each model writes its own directory:
 
 ```text
-results/passk_pi/demo_gain/Qwen_Qwen3-1.7B/
-results/passk_pi/demo_gain/Qwen_Qwen3-4B/
+results/passk_pi/demo_gain_solution/Qwen_Qwen3-1.7B/
+results/passk_pi/demo_gain_solution/Qwen_Qwen3-4B/
 ```
 
 Files:
@@ -163,7 +169,7 @@ A response that hits the token limit remains in the denominator and is graded
 normally. `truncation_rate` reports the fraction with finish reason `length`;
 it does not automatically mark such responses wrong.
 
-`answer` and `full` expose the gold answer, so success can reflect copying or
+`answer`, `full`, and `solution` expose the gold answer, so success can reflect copying or
 following supplied information. These conditions measure privileged self-teacher
 behavior, not unaided mathematical capability. The fixed hints' source model
 matches the evaluated model, but their source demonstration remains the external

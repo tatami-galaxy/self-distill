@@ -613,7 +613,7 @@ class RunConfigTest(unittest.TestCase):
 
 class HintPiIntegrationTest(unittest.TestCase):
     def test_cli_accepts_generated_hint_conditions(self):
-        modes = ["none", "answer", "rollout", "full", "hint_short", "hint_medium", "hint_detailed"]
+        modes = ["none", "answer", "rollout", "full", "solution", "hint_short", "hint_medium", "hint_detailed"]
         args = tb.build_parser().parse_args(["--pi-modes", *modes])
         self.assertEqual(args.pi_modes, modes)
 

@@ -48,6 +48,41 @@ class RolloutPiPromptTest(unittest.TestCase):
         self.assertIn("Solve q", user_text)
 
 
+class SolutionPiPromptTest(unittest.TestCase):
+    def test_final_solution_only_is_shared_with_demo_gain(self):
+        from eval.demo_gain import messages_for
+
+        row = {
+            "question": "Q",
+            "solution": "Private reasoning</think>Full worked answer: 42.",
+        }
+        teacher = passk_pi.build_teacher_messages(row, "solution")
+        self.assertEqual(teacher, messages_for(row, "solution"))
+        self.assertNotIn("Private reasoning", str(teacher))
+        self.assertIn("Full worked answer: 42.", teacher[-1]["content"])
+        changed = dict(
+            row, solution="Other hidden reasoning</think>Full worked answer: 42."
+        )
+        self.assertEqual(teacher, passk_pi.build_teacher_messages(changed, "solution"))
+
+    def test_malformed_source_is_excluded_from_all_requested_arms(self):
+        class Tokenizer:
+            def apply_chat_template(self, *args, **kwargs):
+                return {"input_ids": [[1]]}
+
+        rows = [
+            {"question": "bad", "solution": "No boundary"},
+            {"question": "empty", "solution": "Reasoning</think> "},
+            {"question": "valid", "solution": "Reasoning</think>42"},
+        ]
+        self.assertEqual(
+            passk_pi.restrict_to_pi_feasible(
+                rows, Tokenizer(), 10, ["none", "solution"]
+            ),
+            rows[-1:],
+        )
+
+
 class RolloutPiCacheTest(unittest.TestCase):
     def test_fixed_sample_index_is_selected_without_reward_filtering(self):
         with (
@@ -513,7 +548,9 @@ class PasskCliTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv):
                 passk_pi.main()
                 passk_pi.main()
-            self.assertEqual(llm.return_value.generate.call_count, 7)
+            self.assertEqual(
+                llm.return_value.generate.call_count, len(passk_pi.DEFAULT_PI_MODES)
+            )
             summary = json.loads(
                 (Path(directory) / "student/passk_pi_summary.json").read_text()
             )
@@ -522,7 +559,10 @@ class PasskCliTest(unittest.TestCase):
                 summary["pass_at_k"]["none"], {"pass@1": 0.5, "pass@2": 1.0}
             )
             self.assertEqual(summary["truncation_rate"]["hint_short"], 0.5)
-            self.assertEqual(summary["cache_stats"], {"hits": 14, "misses": 0})
+            self.assertEqual(
+                summary["cache_stats"],
+                {"hits": 2 * len(passk_pi.DEFAULT_PI_MODES), "misses": 0},
+            )
             self.assertEqual(
                 summary["paired_against_none"]["full"]["pass@1"]["delta_vs_none"], 0
             )

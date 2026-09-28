@@ -5,6 +5,7 @@ Train SDFT -- on-policy self-distillation from a privileged teacher, following
 
 Privileged context (`--pi-mode`):
   full   -- the reference r1 solution (reasoning + worked answer) as a worked example
+  solution -- only the complete response after </think>, with the full-PI wrapper
   answer -- only the gold final answer as a hint
   hint   -- a small set of concepts/results distilled from the full solution;
             precompute with `python -m utils.gen_hints` first. By default the
@@ -59,22 +60,25 @@ from datasets import load_from_disk
 from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
 from utils import (
-    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
-    PI_ANSWER as PI_ANSWER,
     PI_FULL,
     PI_HINT,
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
-    compose_pi_messages,
-    format_prompt,
     answer_context,
-    reward_solution,
+    compose_pi_messages,
+    dataset_provenance,
+    extract_final_solution,
+    format_prompt,
     hint_path,
     load_hint_cache,
     load_train_dataset,
+    reward_solution,
     rollout_path,
     validate_resume,
+)
+from utils import (
+    PI_ANSWER as PI_ANSWER,
 )
 
 # How SDFTTrainer stitches the student prompt and privileged context into the teacher's
@@ -111,12 +115,13 @@ def build_sdft_dataset(
 
     `pi_mode="hint"` loads precomputed hints from disk (see build_hint_dataset);
     `rollout` loads one fixed, unverified attempt per question from
-    gen_rollouts.py (see build_rollout_dataset); `full`/`answer` are built
-    inline from the dataset (question, final_answer, solution). `full` requires
+    gen_rollouts.py (see build_rollout_dataset); `full`/`solution`/`answer` are built
+    inline from the dataset (question, final_answer, solution). `full`/`solution` require
     a solution, so its rows are drawn from the solution-bearing subset (see
-    load_train_dataset).
+    load_train_dataset). `solution` further drops malformed thinking boundaries
+    and empty post-thinking responses, retaining the complete final worked answer.
 
-    For `full` and `rollout`, the long PI lives entirely in the teacher prompt,
+    For `full`, `solution`, and `rollout`, the long PI lives entirely in the teacher prompt,
     which SDFTTrainer left-truncates to `max_prompt_length` -- silently lopping
     the start of the PI (and the question). So when `model`/`max_prompt_length`
     are given, drop rows whose exact teacher prompt doesn't fit. Applied after
@@ -147,21 +152,34 @@ def build_sdft_dataset(
         return filter_long_pi_prompts(
             ds, pi_mode, model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio")
         )
-    if pi_mode not in ("full", "answer"):
+    if pi_mode not in ("full", "solution", "answer"):
         raise ValueError(
             f"unknown pi_mode {pi_mode!r}; expected one of "
-            "('full', 'answer', 'hint', 'rollout')"
+            "('full', 'solution', 'answer', 'hint', 'rollout')"
         )
 
     ds = load_train_dataset(
-        dataset, max_samples=max_samples, require_solution=(pi_mode == "full")
+        dataset, max_samples=max_samples, require_solution=(pi_mode in ("full", "solution"))
     )
+
+    if pi_mode == "solution":
+        def _has_final_solution(row):
+            try:
+                extract_final_solution(row["solution"])
+            except ValueError:
+                return False
+            return True
+
+        before = len(ds)
+        ds = ds.filter(_has_final_solution)
+        print(f"  pi=solution: kept {len(ds)}/{before} references with a valid final solution")
 
     def _map(row):
         if pi_mode == "answer":
             privileged_context = answer_context(str(row["final_answer"]), dataset)
-        else:  # full
-            privileged_context = PI_FULL.format(demo=row["solution"])
+        else:  # full or solution, using an identical wrapper
+            demo = extract_final_solution(row["solution"]) if pi_mode == "solution" else row["solution"]
+            privileged_context = PI_FULL.format(demo=demo)
         example = {
             "prompt": format_prompt(row["question"], dataset),
             "privileged_context": privileged_context,
@@ -185,7 +203,7 @@ def filter_long_pi_prompts(
     force: bool = False,
 ):
     """Drop long-PI rows that SDFTTrainer would otherwise silently left-truncate."""
-    if (not force and pi_mode not in ("full", "rollout")) or model is None or max_prompt_length is None:
+    if (not force and pi_mode not in ("full", "solution", "rollout")) or model is None or max_prompt_length is None:
         return ds
 
     from transformers import AutoTokenizer
@@ -500,7 +518,7 @@ def main():
     p.add_argument("--dataset", default="deepmath", choices=list(DATASET_REGISTRY_TRAIN.keys()),
                    help="Training dataset (see utils.DATASET_REGISTRY_TRAIN). 'hint' uses "
                         "the selected hint cache; 'rollout' uses the student's self-hint "
-                        "question order; 'full' uses the solution-bearing subset.")
+                        "question order; 'full'/'solution' use the solution-bearing subset.")
     p.add_argument("--output-root", default="/mnt/data/ujan/self-distill/outputs/sdft")
     p.add_argument("--output-dir", default=None,
                    help="Override; defaults to <output-root>/<model>/<dataset>_<pi-mode>")
@@ -508,9 +526,10 @@ def main():
                    help="Subset the training set")
     # privileged context
     p.add_argument("--pi-mode", default="full",
-                   choices=["full", "answer", "hint", "rollout"],
+                   choices=["full", "solution", "answer", "hint", "rollout"],
                    help="Teacher-only privileged context: 'full' worked demo (paper "
-                        "default), 'answer' boxed value, 'hint' precomputed hints "
+                        "default), 'solution' post-thinking worked answer, 'answer' boxed "
+                        "value, 'hint' precomputed hints "
                         "(run utils.gen_hints first), or 'rollout' one fixed unverified "
                         "attempt from the same model.")
     p.add_argument("--hint-generator-model", default=None,
@@ -556,7 +575,7 @@ def main():
     # generation
     p.add_argument("--max-prompt-length", type=int, default=8192,
                    help="Prompts longer than this are left-truncated. The teacher "
-                        "prompt carries the privileged context, so 'full' and 'rollout' "
+                        "prompt carries the privileged context, so 'full', 'solution', and 'rollout' "
                         "PI need room.")
     p.add_argument("--max-completion-length", type=int, default=8192)
     p.add_argument("--num-generations", type=int, default=1,

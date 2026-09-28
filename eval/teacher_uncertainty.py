@@ -18,7 +18,7 @@ Two behaviors, per completion:
 
 Two teacher kinds share this one script; they differ only in which model generates:
   * self / OPSD  -- teacher-model == problem-model (the student), PI in {none, rollout,
-                    answer, hint, full, hint_short, hint_medium, hint_detailed}. `rollout` is one fixed, unverified sample from
+                    answer, hint, full, solution, hint_short, hint_medium, hint_detailed}. `rollout` is one fixed, unverified sample from
                     that model. The collapse prediction: full PI -> short, low-E(y).
   * strong / OPD -- teacher-model = a bigger model (e.g. Qwen3-30B-A3B-Thinking-2507),
                     PI = none (its edge is capability, not information).
@@ -28,7 +28,7 @@ full-PI-feasible subset under that model's tokenizer. When rollout PI is request
 also restricted to source indices covered by the rollout cache and rollout prompts that fit.
 Pass --cohort-dir to reuse the demo-gain cohort and its three hint variants.
 Pass --align-pi-modes to use the same validity/context filters for a separate strong
-teacher baseline. See docs/teacher_pi.md for the seven-condition workflow.
+teacher baseline. See docs/teacher_pi.md for the eight-condition workflow.
 
 # self-teacher (OPSD), all PIs
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \

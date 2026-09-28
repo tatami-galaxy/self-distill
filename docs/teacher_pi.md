@@ -1,8 +1,12 @@
 # Teacher uncertainty and cognitive behaviors across PI types
 
-Use the same seven conditions as the pass@k comparison:
-`none answer rollout full hint_short hint_medium hint_detailed`.
+Use the same eight conditions as the pass@k comparison:
+`none answer rollout full solution hint_short hint_medium hint_detailed`.
 The original `hint` condition is also supported if explicitly requested.
+`solution` supplies only the complete reference response after `</think>`, using
+the same prompt wrapper as `full`. It retains any worked explanation and final
+answer in that response; the reference thinking trace is excluded. The teacher
+still generates its own thinking, just as in every other arm.
 
 There are two stages:
 
@@ -35,7 +39,7 @@ question IDs, hashes, filter conditions, exclusions, and sampling settings.
 
 The hint variants require `--cohort-dir`. Without it, the existing hint-cache
 workflow remains available for the original PI types. With a cohort, the default
-PI list is the seven conditions above; the commands spell them out explicitly.
+PI list is the eight conditions above; the commands spell them out explicitly.
 
 ## 1. Generate uncertainty completions
 
@@ -49,7 +53,7 @@ for model in Qwen3-1.7B Qwen3-4B; do
   CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.teacher_uncertainty \
     --teacher-model "Qwen/$model" \
     --cohort-dir "results/demo_gain/solution/$model" \
-    --pi-modes none answer rollout full hint_short hint_medium hint_detailed \
+    --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
     --num-problems 0 --hint-sample-idx 0 --n 8 \
     --max-tokens 8192 --max-model-len 40000 \
     --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
@@ -65,7 +69,7 @@ metadata without loading model weights or generating samples. A pilot can use
 
 Keep completion saving enabled (the default), since stage 2 reads those files.
 Each model writes under its slug, e.g.
-`results/teacher_uncertainty/demo_gain/Qwen_Qwen3-1.7B/`:
+`results/teacher_uncertainty/demo_gain_solution/Qwen_Qwen3-1.7B/`:
 
 - `teacher_uncertainty_run_meta.json`: frozen cohort and generation configuration.
 - `completions_<condition>.jsonl`: response text, question ID/source index, sample
@@ -89,7 +93,7 @@ for model in Qwen3-1.7B Qwen3-4B; do
     --teacher-model "Qwen/$model" \
     --completions-root results/teacher_uncertainty/demo_gain \
     --output-root results/teacher_behaviors/demo_gain \
-    --pi-modes none answer rollout full hint_short hint_medium hint_detailed \
+    --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
     --classifier-model Qwen/Qwen3.8-27B \
     --samples-per-problem 4 --chunk-tokens 1000
 done
@@ -100,7 +104,7 @@ judge weights. The classifier tokenizer is still needed. Source arms must contai
 the same selected `(question_idx, sample_idx)` pairs with consistent question IDs;
 duplicate or misaligned records are rejected before judge inference.
 
-Outputs under `results/teacher_behaviors/demo_gain/<model-slug>/` include:
+Outputs under `results/teacher_behaviors/demo_gain_solution/<model-slug>/` include:
 
 - `behaviors_<condition>.jsonl`: per-segment classifier counts and character spans.
 - `behaviors_meta_<condition>.json`: rubric, configuration, and source fingerprint.
@@ -119,7 +123,7 @@ source cohorts do not guarantee identical usable cohorts after judge failures.
 
 A strong teacher can generate only `none` while using the same student-cohort hint
 validity and context filters. Specify the same problem model, cohort, question cap,
-hint index, context/completion budgets, and all seven alignment modes:
+hint index, context/completion budgets, and all eight alignment modes:
 
 ```sh
 CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.teacher_uncertainty \
@@ -127,11 +131,11 @@ CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.teacher_uncertainty \
   --problem-model Qwen/Qwen3-1.7B \
   --cohort-dir results/demo_gain/solution/Qwen3-1.7B \
   --pi-modes none \
-  --align-pi-modes none answer rollout full hint_short hint_medium hint_detailed \
+  --align-pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
   --num-problems 0 --hint-sample-idx 0 --n 8 \
   --max-tokens 8192 --max-model-len 40000 \
   --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
-  --output-dir results/teacher_uncertainty/demo_gain_strong_for_1.7B
+  --output-dir results/teacher_uncertainty/demo_gain_solution_strong_for_1.7B
 ```
 
 The strong teacher's actual prompts must also fit its tokenizer. If they do not,
@@ -140,6 +144,6 @@ strong baselines aligned to different student cohorts in separate output roots.
 
 Epistemic markers are a lexical proxy; classifier counts are rubric-based estimates.
 Report length, marker rates, truncation, and cognitive-behavior rates together.
-The full and answer conditions expose the answer, so their accuracy can reflect
+The full, solution, and answer conditions expose the answer, so their accuracy can reflect
 copying. Hint validation selects a subset of the training-cache questions, and the
 retained cohorts can differ across model sizes.

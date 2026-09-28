@@ -1,3 +1,4 @@
+import sys
 import types
 import unittest
 from unittest import mock
@@ -267,6 +268,66 @@ class RolloutRunMetadataTest(unittest.TestCase):
             train_sdft.hint_generator_run_slug(generator),
             "hint-run_checkpoint-100",
         )
+
+
+class SolutionSdftDatasetTest(unittest.TestCase):
+    def test_solution_pi_preserves_student_prompt_and_excludes_reference_trace(self):
+        source = Dataset.from_list([
+            {"question": "q0", "final_answer": "42", "solution": "SECRET TRACE</think>Worked steps. Answer 42."},
+            {"question": "q1", "final_answer": "7", "solution": "<think>OTHER TRACE</think>Answer 7."},
+            {"question": "bad", "final_answer": "0", "solution": "No boundary"},
+            {"question": "empty", "final_answer": "0", "solution": "Trace</think>  "},
+            {"question": "ambiguous", "final_answer": "0", "solution": "Trace</think>Final</think>Extra"},
+        ])
+        with mock.patch.object(train_sdft, "load_train_dataset", return_value=source) as loader:
+            ds = train_sdft.build_sdft_dataset("solution", include_reward_solution=True)
+        loader.assert_called_once_with("deepmath", max_samples=None, require_solution=True)
+        self.assertEqual(len(ds), 2)
+        self.assertEqual(ds[0]["prompt"], train_sdft.format_prompt("q0", "deepmath"))
+        self.assertEqual(ds[0]["privileged_context"], train_sdft.PI_FULL.format(demo="Worked steps. Answer 42."))
+        self.assertNotIn("TRACE", str(ds[:]))
+        self.assertEqual(ds[0]["solution"], r"\boxed{42}")
+
+    def test_training_and_analysis_share_identical_solution_pi(self):
+        from eval.passk_pi import build_teacher_messages
+        row = {"question": "q", "final_answer": "7", "solution": "Reasoning</think>Worked final 7"}
+        with mock.patch.object(train_sdft, "load_train_dataset", return_value=Dataset.from_list([row])):
+            example = train_sdft.build_sdft_dataset("solution")[0]
+        self.assertEqual(
+            train_sdft.compose_pi_messages(example["prompt"], example["privileged_context"]),
+            build_teacher_messages(row, "solution"),
+        )
+
+    def test_prompt_filter_counts_final_solution_instead_of_removed_trace(self):
+        source = Dataset.from_list([
+            {"question": "q0", "final_answer": "1", "solution": "PRIVATE" * 200 + "</think>Short final"},
+            {"question": "q1", "final_answer": "2", "solution": "Trace</think>LONG FINAL"},
+        ])
+        class Tokenizer:
+            @staticmethod
+            def apply_chat_template(conversations, **kwargs):
+                text = str(conversations)
+                assert "PRIVATE" not in text
+                return {"input_ids": [list(range(20 if "LONG FINAL" in text else 5))]}
+        with (
+            mock.patch.object(train_sdft, "load_train_dataset", return_value=source),
+            mock.patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()),
+        ):
+            ds = train_sdft.build_sdft_dataset("solution", model="student", max_prompt_length=10)
+        self.assertEqual(len(ds), 1)
+        self.assertEqual(ds[0]["prompt"][-1]["content"], "q0")
+
+    def test_cli_accepts_solution_before_any_trainer_is_created(self):
+        with (
+            mock.patch.object(sys, "argv", ["train_sdft", "--model", "student", "--pi-mode", "solution"]),
+            mock.patch.object(train_sdft, "build_sdft_dataset", return_value=[]) as loader,
+            mock.patch.object(train_sdft, "SDFTTrainer") as trainer,
+            self.assertRaisesRegex(RuntimeError, "No training examples"),
+        ):
+            train_sdft.main()
+        self.assertEqual(loader.call_args.args[0], "solution")
+        trainer.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

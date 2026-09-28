@@ -50,6 +50,35 @@ class AlignmentTest(unittest.TestCase):
             expected = target
         self.assertIn(row["solution"], dg.messages_for(row, "full")[-1]["content"])
 
+    def test_solution_pi_excludes_trace_and_keeps_full_wrapper(self):
+        row = {
+            "question": "Q",
+            "solution": "<think>PRIVATE TRACE</think>Worked steps. Answer 42.",
+        }
+        messages = dg.messages_for(row, "solution")
+        expected = dg.messages_for(
+            dict(row, solution="Worked steps. Answer 42."), "full"
+        )
+        self.assertEqual(messages, expected)
+        self.assertNotIn("PRIVATE TRACE", str(messages))
+        self.assertNotIn("</think>", str(messages))
+        changed = dict(
+            row, solution="Different private trace</think>Worked steps. Answer 42."
+        )
+        self.assertEqual(messages, dg.messages_for(changed, "solution"))
+        self.assertNotEqual(
+            dg.messages_for(row, "full"), dg.messages_for(changed, "full")
+        )
+
+    def test_solution_pi_rejects_missing_ambiguous_or_empty_boundary(self):
+        for source in (
+            "No boundary",
+            "Trace</think> ",
+            "Trace</think>Final</think>Extra",
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                dg.messages_for({"question": "Q", "solution": source}, "solution")
+
     def test_bad_demo_and_template_fail(self):
         with self.assertRaisesRegex(ValueError, "malformed"):
             dg.render_target(CharacterTokenizer(), [], "No closing tag")
@@ -277,6 +306,39 @@ class PipelineTest(unittest.TestCase):
             dg.write_json(path, saved)
             with self.assertRaisesRegex(ValueError, "Invalid condition cache"):
                 dg.aggregate(args)
+
+    def test_solution_pi_can_extend_existing_cohort_without_changing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.fixture(root)
+            original = (root / "cohort.jsonl").read_bytes()
+            with (
+                mock.patch(
+                    "transformers.AutoModelForCausalLM.from_pretrained"
+                ) as loader,
+                mock.patch("transformers.AutoTokenizer.from_pretrained"),
+                mock.patch.object(dg, "tokenizer_hash", return_value="tokenizer"),
+                mock.patch.object(
+                    dg, "score_tokens", return_value=[-1.0] * 3
+                ) as forward,
+                mock.patch.object(
+                    dg, "render_target", return_value=([7], [4, 5, 6])
+                ) as render,
+            ):
+                dg.score(args)
+                self.assertEqual(forward.call_count, 3)
+                args.conditions = ["answer", "full", "solution"]
+                dg.score(args)
+                self.assertEqual(forward.call_count, 4)
+                self.assertEqual((root / "cohort.jsonl").read_bytes(), original)
+                self.assertNotIn("Reason", str(render.call_args.args[1]))
+                index = dg.read_json(root / "score_index.json")
+                self.assertEqual(index["cache_stats"], {"hits": 3, "misses": 1})
+                self.assertIn("solution", dg.aggregate(args)["conditions"])
+                render.return_value = ([7], [9])
+                with self.assertRaisesRegex(ValueError, "target tokens differ"):
+                    dg.score(args)
+                self.assertEqual(loader.call_count, 2)
 
     def test_cohort_edits_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

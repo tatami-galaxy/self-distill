@@ -20,7 +20,12 @@ from typing import NamedTuple
 from datasets import load_from_disk
 from vllm import LLM, SamplingParams
 
-from eval.demo_gain import load_cohort, load_variants, tokenizer_hash, write_json
+from eval.demo_gain import (
+    load_cohort,
+    load_variants,
+    tokenizer_hash,
+    write_json,
+)
 from eval.hint_compare_cache import ConditionCache, digest, model_identity
 from eval.run_eval import compute_pass_at_k, pass_at_k
 from utils import (
@@ -30,6 +35,7 @@ from utils import (
     PI_ROLLOUT,
     TEACHER_PROMPT_TEMPLATE,
     answer_context,
+    extract_final_solution,
     format_prompt,
     grade,
     hint_path,
@@ -37,8 +43,8 @@ from utils import (
 )
 
 HINT_VARIANTS = ("hint_short", "hint_medium", "hint_detailed")
-PI_MODES = ("none", "answer", "rollout", "full", *HINT_VARIANTS, "hint")
-DEFAULT_PI_MODES = ("none", "answer", "rollout", "full", *HINT_VARIANTS)
+PI_MODES = ("none", "answer", "rollout", "full", "solution", *HINT_VARIANTS, "hint")
+DEFAULT_PI_MODES = ("none", "answer", "rollout", "full", "solution", *HINT_VARIANTS)
 
 
 class RolloutAttempt(NamedTuple):
@@ -59,6 +65,10 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
         return messages
     if pi_mode == "full":
         privileged_context = PI_FULL.format(demo=problem["solution"])
+    elif pi_mode == "solution":
+        privileged_context = PI_FULL.format(
+            demo=extract_final_solution(problem["solution"])
+        )
     elif pi_mode == "answer":
         privileged_context = answer_context(
             problem["answer"], problem.get("dataset", "deepmath")
@@ -515,10 +525,15 @@ def restrict_to_pi_feasible(
     feasible = []
     modes = list(dict.fromkeys(pi_modes))
     for problem in problems:
-        if "full" in modes and not problem.get("solution"):
+        if {"full", "solution"}.intersection(modes) and not problem.get("solution"):
             continue
         if "rollout" in modes and "rollout" not in problem:
             continue
+        if "solution" in modes:
+            try:
+                extract_final_solution(problem["solution"])
+            except ValueError:
+                continue
         fits = True
         for mode in modes:
             ids = tokenizer.apply_chat_template(
@@ -796,7 +811,7 @@ def main():
             args.model,
             args.num_problems,
             args.seed,
-            need_full=("full" in args.pi_modes),
+            need_full=bool({"full", "solution"}.intersection(args.pi_modes)),
             dataset=args.dataset,
             required_question_indices=set(rollout_attempts)
             if rollout_attempts is not None

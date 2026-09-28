@@ -128,7 +128,7 @@ class GenerationTest(unittest.TestCase):
         self.assertTrue(records[0]["truncated"])
         self.assertFalse(records[0]["unclosed"])
 
-    def test_main_preflight_then_seven_conditions_without_real_model(self):
+    def test_main_preflight_then_all_conditions_without_real_model(self):
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(
@@ -195,7 +195,9 @@ class GenerationTest(unittest.TestCase):
                     .splitlines()
                 )
                 self.assertEqual(json.loads(rows[0])["question_id"], "qid3")
-            self.assertEqual(llm.return_value.generate.call_count, 7)
+            self.assertEqual(
+                llm.return_value.generate.call_count, len(DEFAULT_PI_MODES)
+            )
 
     def test_missing_cohort_rejected_before_model_load(self):
         with (

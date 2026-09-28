@@ -23,6 +23,7 @@ from utils import (
     PI_ROLLOUT,
     answer_context,
     compose_pi_messages,
+    extract_final_solution,
     format_prompt,
     load_hint_cache,
     load_train_dataset,
@@ -30,7 +31,7 @@ from utils import (
 )
 
 VERSION = 2
-CORE = ("answer", "full", "rollout", "hint")
+CORE = ("answer", "full", "solution", "rollout", "hint")
 VARIANTS = ("hint_detailed", "hint_medium", "hint_short")
 CONDITIONS = CORE + VARIANTS
 TARGET_FORMAT = "post_think_solution_no_trace_v1_including_terminator"
@@ -75,6 +76,8 @@ def messages_for(row, condition, hint=None):
         context = answer_context(row["final_answer"], "deepmath")
     elif condition == "full":
         context = PI_FULL.format(demo=row["solution"])
+    elif condition == "solution":
+        context = PI_FULL.format(demo=extract_final_solution(row["solution"]))
     elif condition == "rollout":
         context = PI_ROLLOUT.format(attempt=row["rollout"])
     elif condition == "hint" or condition in VARIANTS:
@@ -91,14 +94,7 @@ def render_target(tokenizer, messages, solution):
     Qwen's non-thinking generation header supplies an empty think block in the
     prompt; its delimiters are not scored. Full/rollout PI remains in messages.
     """
-    from train.sft.train_sft import format_think_completion
-
-    completion = format_think_completion(solution)
-    if completion is None:
-        raise ValueError("malformed_thinking_trace")
-    completion = completion.split("</think>", 1)[1]
-    if not completion.strip():
-        raise ValueError("empty_final_solution")
+    completion = extract_final_solution(solution)
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
@@ -366,6 +362,7 @@ def score(args):
         variants, variant_meta = load_variants(
             args.hint_variants_dir or out / "hints", cohort
         )
+    if variant_conditions or "solution" in conditions:
         tok = AutoTokenizer.from_pretrained(
             manifest["model"], revision=manifest["revision"], trust_remote_code=True
         )
@@ -377,7 +374,19 @@ def score(args):
         arms = {"none": [{"prompt_ids": row["prompt_ids"]["none"], "sample_idx": 0}]}
         reason = None
         for condition in conditions:
-            if condition in CORE:
+            if condition == "solution" and condition not in row["prompt_ids"]:
+                # Older cohorts already store the source demonstration. Render only
+                # this added arm without changing their identity or existing scores.
+                ids, target = render_target(
+                    tok, messages_for(row, condition), row["solution"]
+                )
+                if target != row["target_ids"]:
+                    raise ValueError("Solution PI target tokens differ from baseline")
+                if len(ids) + len(target) > manifest["max_model_len"]:
+                    reason = "over_context_solution"
+                    break
+                arms[condition] = [{"prompt_ids": ids, "sample_idx": 0}]
+            elif condition in CORE:
                 if condition not in row["prompt_ids"]:
                     raise ValueError(
                         f"{condition} was not prepared; use a new cohort directory"

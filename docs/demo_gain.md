@@ -18,6 +18,12 @@ of the fixed assistant header. Those delimiters are not scored, and no reference
 thinking tokens are inserted there. Templates must yield an exact prompt/target
 boundary and a target without thinking tags.
 
+The `solution` PI supplies only the full response after `</think>`, including any
+worked explanation and final answer. It uses exactly the same prompt wrapper as
+`full`; only the reference thinking trace is removed. Missing, ambiguous, or empty
+post-thinking responses are rejected. Since this PI contains the target text,
+its gain can reflect copying, just as for `full`.
+
 The original complete demonstration remains available to construct PI: `full`
 contains it, and hints are generated from it. Thus full PI still exposes the
 reference reasoning through the privileged user prompt. Every arm, including
@@ -60,7 +66,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m eval.demo_gain --phase score \
 
 Repeat with `Qwen/Qwen3-4B` and a separate output directory. A pilot can use
 `--num-problems 4`. To evaluate only existing PI, omit hint generation and pass
-`--conditions answer full rollout hint` during preparation.
+`--conditions answer full solution rollout hint` during preparation.
 
 Solution-only scoring is the sole target. Prepare a new cohort directory;
 whole-trace manifests and scores are rejected. Slicing existing log-probability
@@ -71,9 +77,31 @@ The `all` phase combines prepare/score/aggregate for a new directory with availa
 PI; it does not generate hints. Resume existing cohorts using explicit
 score/aggregate phases.
 
+## Add solution PI to an existing run
+
+Existing solution-target cohorts already contain the complete reference source.
+The scorer can render the new `solution` prompt from it without changing the cohort
+or regenerating hints. Explicitly request all desired conditions when rescoring;
+otherwise an existing manifest retains its original condition list.
+
+```sh
+CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.demo_gain --phase score \
+  --output-dir results/demo_gain/solution/Qwen3-1.7B \
+  --conditions answer full solution rollout hint hint_detailed hint_medium hint_short
+.venv/bin/python -m eval.demo_gain --phase aggregate \
+  --output-dir results/demo_gain/solution/Qwen3-1.7B
+.venv/bin/python -m eval.viz.demo_gain \
+  --output-dir results/demo_gain/solution/Qwen3-1.7B
+```
+
+Repeat with `Qwen3-4B`. Existing condition scores are reused when numerical settings
+match; only the new prompt needs a forward pass. The score index, summary, and plots
+are updated to include the requested conditions. Context and target-token alignment
+checks also apply to this added arm. Newly prepared cohorts include it by default.
+
 ## PI and cohort selection
 
-Conditions are `answer`, `full`, `rollout`, `hint`, `hint_detailed`, `hint_medium`,
+Conditions are `answer`, `full`, `solution`, `rollout`, `hint`, `hint_detailed`, `hint_medium`,
 and `hint_short`. The existing self-hint cache supplies `hint`. Additional hint
 variants independently request detailed, medium, and short guidance from the
 same question and complete reference demonstration, with generation caps of

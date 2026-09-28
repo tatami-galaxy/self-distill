@@ -20,4 +20,23 @@ PI_ROLLOUT = (
     "Now write a complete solution of your own, including the reasoning."
 )
 
-__all__ = ["PI_ANSWER", "PI_FULL", "PI_HINT", "PI_ROLLOUT"]
+
+def extract_final_solution(solution: str) -> str:
+    """Return the complete response after one well-formed </think> boundary.
+
+    Accept the R1 convention with no opening tag. Match reference-target validation
+    without importing training or evaluation modules into shared PI utilities.
+    """
+    text = (solution or "").strip()
+    n_open = text.count("<think>")
+    if text.count("</think>") != 1 or not (
+        n_open == 0 or (n_open == 1 and text.startswith("<think>"))
+    ):
+        raise ValueError("malformed_thinking_trace")
+    final = text.split("</think>", 1)[1]
+    if not final.strip():
+        raise ValueError("empty_final_solution")
+    return final
+
+
+__all__ = ["PI_ANSWER", "PI_FULL", "PI_HINT", "PI_ROLLOUT", "extract_final_solution"]
