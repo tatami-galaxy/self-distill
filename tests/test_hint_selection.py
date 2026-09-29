@@ -93,6 +93,96 @@ class SelectionTest(unittest.TestCase):
                 hs.load_artifact(root, "test", "id")
 
 
+class DeviceExecutionTest(unittest.TestCase):
+    def test_device_validation_and_execution_flags_preserve_cache_identity(self):
+        args = hs.build_parser().parse_args([])
+        baseline = hs.prepare_config(args)
+        args.teacher_gpu = "5"
+        args.teacher_gpu_memory_utilization = .6
+        args.teacher_max_num_seqs = 32
+        with mock.patch.dict(hs.os.environ, {"CUDA_VISIBLE_DEVICES": "4", "WORLD_SIZE": "1"}):
+            hs.validate_teacher_device(args)
+        self.assertEqual(hs.prepare_config(args), baseline)
+        for visible, teacher in (("4", "4"), ("4", "04"), ("", "5"), ("4,5", "6"),
+                                 ("4", "GPU-other"), ("4", "5,6"), ("4", "-1")):
+            with self.subTest(visible=visible, teacher=teacher), \
+                    mock.patch.dict(hs.os.environ, {"CUDA_VISIBLE_DEVICES": visible, "WORLD_SIZE": "1"}):
+                args.teacher_gpu = teacher
+                with self.assertRaises(ValueError):
+                    hs.validate_teacher_device(args)
+
+    def test_worker_sets_teacher_visibility_before_scoring(self):
+        args = hs.build_parser().parse_args(["--teacher-gpu", "5"])
+        observed = []
+        def capture(*_):
+            observed.append(hs.os.environ["CUDA_VISIBLE_DEVICES"])
+        for phase in ("sufficiency", "transfer"):
+            with mock.patch.dict(hs.os.environ, {"CUDA_VISIBLE_DEVICES": "4"}), \
+                    mock.patch.object(hs, phase, side_effect=capture), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                hs.worker(phase, vars(args), "/tmp/test")
+        self.assertEqual(observed, ["5", "4"])
+
+    def test_teacher_engine_settings_do_not_change_generator(self):
+        args = hs.build_parser().parse_args([
+            "--teacher-gpu", "5", "--teacher-gpu-memory-utilization", ".6",
+            "--teacher-max-num-seqs", "32",
+        ])
+        config = hs.prepare_config(args)
+        llm = mock.Mock()
+        with mock.patch.dict("sys.modules", {"vllm": SimpleNamespace(LLM=llm)}):
+            hs.new_engine(config, args)
+            hs.new_engine(config, args, teacher=True)
+        generator, teacher = [call.kwargs for call in llm.call_args_list]
+        self.assertEqual(generator["gpu_memory_utilization"], .8)
+        self.assertNotIn("max_num_seqs", generator)
+        self.assertEqual(teacher["gpu_memory_utilization"], .6)
+        self.assertEqual(teacher["max_num_seqs"], 32)
+        self.assertEqual(teacher["tensor_parallel_size"], 1)
+
+    def test_parallel_phases_start_before_waiting_and_cancel_peer_on_failure(self):
+        for fails in (False, True):
+            self.check_parallel_outcome(fails)
+
+    def check_parallel_outcome(self, fails):
+        args = hs.build_parser().parse_args([])
+        events = []
+        processes = []
+        class Process:
+            def __init__(self, target, args):
+                self.phase = args[0]
+                self.sentinel = self.phase
+                self.exitcode = None
+                processes.append(self)
+            def start(self):
+                events.append(("start", self.phase))
+            def join(self):
+                events.append(("join", self.phase))
+            def is_alive(self):
+                return self.exitcode is None
+            def terminate(self):
+                events.append(("terminate", self.phase))
+                self.exitcode = -15
+        def ready(sentinels):
+            self.assertEqual(events[:2], [("start", "sufficiency"), ("start", "transfer")])
+            self.assertEqual(set(sentinels), {"sufficiency", "transfer"})
+            processes[0].exitcode = 1 if fails else 0
+            if fails:
+                return ["sufficiency"]
+            processes[1].exitcode = 0
+            return list(sentinels)
+        with self.subTest(fails=fails), \
+                mock.patch.object(hs.multiprocessing, "get_context", return_value=SimpleNamespace(Process=Process)), \
+                mock.patch.object(hs, "wait_processes", side_effect=ready):
+            if fails:
+                with self.assertRaisesRegex(RuntimeError, "sufficiency failed"):
+                    hs.run_phases(["sufficiency", "transfer"], args, Path("/tmp/test"))
+                self.assertIn(("terminate", "transfer"), events)
+            else:
+                hs.run_phases(["sufficiency", "transfer"], args, Path("/tmp/test"))
+                self.assertFalse(any(event[0] == "terminate" for event in events))
+
+
 class PreparationTest(unittest.TestCase):
     def prepare_rows(self, root, source_rows, *, count=0, cache_answer="42"):
         args = hs.build_parser().parse_args([
@@ -214,6 +304,13 @@ class PipelineTest(unittest.TestCase):
                 hs.transfer(args, root)
                 self.assertEqual(load_model.call_count, 1)
                 self.assertEqual(forward.call_count, 6)
+            # Real spawned workers must reuse the cached pipeline even with no
+            # usable CUDA devices. This also exercises concurrent file access.
+            args.teacher_gpu = "GPU-test-teacher"
+            with mock.patch.dict(hs.os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-test-main", "WORLD_SIZE": "1"}):
+                hs.validate_teacher_device(args)
+                hs.run_phase("generate", args, root)
+                hs.run_phases(["sufficiency", "transfer"], args, root)
             hs.select(args, root)
             hs.select(args, root)  # Verify committed export integrity on reuse.
             args.epsilon = 0

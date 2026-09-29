@@ -17,6 +17,7 @@ import os
 import random
 import statistics
 from collections import Counter, defaultdict
+from multiprocessing.connection import wait as wait_processes
 from pathlib import Path
 
 from eval.hint_compare_cache import ConditionCache, digest, model_identity
@@ -220,13 +221,21 @@ def cache_for(root, kind, manifest, force):
     return ConditionCache(root, kind, {"manifest": digest(manifest)}, force)
 
 
-def new_engine(config, args):
+def new_engine(config, args, *, teacher=False):
     from vllm import LLM
 
+    memory = args.gpu_memory_utilization
+    options = {}
+    if teacher:
+        if args.teacher_gpu_memory_utilization is not None:
+            memory = args.teacher_gpu_memory_utilization
+        if args.teacher_max_num_seqs is not None:
+            options["max_num_seqs"] = args.teacher_max_num_seqs
     return LLM(model=config["model"], revision=config["revision"], dtype=config["dtype"],
                generation_config="vllm", max_model_len=config["max_model_len"],
-               gpu_memory_utilization=args.gpu_memory_utilization,
-               tensor_parallel_size=args.tensor_parallel_size, seed=config["seed"], trust_remote_code=True)
+               gpu_memory_utilization=memory,
+               tensor_parallel_size=1 if teacher and args.teacher_gpu else args.tensor_parallel_size,
+               seed=config["seed"], trust_remote_code=True, **options)
 
 
 def candidates(root, manifest, cohort):
@@ -311,7 +320,7 @@ def sufficiency(args, root):
     if pending:
         from vllm import SamplingParams
 
-        engine = new_engine(c, args)
+        engine = new_engine(c, args, teacher=True)
         tokenizer = engine.get_tokenizer()
         params = SamplingParams(n=c["teacher_rollouts"], temperature=c["teacher_temperature"],
                                 top_p=1.0, top_k=c["teacher_top_k"] or -1, min_p=0.0,
@@ -512,21 +521,64 @@ def select(args, root):
     print(f"SDFT --hint-cache {out / 'hints'}" if exported else "No training cache exported: all hints invalid", flush=True)
 
 
+def validate_teacher_device(args):
+    if args.teacher_gpu is None:
+        return
+    teacher = args.teacher_gpu.strip()
+    visible = [gpu.strip() for gpu in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if gpu.strip()]
+    if len(visible) != 1 or visible[0] == "-1" or int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("With --teacher-gpu, use one process and CUDA_VISIBLE_DEVICES=<main GPU>")
+    if not teacher or "," in teacher or teacher == "-1":
+        raise ValueError("--teacher-gpu requires one GPU index or UUID in host CUDA order")
+    if args.tensor_parallel_size != 1:
+        raise ValueError("--teacher-gpu currently requires --tensor-parallel-size 1")
+    # Avoid ambiguous index/UUID aliases for the same physical GPU.
+    main = visible[0]
+    if teacher.isdigit() != main.isdigit():
+        raise ValueError("Use GPU indices for both devices, or GPU UUIDs for both devices")
+    same = int(teacher) == int(main) if teacher.isdigit() else (
+        teacher.startswith(main) or main.startswith(teacher)
+    )
+    if same:
+        raise ValueError("--teacher-gpu must differ from the main GPU")
+    args.teacher_gpu = teacher
+
+
 def worker(phase, args_dict, root):
-    globals()[phase](argparse.Namespace(**args_dict), Path(root))
+    args = argparse.Namespace(**args_dict)
+    if phase == "sufficiency" and args.teacher_gpu is not None:
+        # Spawn imports only this lightweight module before reaching here. Set
+        # visibility before any torch/vLLM imports or CUDA initialization.
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.teacher_gpu
+    print(f"Starting {phase}: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}", flush=True)
+    globals()[phase](args, Path(root))
+
+
+def run_phases(phases, args, root):
+    """Start independent phases together, stopping peers if any child fails."""
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    try:
+        for phase in phases:
+            process = context.Process(target=worker, args=(phase, vars(args), str(root)))
+            process.start()
+            processes.append((phase, process))
+        pending = {process.sentinel: (phase, process) for phase, process in processes}
+        while pending:
+            for sentinel in wait_processes(list(pending)):
+                phase, process = pending.pop(sentinel)
+                process.join()
+                if process.exitcode != 0:
+                    raise RuntimeError(f"{phase} failed with exit code {process.exitcode}; completed condition caches are reusable")
+    finally:
+        for _, process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join()
 
 
 def run_phase(phase, args, root):
-    process = multiprocessing.get_context("spawn").Process(target=worker, args=(phase, vars(args), str(root)))
-    process.start()
-    try:
-        process.join()
-    except BaseException:
-        process.terminate()
-        process.join()
-        raise
-    if process.exitcode != 0:
-        raise RuntimeError(f"{phase} failed with exit code {process.exitcode}; completed condition caches are reusable")
+    run_phases([phase], args, root)
 
 
 def build_parser():
@@ -558,6 +610,11 @@ def build_parser():
     p.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--teacher-batch-size", type=int, default=8)
+    p.add_argument("--teacher-gpu", help="Dedicated sufficiency GPU index/UUID in host CUDA order; overlaps sufficiency with transfer in sweep mode")
+    p.add_argument("--teacher-gpu-memory-utilization", type=float, default=None,
+                   help="Teacher vLLM memory fraction; defaults to --gpu-memory-utilization")
+    p.add_argument("--teacher-max-num-seqs", type=int, default=None,
+                   help="Teacher vLLM maximum concurrent sequences; defaults to vLLM's setting")
     p.add_argument("--force", action="store_true", help="Recompute requested inference stages; preparation remains immutable")
     return p
 
@@ -579,16 +636,30 @@ def main():
         p.error("Context length must exceed generation budgets")
     if args.force and args.phase in ("prepare", "select"):
         p.error("--force only applies to inference stages")
+    if args.teacher_gpu_memory_utilization is not None and not 0 < args.teacher_gpu_memory_utilization <= 1:
+        p.error("Teacher GPU memory utilization must be in (0, 1]")
+    if args.teacher_max_num_seqs is not None and args.teacher_max_num_seqs < 1:
+        p.error("Teacher max-num-seqs must be positive")
+    try:
+        validate_teacher_device(args)
+    except ValueError as error:
+        p.error(str(error))
     root = run_root(args)
     protect_output(root, (args.cohort_dir, args.rollout_root))
     if args.phase in ("prepare", "sweep"):
         prepare(args, root)
     if args.phase == "sweep":
-        for phase in ("generate", "sufficiency", "transfer"):
-            run_phase(phase, args, root)
+        run_phase("generate", args, root)
+        if args.teacher_gpu is not None:
+            run_phases(["sufficiency", "transfer"], args, root)
+        else:
+            for phase in ("sufficiency", "transfer"):
+                run_phase(phase, args, root)
+        select(args, root)
+    elif args.phase == "select":
         select(args, root)
     elif args.phase != "prepare":
-        globals()[args.phase](args, root)
+        run_phase(args.phase, args, root)
 
 
 if __name__ == "__main__":

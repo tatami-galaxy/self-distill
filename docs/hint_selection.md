@@ -85,10 +85,43 @@ sampling matches the constrained runs: temperature 1, top-p 1, top-k 20, up to
 in the denominator. Hint/teacher sample counts, temperatures, budgets, gamma, and
 epsilon are configurable. Pin a remote model using `--revision` for reproducibility.
 
-All stages run sequentially on the visible GPU(s). Generator and teacher vLLM
-engines run in separate spawned processes from HF transfer scoring. The frozen
-HF scorer uses one GPU. `--teacher-batch-size` controls simultaneous hinted
-conditions (default 8, each with 8 teacher samples).
+By default, stages run sequentially on the visible GPU(s). Generator and teacher
+vLLM engines run in separate spawned processes from HF transfer scoring.
+`--teacher-batch-size` controls simultaneous hinted conditions (default 8, each
+with 8 teacher samples).
+
+### Use a second GPU for sufficiency
+
+As in the constrained hint trainer, `--teacher-gpu` identifies a separate GPU in
+**host CUDA order**, not an index within `CUDA_VISIBLE_DEVICES`. Use one main GPU
+and one distinct teacher GPU (indices for both, or UUIDs for both):
+
+```sh
+CUDA_VISIBLE_DEVICES=4 .venv/bin/python -m eval.hint_selection \
+  --model Qwen/Qwen3-1.7B --dataset deepmath --num-questions 2048 \
+  --output-dir data/pi/hint_selection/deepmath/Qwen3-1.7B/q2048_n8_k8_t1.4 \
+  --teacher-gpu 5 --teacher-gpu-memory-utilization 0.8 \
+  --teacher-max-num-seqs 32
+```
+
+Hint generation completes on GPU 4 first. Then sufficiency runs on GPU 5
+**concurrently with transfer scoring on GPU 4**. Selection waits for both.
+This overlaps the two scoring stages; it does not split the teacher's rollouts
+across GPUs or overlap teacher scoring with hint generation. If sufficiency
+dominates runtime, the speedup is limited by the transfer work that can overlap.
+
+Both stages already use the frozen base model; no teacher server or
+`--teacher-backend` flag is needed. `--teacher-max-num-seqs` limits active teacher
+sequences, while `--teacher-batch-size` controls submitted hint conditions.
+Without an explicit memory fraction, the teacher inherits
+`--gpu-memory-utilization`. Dedicated-teacher mode requires tensor parallel size
+1 and a single launcher process.
+
+Device placement and these execution settings do not change cache identities.
+Reusing the same command and output directory resumes completed conditions;
+changing epsilon still writes a separate selection. A standalone
+`--phase sufficiency --teacher-gpu 5` also uses GPU 5, but does not launch transfer
+scoring. Avoid launching another sweep into a directory while one is running.
 
 ## Reuse and epsilon comparisons
 

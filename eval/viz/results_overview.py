@@ -368,7 +368,7 @@ plot_aime_curves(aime, "pass@1");
 # HMMT itself; these are not validation-selected scores. Curves retain separate
 # variants and runs, with a base-model reference when available.
 
-# %% -------------------- HMMT TABLES AND LEARNING CURVES --------------------
+# %% -------------------- HMMT BEST-CHECKPOINT TABLES --------------------
 HMMT_BEST_K = 1  # Choose 1, 8, or 16.
 HMMT_METRIC = f"pass@{HMMT_BEST_K}"
 HMMT_DIR = RESULTS / "hmmt_feb_2025"
@@ -395,6 +395,14 @@ else:
             .format({HMMT_METRIC: "{:.3f}"}, na_rep="—")
             .background_gradient(subset=[HMMT_METRIC], cmap="Blues", vmin=0, vmax=1)
         )
+
+
+# %% -------------------- PLOT HMMT LEARNING CURVES --------------------
+if hmmt.empty:
+    print(f"No HMMT February 2025 results yet: {HMMT_DIR}")
+elif HMMT_METRIC not in hmmt or hmmt[HMMT_METRIC].notna().sum() == 0:
+    print(f"No HMMT results with {HMMT_METRIC}; choose an available HMMT_BEST_K.")
+else:
     plot_aime_curves(
         hmmt.dropna(subset=[HMMT_METRIC]), HMMT_METRIC, label="HMMT February 2025"
     );
