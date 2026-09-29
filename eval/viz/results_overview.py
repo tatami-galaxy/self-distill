@@ -110,9 +110,9 @@ def checkpoint_number(step: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def fallback_aime_arm(path: Path) -> dict:
+def fallback_aime_arm(path: Path, directory: Path = AIME_DIR) -> dict:
     """Recover arm identity from the path used by schema-0 summaries."""
-    parts = path.relative_to(AIME_DIR).parts[:-1]  # drop summary.json
+    parts = path.relative_to(directory).parts[:-1]  # drop summary.json
     if len(parts) == 2 and parts[0] == "base":
         return {
             "algo": "base",
@@ -124,7 +124,7 @@ def fallback_aime_arm(path: Path) -> dict:
         }
 
     if len(parts) < 4:
-        raise ValueError(f"Unrecognized {AIME_LABEL} result path: {path}")
+        raise ValueError(f"Unrecognized {directory.name} result path: {path}")
 
     train_dataset, model, algo = parts[:3]
     step = parts[-1]
@@ -150,11 +150,11 @@ def fallback_aime_arm(path: Path) -> dict:
     }
 
 
-def load_aime() -> pd.DataFrame:
+def load_aime(directory: Path = AIME_DIR) -> pd.DataFrame:
     rows = []
-    for path in sorted(AIME_DIR.rglob("summary.json")):
+    for path in sorted(directory.rglob("summary.json")):
         summary = read_json(path)
-        fallback = fallback_aime_arm(path)
+        fallback = fallback_aime_arm(path, directory)
         arm = {**fallback, **(summary.get("arm") or {})}
         # Legacy directories were renamed without rewriting their recorded arm.
         # The directory distinguishes the learned-hint variants and generator runs.
@@ -162,10 +162,10 @@ def load_aime() -> pd.DataFrame:
             arm.update(variant=fallback["variant"], run=fallback["run"])
         eval_config = summary.get("eval_config") or {}
         recorded_eval_dataset = eval_config.get("eval_dataset")
-        if recorded_eval_dataset not in (None, AIME_DATASET):
+        if recorded_eval_dataset not in (None, directory.name):
             raise ValueError(
                 f"{path} records eval dataset {recorded_eval_dataset!r}, "
-                f"expected {AIME_DATASET!r}"
+                f"expected {directory.name!r}"
             )
         sampling = eval_config.get("sampling") or {}
         row = {
@@ -306,11 +306,15 @@ ALGO_COLORS = {
     "ppo": "#7a5195",
     "ppo_pi": "#b279a2",
     "ppo_val": "#9c755f",
+    "sac": "#17becf",
 }
 LINESTYLES = ["-", "--", "-.", ":"]
 
 
-def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int = 2):
+def plot_aime_curves(
+    frame: pd.DataFrame, metric: str = "pass@1", columns: int = 2,
+    label: str = AIME_LABEL,
+):
     models = sorted(frame["model"].unique())
     rows = math.ceil(len(models) / columns)
     fig, axes = plt.subplots(rows, columns, figsize=(7.2 * columns, 4.0 * rows), squeeze=False)
@@ -323,7 +327,9 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
             ax.axhline(value, color="black", linewidth=1.6, linestyle="--", label=f"Base ({value:.3f})")
 
         trained = model_frame[~model_frame["is_base"]].copy()
-        trained["series"] = trained.apply(method_label, axis=1)
+        trained["series"] = (
+            trained.apply(method_label, axis=1) if not trained.empty else pd.Series(dtype=str)
+        )
         for index, (series, group) in enumerate(trained.groupby("series", sort=True)):
             algo = group.iloc[0]["algo"]
             same_algo_series = sorted(trained.loc[trained["algo"] == algo, "series"].unique())
@@ -346,12 +352,52 @@ def plot_aime_curves(frame: pd.DataFrame, metric: str = "pass@1", columns: int =
 
     for ax in axes.flat[len(models):]:
         ax.set_visible(False)
-    fig.suptitle(f"{AIME_LABEL} {metric} over training", fontsize=16, y=1.005)
+    fig.suptitle(f"{label} {metric} over training", fontsize=16, y=1.005)
     fig.tight_layout()
     return fig
 
 
 plot_aime_curves(aime, "pass@1");
+
+
+# %% -------------------- HMMT FEBRUARY 2025 -------------------- [markdown]
+# ## HMMT February 2025
+#
+# Reads all algorithms and variants under `results/hmmt_feb_2025/` independently
+# of the AIME selection. Tables select the best checkpoint by `HMMT_BEST_K` on
+# HMMT itself; these are not validation-selected scores. Curves retain separate
+# variants and runs, with a base-model reference when available.
+
+# %% -------------------- HMMT TABLES AND LEARNING CURVES --------------------
+HMMT_BEST_K = 1  # Choose 1, 8, or 16.
+HMMT_METRIC = f"pass@{HMMT_BEST_K}"
+HMMT_DIR = RESULTS / "hmmt_feb_2025"
+if HMMT_BEST_K not in {1, 8, 16}:
+    raise ValueError(f"HMMT_BEST_K must be one of 1, 8, or 16; got {HMMT_BEST_K}")
+
+hmmt = load_aime(HMMT_DIR)
+if hmmt.empty:
+    print(f"No HMMT February 2025 results yet: {HMMT_DIR}")
+elif HMMT_METRIC not in hmmt or hmmt[HMMT_METRIC].notna().sum() == 0:
+    print(f"No HMMT results with {HMMT_METRIC}; choose an available HMMT_BEST_K.")
+else:
+    print(f"Loaded {len(hmmt)} HMMT summaries across {hmmt.model.nunique()} models.")
+    hmmt_best = best_aime_by_algo(hmmt, HMMT_METRIC)
+    for model, model_results in hmmt_best.groupby("model", sort=True):
+        table = model_results[
+            ["algo", "variant", "run", "step", "train_dataset", HMMT_METRIC]
+        ].copy()
+        table["algo"] = table["algo"].str.upper()
+        table = table.rename(columns={"algo": "algorithm", "step": "checkpoint"})
+        display(
+            table.style
+            .set_caption(f"HMMT February 2025 · {model} — best {HMMT_METRIC}")
+            .format({HMMT_METRIC: "{:.3f}"}, na_rep="—")
+            .background_gradient(subset=[HMMT_METRIC], cmap="Blues", vmin=0, vmax=1)
+        )
+    plot_aime_curves(
+        hmmt.dropna(subset=[HMMT_METRIC]), HMMT_METRIC, label="HMMT February 2025"
+    );
 
 
 # %% -------------------- VALIDATION-SELECTED AIME -------------------- [markdown]

@@ -405,6 +405,20 @@ def load_aime26() -> list[dict]:
     return out
 
 
+@register_dataset_eval("hmmt_feb_2025")
+def load_hmmt_feb_2025() -> list[dict]:
+    # MathArena publishes this evaluation benchmark under the "train" split.
+    ds = load_dataset("MathArena/hmmt_feb_2025", split="train")
+    return [
+        {
+            "problem": row["problem"],
+            "answer": str(row["answer"]),
+            "unique_id": f"hmmt_feb_2025_{row['problem_idx']}",
+        }
+        for row in ds
+    ]
+
+
 @register_dataset_eval("beyond_aime")
 def load_beyond_aime() -> list[dict]:
     ds = load_dataset("ByteDance-Seed/BeyondAIME", split="test")

@@ -27,21 +27,52 @@ zero successes, the literal rule still selects the cheapest and labels it
 `no_valid_hints` and omitted from the training export; no replacement question or
 fallback hint is silently substituted. Both outcomes are counted in the summary.
 
-## Run a small pilot
+## Generate a subset for a 200–1,000-step SDFT run
 
-Use an existing HF cohort to avoid reloading DeepMath. This samples ten questions
-with matching cached student trajectories; the selected cohort is frozen on disk.
+Start with **2,048 questions**. The current Qwen3-1.7B and Qwen3-4B student
+rollout caches each cover 2,048 questions with four trajectories per question.
+Load solution-bearing rows from DeepMath and select this bounded cohort with
+matching cached trajectories; preparation freezes the cohort on disk. Repeated
+questions with the same reference answer may have different worked solutions:
+preparation keeps the first demonstration that fits the context limit in the
+seeded shuffle order, with one selected row per question. Conflicting reference
+answers among rollout-eligible source rows still raise an error; duplicates
+outside the rollout-backed cohort do not block preparation.
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m eval.hint_selection \
   --model Qwen/Qwen3-1.7B \
-  --cohort-dir results/hint_gen_compare/Qwen3-1.7B/deepmath_t0.7_g6_lora_r16/cohort \
-  --num-questions 10 \
-  --output-dir data/pi/hint_selection/deepmath/Qwen3-1.7B/pilot_n8_k8_t1.4
+  --dataset deepmath \
+  --num-questions 2048 \
+  --output-dir data/pi/hint_selection/deepmath/Qwen3-1.7B/q2048_n8_k8_t1.4
 ```
 
-Without `--cohort-dir`, load solution-bearing rows from the training dataset.
-The default count is 128; `--num-questions 0` uses all eligible questions.
+The count is explicit; the script default remains 128. Omit `--cohort-dir` to
+avoid restricting the run to the small evaluation cohort. Questions with no valid
+hint are omitted from the export, so use `summary.json`'s `n_selected` when
+calculating the actual number of passes. Requesting more than 2,048 questions
+requires extending the cached student rollouts first.
+
+For the single-GPU training command below, the effective batch is
+`1 GPU × 1 example × 16 accumulation steps = 16`, with one on-policy rollout per
+prompt. A 2,048-row export therefore gives approximately **128 optimizer steps
+per pass**:
+
+| Optimizer steps | Prompt presentations | Approximate passes over 2,048 rows |
+| --- | --- | --- |
+| 200 | 3,200 | 1.56 |
+| 500 | 8,000 | 3.91 |
+| 1,000 | 16,000 | 7.81 |
+
+Start with **500 steps** and change `--max-steps` to 200 or 1,000 as needed.
+SDFT cycles through the selected questions and generates fresh on-policy
+completions on subsequent passes; the selected hints stay fixed. The number of
+unique questions does not need to equal the number of prompt presentations.
+With multiple training GPUs, multiply the effective batch by the number of
+processes: four GPUs at the same per-device settings give 64 examples per step,
+or about 32 steps per pass. To limit repeated question exposure at that batch
+size, generate student rollouts and selected hints for a larger subset.
+
 Eligibility requires at least `--transfer-rollouts` cached unhinted trajectories
 under `data/rollouts/<dataset>/<model>/`. Selection uses the lowest stored sample
 indices without inspecting rewards. Legacy rollout caches without sample indices
@@ -68,7 +99,7 @@ settings come from its saved manifest. `--phase select` loads no model weights.
 
 ```sh
 .venv/bin/python -m eval.hint_selection --phase select \
-  --output-dir data/pi/hint_selection/deepmath/Qwen3-1.7B/pilot_n8_k8_t1.4 \
+  --output-dir data/pi/hint_selection/deepmath/Qwen3-1.7B/q2048_n8_k8_t1.4 \
   --epsilon 0
 ```
 
@@ -100,7 +131,9 @@ the established cache directories is rejected. Explicitly pass the printed new
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m train.opsd.train_sdft \
   --model Qwen/Qwen3-1.7B --dataset deepmath --pi-mode hint \
   --hint-cache <printed-selection-directory>/hints \
-  --output-root /mnt/data/ujan/self-distill/outputs/sdft_selected_hint
+  --max-steps 500 --num-generations 1 \
+  --per-device-train-batch-size 1 --gradient-accumulation-steps 16 \
+  --output-root /mnt/data/ujan/self-distill/outputs/sdft_selected_hint_q2048_eps0125
 ```
 
 Use distinct SDFT output roots for epsilon/gamma variants too. The generator

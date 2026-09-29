@@ -12,6 +12,9 @@ Use --dry-run to print commands without loading models or writing results.
         --model-dir /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-4B/deepmath_hint \
         --algo sdft --model_name Qwen3-4B --train_dataset deepmath \
         --variant hint --run run-2 --dataset aime24 --n 16 --k 1 8 16
+    # HMMT February 2025 uses the shared evaluation dataset registry.
+    # Pass --dataset hmmt_feb_2025 in the command above to evaluate it.
+
 """
 
 from __future__ import annotations

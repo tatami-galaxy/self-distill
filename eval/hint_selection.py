@@ -141,26 +141,38 @@ def prepare(args, root):
     if set(rollouts.unique("gen_model")) != {args.model} or set(rollouts.unique("dataset")) != {args.dataset}:
         raise ValueError("Student rollout cache model/dataset does not match")
     indices, sample_index_source = index_student_samples(rollouts)
+    eligible_questions = {q for q, samples in indices.items() if len(samples) >= args.transfer_rollouts}
+    source_questions = source["question"]
+    # Different worked solutions are valid alternatives. Check reference answers
+    # only for questions that can enter this rollout-backed cohort, before sampling
+    # so conflicts cannot hide beyond the requested prefix.
+    answers = {}
+    for question, answer in zip(source_questions, source["final_answer"], strict=True):
+        if question not in eligible_questions or answer is None:
+            continue
+        answer = str(answer)
+        if question in answers and answers[question] != answer:
+            raise ValueError(f"Conflicting reference answers for question {question[:120]!r}: "
+                             f"{answers[question]!r} versus {answer!r}")
+        answers[question] = answer
     # Do not inspect rewards or choose trajectories based on correctness.
     order = list(range(len(source)))
     random.Random(args.seed).shuffle(order)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
-    cohort, seen, excluded = [], {}, Counter()
+    cohort, seen, excluded = [], set(), Counter()
     for index in order:
+        if source_questions[index] not in eligible_questions:
+            excluded["missing_student_rollouts"] += 1
+            continue
         row = source[index]
         question, answer, solution = row["question"], str(row["final_answer"]), row["solution"]
         if not question or not solution or row["final_answer"] is None:
             excluded["empty_source"] += 1
             continue
         if question in seen:
-            if seen[question] != (answer, solution):
-                raise ValueError("Conflicting demonstrations/answers for a repeated question")
+            excluded["duplicate_question"] += 1
             continue
-        seen[question] = (answer, solution)
-        selected = sorted(indices.get(question, {}))[:args.transfer_rollouts]
-        if len(selected) != args.transfer_rollouts:
-            excluded["missing_student_rollouts"] += 1
-            continue
+        selected = sorted(indices[question])[:args.transfer_rollouts]
         cached = [rollouts[indices[question][s]] for s in selected]
         if any("final_answer" in r and str(r["final_answer"]) != answer for r in cached):
             raise ValueError("Source and student rollout reference answers differ")
@@ -180,11 +192,14 @@ def prepare(args, root):
             "student_sample_indices": selected, "student_completion_ids": completions,
             "student_sample_index_source": sample_index_source,
         })
+        # A too-long demo must not prevent trying another demo for this question.
+        seen.add(question)
         if args.num_questions and len(cohort) == args.num_questions:
             break
     if not cohort or (args.num_questions and len(cohort) != args.num_questions):
         raise ValueError(f"Found {len(cohort)} eligible questions; requested {args.num_questions}. Exclusions: {dict(excluded)}")
     manifest = {"config": config, "cohort_fingerprint": digest(cohort),
+                "source_duplicate_policy": "first_context_fitting_demo_in_seeded_order",
                 "n_questions": len(cohort), "exclusions": dict(excluded),
                 "tokenizer_revision": tokenizer.init_kwargs.get("_commit_hash"),
                 "software": {p: importlib.metadata.version(p) for p in ("transformers", "datasets", "torch", "vllm")}}
