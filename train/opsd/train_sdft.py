@@ -67,7 +67,6 @@ from utils import (
     TEACHER_PROMPT_TEMPLATE,
     answer_context,
     compose_pi_messages,
-    dataset_provenance,
     extract_final_solution,
     format_prompt,
     hint_path,
@@ -138,7 +137,7 @@ def build_sdft_dataset(
         )
         return filter_long_pi_prompts(
             ds, pi_mode,
-            model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio"),
+            model=model, max_prompt_length=max_prompt_length,
         )
     if pi_mode == "rollout":
         ds = build_rollout_dataset(
@@ -150,7 +149,7 @@ def build_sdft_dataset(
             include_reward_solution=include_reward_solution,
         )
         return filter_long_pi_prompts(
-            ds, pi_mode, model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio")
+            ds, pi_mode, model=model, max_prompt_length=max_prompt_length
         )
     if pi_mode not in ("full", "solution", "answer"):
         raise ValueError(
@@ -191,7 +190,7 @@ def build_sdft_dataset(
     ds = ds.map(_map, remove_columns=ds.column_names)
 
     return filter_long_pi_prompts(
-        ds, pi_mode, model=model, max_prompt_length=max_prompt_length, force=(dataset == "codeio")
+        ds, pi_mode, model=model, max_prompt_length=max_prompt_length
     )
 
 
@@ -200,10 +199,9 @@ def filter_long_pi_prompts(
     pi_mode: str,
     model: str | None,
     max_prompt_length: int | None,
-    force: bool = False,
 ):
     """Drop long-PI rows that SDFTTrainer would otherwise silently left-truncate."""
-    if (not force and pi_mode not in ("full", "solution", "rollout")) or model is None or max_prompt_length is None:
+    if pi_mode not in ("full", "solution", "rollout") or model is None or max_prompt_length is None:
         return ds
 
     from transformers import AutoTokenizer
@@ -475,7 +473,6 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "hint_cache": hint_cache_path,
         "hint_source": hint_source,
         "dataset": args.dataset,
-        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "rollout_pi_root": (
             args.rollout_pi_root if args.pi_mode == "rollout" else None

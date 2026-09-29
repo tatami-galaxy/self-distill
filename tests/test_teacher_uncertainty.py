@@ -1,4 +1,4 @@
-"""CPU checks for cohort-backed teacher uncertainty and generated hint arms."""
+"""CPU checks for cohort-backed teacher uncertainty and the standard hint arm."""
 
 import json
 import sys
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from eval import teacher_uncertainty as tu
-from eval.passk_pi import DEFAULT_PI_MODES
+from eval.teacher_uncertainty import DEFAULT_PI_MODES
 
 
 class Tokenizer:
@@ -30,9 +30,7 @@ def problems():
             "answer": "42",
             "solution": "Reference trace</think>42",
             "rollout": "Attempt",
-            "hint_short": "short advice",
-            "hint_medium": "medium advice",
-            "hint_detailed": "detailed advice",
+            "hint": "standard advice",
         }
     ]
 
@@ -52,6 +50,30 @@ class CohortAlignmentTest(unittest.TestCase):
                 *extra,
             ]
         )
+
+    def test_preparation_uses_standard_cohort_hint_without_variant_artifacts(self):
+        manifest = {
+            "model": "student",
+            "model_identity": {"model": "student"},
+            "revision": "rev",
+            "cohort_hash": "cohort",
+            "tokenizer_hash": "tok",
+            "rollout_pi_root": "rollouts",
+            "rollout_pi_sample_idx": 0,
+        }
+        cohort = [dict(problems()[0], final_answer="42")]
+        with (
+            mock.patch("eval.passk_pi.load_cohort", return_value=(manifest, cohort)),
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()
+            ),
+            mock.patch.object(tu, "tokenizer_hash", return_value="tok"),
+        ):
+            rows, meta = tu.prepare_problems(self.args())
+        self.assertEqual(rows[0]["hint"], "standard advice")
+        self.assertEqual(meta["cohort"]["hint_source"], "cohort.hint")
+        self.assertEqual(meta["question_ids"], ["qid3"])
+        self.assertNotIn("hint_sample_idx", meta["cohort"])
 
     def test_self_and_strong_use_identical_source_filters(self):
         metadata = {"revision": "rev", "tokenizer_hash": "tok"}
@@ -83,7 +105,7 @@ class CohortAlignmentTest(unittest.TestCase):
 
     def test_long_hint_is_checked_even_when_only_aligning_strong_baseline(self):
         rows = problems()
-        rows[0]["hint_detailed"] = "TOO_LONG"
+        rows[0]["hint"] = "TOO_LONG"
         with (
             mock.patch.object(
                 tu,
@@ -97,12 +119,25 @@ class CohortAlignmentTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "No common"),
         ):
             tu.prepare_problems(
-                self.args("--max-model-len", "50", "--max-tokens", "10")
+                self.args(
+                    "--teacher-model",
+                    "strong",
+                    "--problem-model",
+                    "student",
+                    "--pi-modes",
+                    "none",
+                    "--align-pi-modes",
+                    "hint",
+                    "--max-model-len",
+                    "50",
+                    "--max-tokens",
+                    "10",
+                )
             )
 
 
 class GenerationTest(unittest.TestCase):
-    def test_variant_generation_preserves_ids_and_measures_actual_response(self):
+    def test_hint_generation_preserves_ids_and_measures_actual_response(self):
         llm = mock.Mock()
         llm.generate.return_value = [
             SimpleNamespace(
@@ -117,10 +152,10 @@ class GenerationTest(unittest.TestCase):
         ]
         with mock.patch.object(tu, "grade", return_value=("42", True)):
             records = tu.generate_arm(
-                llm, Tokenizer(), problems(), "hint_short", SimpleNamespace(n=1)
+                llm, Tokenizer(), problems(), "hint", SimpleNamespace(n=1)
             )
-        self.assertIn("short advice", llm.generate.call_args.args[0][0])
-        self.assertNotIn("detailed advice", llm.generate.call_args.args[0][0])
+        self.assertIn("standard advice", llm.generate.call_args.args[0][0])
+        self.assertNotIn("Reference trace", llm.generate.call_args.args[0][0])
         self.assertEqual(records[0]["question_id"], "qid3")
         self.assertEqual(records[0]["question_idx"], 3)
         self.assertEqual(records[0]["sample_idx"], 0)
@@ -199,16 +234,30 @@ class GenerationTest(unittest.TestCase):
                 llm.return_value.generate.call_count, len(DEFAULT_PI_MODES)
             )
 
-    def test_missing_cohort_rejected_before_model_load(self):
-        with (
-            mock.patch.object(
-                sys, "argv", ["teacher_uncertainty", "--pi-modes", "hint_short"]
-            ),
-            mock.patch.object(tu, "LLM") as llm,
-            self.assertRaises(SystemExit),
+    def test_removed_hint_options_rejected_before_preparation(self):
+        for extra in (
+            ["--pi-modes", "none", "hint_short"],
+            ["--pi-modes", "none", "hint_medium"],
+            ["--pi-modes", "none", "hint_detailed"],
+            ["--align-pi-modes", "hint_short"],
+            ["--align-pi-modes", "hint_medium"],
+            ["--align-pi-modes", "hint_detailed"],
+            ["--hint-sample-idx", "0"],
         ):
-            tu.main()
-        llm.assert_not_called()
+            with (
+                self.subTest(extra=extra),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["teacher_uncertainty", "--cohort-dir", "cohort", *extra],
+                ),
+                mock.patch.object(sys, "stderr"),
+                mock.patch.object(tu, "prepare_problems") as prepare,
+                self.assertRaises(SystemExit) as raised,
+            ):
+                tu.main()
+            self.assertEqual(raised.exception.code, 2)
+            prepare.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ Two behaviors, per completion:
 
 Two teacher kinds share this one script; they differ only in which model generates:
   * self / OPSD  -- teacher-model == problem-model (the student), PI in {none, rollout,
-                    answer, hint, full, solution, hint_short, hint_medium, hint_detailed}. `rollout` is one fixed, unverified sample from
+                    answer, hint, full, solution}. `rollout` is one fixed, unverified sample from
                     that model. The collapse prediction: full PI -> short, low-E(y).
   * strong / OPD -- teacher-model = a bigger model (e.g. Qwen3-30B-A3B-Thinking-2507),
                     PI = none (its edge is capability, not information).
@@ -26,9 +26,9 @@ Two teacher kinds share this one script; they differ only in which model generat
 The problem set is FIXED across arms: --problem-model's hint cache, restricted to the
 full-PI-feasible subset under that model's tokenizer. When rollout PI is requested it is
 also restricted to source indices covered by the rollout cache and rollout prompts that fit.
-Pass --cohort-dir to reuse the demo-gain cohort and its three hint variants.
+Pass --cohort-dir to reuse the demo-gain cohort and its standard cached hint.
 Pass --align-pi-modes to use the same validity/context filters for a separate strong
-teacher baseline. See docs/teacher_pi.md for the eight-condition workflow.
+teacher baseline. See docs/teacher_pi.md for the six-condition workflow.
 
 # self-teacher (OPSD), all PIs
 CUDA_VISIBLE_DEVICES=7 uv run python -m eval.teacher_uncertainty \
@@ -53,7 +53,6 @@ from eval.demo_gain import read_json, tokenizer_hash, write_json, write_rows
 from eval.hint_compare_cache import digest
 from eval.passk_pi import (
     DEFAULT_PI_MODES,
-    HINT_VARIANTS,
     PI_MODES,
     attach_rollout_pi,
     build_teacher_messages,
@@ -232,7 +231,6 @@ def prepare_problems(args):
             problem_model,
             common_modes,
             args.num_problems,
-            args.hint_sample_idx,
         )
     else:
         attempts = None
@@ -360,9 +358,8 @@ def build_parser():
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
-        "--cohort-dir", help="Prepared demo-gain cohort containing hints/ artifacts."
+        "--cohort-dir", help="Prepared demo-gain cohort with its standard cached hint."
     )
-    p.add_argument("--hint-sample-idx", type=int, default=0)
     p.add_argument(
         "--align-pi-modes",
         nargs="+",
@@ -389,15 +386,12 @@ def main():
             if args.cohort_dir
             else ["none", "answer", "hint", "full"]
         )
-    requested = args.pi_modes + (args.align_pi_modes or [])
-    if any(mode in HINT_VARIANTS for mode in requested) and not args.cohort_dir:
-        p.error("Generated hint variants require --cohort-dir")
     if args.cohort_dir and args.dataset != "deepmath":
         p.error("Demo-gain cohorts require --dataset deepmath")
     if args.num_problems < 0 or (args.num_problems == 0 and not args.cohort_dir):
         p.error("Use a positive question count, or 0 with --cohort-dir")
-    if args.hint_sample_idx < 0 or len(set(args.pi_modes)) != len(args.pi_modes):
-        p.error("Hint sample index must be nonnegative and PI modes must be unique")
+    if len(set(args.pi_modes)) != len(args.pi_modes):
+        p.error("PI modes must be unique")
     if not 0 < args.max_tokens < args.max_model_len:
         p.error("Need 0 < --max-tokens < --max-model-len")
     if (

@@ -1,7 +1,8 @@
 """Compare self-teacher pass@k under fixed privileged-information conditions.
 
 Use --cohort-dir to reuse demo-gain questions, full references, unverified
-rollouts, and short/medium/detailed self-generated hints. All requested arms
+rollouts, and the standard self-generated hint from utils/gen_hints.py. Without
+--cohort-dir, use that generator's model-specific hint cache. All requested arms
 share one validity- and context-filtered question set. Responses are generated
 freely (thinking enabled by default), graded against the gold answer, and cached
 per prompt. Report pass@k and paired differences against the no-PI baseline.
@@ -22,7 +23,6 @@ from vllm import LLM, SamplingParams
 
 from eval.demo_gain import (
     load_cohort,
-    load_variants,
     tokenizer_hash,
     write_json,
 )
@@ -42,9 +42,8 @@ from utils import (
     rollout_path,
 )
 
-HINT_VARIANTS = ("hint_short", "hint_medium", "hint_detailed")
-PI_MODES = ("none", "answer", "rollout", "full", "solution", *HINT_VARIANTS, "hint")
-DEFAULT_PI_MODES = ("none", "answer", "rollout", "full", "solution", *HINT_VARIANTS)
+PI_MODES = ("none", "answer", "rollout", "full", "solution", "hint")
+DEFAULT_PI_MODES = PI_MODES
 
 
 class RolloutAttempt(NamedTuple):
@@ -73,7 +72,7 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
         privileged_context = answer_context(
             problem["answer"], problem.get("dataset", "deepmath")
         )
-    elif pi_mode == "hint" or pi_mode in HINT_VARIANTS:
+    elif pi_mode == "hint":
         privileged_context = PI_HINT.format(hint=problem[pi_mode])
     elif pi_mode == "rollout":
         privileged_context = PI_ROLLOUT.format(attempt=problem["rollout"])
@@ -160,61 +159,24 @@ def load_eval_problems(
     return problems
 
 
-def load_demo_problems(cohort_dir, model, pi_modes, num_problems, hint_sample_idx=0):
-    """Reuse fixed PI artifacts; validity selection never observes generated answers."""
+def load_demo_problems(cohort_dir, model, pi_modes, num_problems):
+    """Reuse the prepared cohort, including its standard gen_hints.py hint."""
     manifest, cohort = load_cohort(cohort_dir)
     if manifest["model"] != model or manifest["model_identity"] != model_identity(
         model
     ):
         raise ValueError("Self-teacher must match the prepared cohort model")
-    modes = [mode for mode in pi_modes if mode in HINT_VARIANTS]
-    variants, hint_meta = {}, None
-    if modes:
-        hints_dir = Path(cohort_dir) / "hints"
-        if not all(
-            (hints_dir / name).is_file() for name in ("manifest.json", "hints.jsonl")
-        ):
-            raise FileNotFoundError(
-                f"Hint artifacts are incomplete at {hints_dir}; finish "
-                "python -m utils.gen_hint_variants for this cohort before evaluating"
-            )
-        variants, hint_meta = load_variants(hints_dir, cohort)
-        config = hint_meta["config"]
-        if (
-            config["model"] != model
-            or config["model_identity"] != manifest["model_identity"]
-            or config["revision"] != manifest["revision"]
-        ):
-            raise ValueError(
-                "Hint generator must match the self-teacher model and revision"
-            )
-        if not 0 <= hint_sample_idx < config["samples_per_level"]:
-            raise ValueError("Hint sample index is outside the generated sample range")
     problems, excluded = [], Counter()
     for row in cohort:
         problem = dict(row, answer=row["final_answer"], dataset="deepmath")
-        invalid = []
-        for mode in modes:
-            matches = [
-                h
-                for h in variants.get((row["question_id"], mode), [])
-                if h["sample_idx"] == hint_sample_idx
-            ]
-            if len(matches) != 1:
-                raise ValueError(
-                    f"Missing fixed {mode} sample for {row['question_id']}"
-                )
-            hint = matches[0]
-            if hint["invalid_reason"] or hint["truncated"]:
-                invalid.append(mode)
-            problem[mode] = hint["hint"]
-        if invalid:
-            excluded[f"invalid_or_truncated_{invalid[0]}"] += 1
-            continue
+        if "hint" in pi_modes and not str(problem.get("hint") or "").strip():
+            raise ValueError(
+                f"Missing standard hint in prepared cohort for {row['question_id']}"
+            )
         if "rollout" in pi_modes and not problem.get("rollout"):
             excluded["missing_rollout"] += 1
             continue
-        # Scoring token IDs are irrelevant: accuracy uses fresh free-running responses.
+        # Accuracy uses fresh responses, not the cohort's teacher-forcing token IDs.
         for key in ("prompt_ids", "target_ids"):
             problem.pop(key, None)
         problems.append(problem)
@@ -229,9 +191,7 @@ def load_demo_problems(cohort_dir, model, pi_modes, num_problems, hint_sample_id
         "n_prepared": len(cohort),
         "n_valid_pi": n_valid,
         "exclusions": dict(excluded),
-        "hint_sample_idx": hint_sample_idx,
-        "hint_selection": "fixed_sample_idx_without_teacher_outcomes",
-        "hints_hash": hint_meta["hints_hash"] if hint_meta else None,
+        "hint_source": "cohort.hint" if "hint" in pi_modes else None,
         "rollout_pi_root": manifest["rollout_pi_root"],
         "rollout_pi_sample_idx": manifest["rollout_pi_sample_idx"],
     }
@@ -519,7 +479,11 @@ def paired_rollout_minus_none(
 
 
 def restrict_to_pi_feasible(
-    problems, tokenizer, budget: int, pi_modes: list[str], enable_thinking=True
+    problems,
+    tokenizer,
+    budget: int,
+    pi_modes: list[str],
+    enable_thinking=True,
 ):
     """Keep the common subset whose prompt fits under every requested PI condition."""
     feasible = []
@@ -736,9 +700,8 @@ def main():
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
-        "--cohort-dir", help="Prepared demo-gain cohort with generated hints."
+        "--cohort-dir", help="Prepared demo-gain cohort with its standard cached hint."
     )
-    p.add_argument("--hint-sample-idx", type=int, default=0)
     p.add_argument(
         "--enable-thinking", action=argparse.BooleanOptionalAction, default=True
     )
@@ -756,10 +719,8 @@ def main():
 
     if args.n < 1 or not args.k or min(args.k) < 1:
         p.error("--n and --k must be positive")
-    if args.num_problems < 0 or args.hint_sample_idx < 0 or args.batch_size < 1:
-        p.error(
-            "Problem count and hint index must be nonnegative; batch size must be positive"
-        )
+    if args.num_problems < 0 or args.batch_size < 1:
+        p.error("Problem count must be nonnegative; batch size must be positive")
     if args.max_tokens < 1 or args.max_model_len <= args.max_tokens:
         p.error("Need 0 < --max-tokens < --max-model-len")
     if (
@@ -771,8 +732,6 @@ def main():
         p.error("Use positive temperature, 0 < top-p <= 1, and top-k >= 1 or -1")
     if len(set(args.pi_modes)) != len(args.pi_modes) or "none" not in args.pi_modes:
         p.error("PI modes must be unique and include none")
-    if any(mode in HINT_VARIANTS for mode in args.pi_modes) and not args.cohort_dir:
-        p.error("Generated hint variants require --cohort-dir")
     if args.cohort_dir and args.dataset != "deepmath":
         p.error("Demo-gain cohorts require --dataset deepmath")
     if not args.cohort_dir and args.num_problems == 0:
@@ -796,7 +755,6 @@ def main():
             args.model,
             args.pi_modes,
             args.num_problems,
-            args.hint_sample_idx,
         )
     else:
         rollout_attempts = None

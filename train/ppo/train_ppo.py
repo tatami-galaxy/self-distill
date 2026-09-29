@@ -95,12 +95,11 @@ import torch
 from transformers import AutoModelForSequenceClassification, set_seed
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from trl import GRPOConfig, GRPOTrainer
-from utils import dataset_provenance, accuracy_reward_for_dataset
+from trl.rewards import accuracy_reward
 from trl.trainer.utils import pad
 
 from train.grpo.train_grpo import build_grpo_dataset
 from utils import DATASET_REGISTRY_TRAIN, validate_resume
-
 
 # ---------------------------------------------------------------------------
 # Small masked reducers
@@ -636,10 +635,9 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "value_prompt_version": None,
         "model": args.model,
         "dataset": args.dataset,
-        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
-        "reward": "codeio_accuracy_reward" if args.dataset == "codeio" else "accuracy_reward",
+        "reward": "accuracy_reward",
         "gamma": args.gamma,
         "lam": args.lam,
         "vf_coef": args.vf_coef,
@@ -901,7 +899,7 @@ def main():
 
     trainer = PPOTrainer(
         model=args.model,
-        reward_funcs=accuracy_reward_for_dataset(args.dataset),
+        reward_funcs=accuracy_reward,
         args=training_args,
         train_dataset=train_dataset,
         value_model=value_model,

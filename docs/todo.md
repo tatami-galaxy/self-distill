@@ -3,7 +3,6 @@
 - [x] Deepmath
 - [ ] Reasoning Gym
 - [ ] Countdown-CoT-20k
-- [ ] CodeIO
 - [ ] Hyperparameter sweep, more steps
 - [x] Validation set
 
@@ -13,7 +12,6 @@
 - [ ] Beyondaime
 - [ ] Reasoning Gym
 - [ ] Countdown heldout
-- [x] CodeIO
 - [ ] Comparison with other SD methods
 
 ### Models

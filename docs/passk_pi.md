@@ -1,6 +1,6 @@
 # Self-teacher pass@k across PI types
 
-Compare the same frozen model under eight conditions on a common question set:
+Compare the same frozen model under six conditions on a common question set:
 
 | CLI condition | Privileged information |
 | --- | --- |
@@ -9,9 +9,7 @@ Compare the same frozen model under eight conditions on a common question set:
 | `rollout` | One fixed, unverified cached attempt from the same model |
 | `full` | Complete reference demonstration, including thinking and final solution |
 | `solution` | Complete reference response after `</think>`, without the thinking trace |
-| `hint_short` | Cached short self-generated hint |
-| `hint_medium` | Cached medium self-generated hint |
-| `hint_detailed` | Cached detailed self-generated hint |
+| `hint` | Standard self-generated hint cached by `utils.gen_hints` |
 
 `solution` uses the same worked-solution prompt wrapper as `full`, but removes
 all reference text through `</think>`. It keeps the entire worked final response,
@@ -31,25 +29,36 @@ answer. Results average equally over questions.
 
 ## Inputs and common cohort
 
-Reuse the completed demo-gain artifacts:
+The standard hint comes from `utils.gen_hints`, the same cache used by SDFT's
+`--pi-mode hint`. Generate it first if it is not already available:
 
-- `results/demo_gain/solution/Qwen3-1.7B/{manifest.json,cohort.jsonl,hints/}`
-- `results/demo_gain/solution/Qwen3-4B/{manifest.json,cohort.jsonl,hints/}`
+```sh
+CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m utils.gen_hints \
+  --model Qwen/Qwen3-1.7B --dataset deepmath --max-samples 20000
+```
 
-Both `hints/manifest.json` and `hints/hints.jsonl` must exist. A directory containing
-only incremental generation caches is not complete. Finish the demo-gain hint
-generation stage before running this evaluator; see [demo_gain.md](demo_gain.md).
-The pass@k evaluator does not generate or repair hints.
+Repeat for `Qwen/Qwen3-4B`. By default the cache lives at
+`data/pi/hint/deepmath/<model-slug>/`. Without `--cohort-dir`, pass@k samples this
+cache using `--seed`, validates its generator/model and dataset stamps, rejoins
+reference solutions, and attaches fixed rollout PI from `--rollout-pi-root`.
+Use a positive `--num-problems` in this mode.
 
-The evaluator checks cohort and hint checksums, demonstration identities, model
-identity, model revision, and tokenizer identity. The hint generator must be the
-same model as the self-teacher.
+With `--cohort-dir`, reuse the prepared demo-gain artifacts:
 
-For every requested hint condition, select `--hint-sample-idx 0` before inspecting
-validity. Exclude a question from **every arm** if any selected hint is invalid or
-truncated. Missing hint artifacts are an error. No replacement hint is selected
-based on validity or accuracy. The rollout is taken directly from the prepared
-cohort, with its original fixed sample index; correctness does not select it.
+- `results/demo_gain/solution/Qwen3-1.7B/{manifest.json,cohort.jsonl}`
+- `results/demo_gain/solution/Qwen3-4B/{manifest.json,cohort.jsonl}`
+
+Cohort preparation already copied the standard cache's hint into each row's
+`hint` field. Pass@k uses that saved text directly; it does not require a `hints/`
+subdirectory or a separate hint-generation stage. A missing or empty standard
+hint is an error when the `hint` arm is requested. The evaluator checks the
+cohort checksum, model identity, and tokenizer identity, and loads the model at
+the cohort's recorded revision. The original hint cache records the generator's
+model identifier, not an independently pinned revision.
+
+The rollout comes directly from the prepared cohort with its original fixed
+sample index; correctness does not select it. The evaluator never generates or
+repairs PI. Hint-variant validity filters and `--hint-sample-idx` no longer apply.
 
 Then require every PI prompt to fit within
 `max_model_len - max_tokens`, reserving the full response budget. No prompt is
@@ -58,8 +67,8 @@ denominator. The cohort manifest's order is preserved; `--num-problems 0` uses a
 valid questions, while a positive value caps the valid list before context filtering.
 
 Preflight reports the actual retained count from the completed artifacts. This
-is a selected training-cache diagnostic cohort. Each model applies its own hint
-validity filters, so their question sets can differ; comparing their scores then
+is a selected training-cache diagnostic cohort. The source caches and context
+filters can yield different question sets for each model; comparing their scores then
 does not isolate a model-size effect.
 
 ## Run
@@ -77,13 +86,13 @@ Model-provided generation defaults are disabled in favor of these settings.
 CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
   --model Qwen/Qwen3-1.7B \
   --cohort-dir results/demo_gain/solution/Qwen3-1.7B \
-  --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
-  --num-problems 0 --hint-sample-idx 0 \
+  --pi-modes none answer rollout full solution hint \
+  --num-problems 0 \
   --n 8 --k 1 2 4 8 \
   --enable-thinking --max-tokens 8192 --max-model-len 40000 \
   --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
   --batch-size 16 --gpu-memory-utilization 0.9 \
-  --output-dir results/passk_pi/demo_gain
+  --output-dir results/passk_pi/default_hint
 ```
 
 ### Qwen3-4B
@@ -92,13 +101,13 @@ CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
 CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m eval.passk_pi \
   --model Qwen/Qwen3-4B \
   --cohort-dir results/demo_gain/solution/Qwen3-4B \
-  --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
-  --num-problems 200 --hint-sample-idx 0 \
+  --pi-modes none answer rollout full solution hint \
+  --num-problems 200 \
   --n 8 --k 1 2 4 8 \
   --enable-thinking --max-tokens 8192 --max-model-len 40000 \
   --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
   --batch-size 16 --gpu-memory-utilization 0.9 \
-  --output-dir results/passk_pi/demo_gain
+  --output-dir results/passk_pi/default_hint
 ```
 
 ### CPU preflight
@@ -112,17 +121,17 @@ for model in Qwen3-1.7B Qwen3-4B; do
   CUDA_VISIBLE_DEVICES='' .venv/bin/python -m eval.passk_pi \
     --model "Qwen/$model" \
     --cohort-dir "results/demo_gain/solution/$model" \
-    --pi-modes none answer rollout full solution hint_short hint_medium hint_detailed \
-    --num-problems 0 --hint-sample-idx 0 \
+    --pi-modes none answer rollout full solution hint \
+    --num-problems 0 \
     --n 8 --k 1 2 4 8 \
     --enable-thinking --max-tokens 8192 --max-model-len 40000 \
     --temperature 0.6 --top-p 0.95 --top-k 20 --seed 42 \
-    --output-dir results/passk_pi/demo_gain_solution --prepare-only
+    --output-dir results/passk_pi/default_hint --prepare-only
 done
 ```
 
 A small pilot can use `--num-problems 4 --n 2 --k 1 2` with a separate output
-root such as `results/passk_pi/demo_gain_solution_pilot`.
+root such as `results/passk_pi/default_hint_pilot`.
 
 ## Resume and outputs
 
@@ -135,15 +144,16 @@ size can change on resume; bitwise regeneration across execution layouts is not
 guaranteed.
 
 Use a new output directory if the cohort, PI conditions, or generation settings
-change. `--force` recomputes generations under the same run settings. Changing
-`--k` or `--paired-bootstrap-samples` can reuse the sampled responses. A resumed
-run still initializes the vLLM model.
+change. In particular, use a new directory for this six-condition run instead
+of a previous hint-variant run. `--force` recomputes generations under the same
+run settings. Changing `--k` or `--paired-bootstrap-samples` can reuse the sampled
+responses. A resumed run still initializes the vLLM model.
 
 Each model writes its own directory:
 
 ```text
-results/passk_pi/demo_gain_solution/Qwen_Qwen3-1.7B/
-results/passk_pi/demo_gain_solution/Qwen_Qwen3-4B/
+results/passk_pi/default_hint/Qwen_Qwen3-1.7B/
+results/passk_pi/default_hint/Qwen_Qwen3-4B/
 ```
 
 Files:

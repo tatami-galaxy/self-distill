@@ -42,16 +42,16 @@ from train.opsd.train_hint_gen.lib import (
     HintRewardConfig,
     add_lora_args,
     add_teacher_backend_args,
-    teacher_backend_kwargs,
-    teacher_backend_meta,
-    validate_teacher_devices,
     build_hint_grpo_dataset,
     lora_config_from_args,
     lora_run_meta,
     make_reward_function,
+    teacher_backend_kwargs,
+    teacher_backend_meta,
     validate_lora_args,
+    validate_teacher_devices,
 )
-from utils import dataset_provenance, DATASET_REGISTRY_TRAIN, validate_resume
+from utils import DATASET_REGISTRY_TRAIN, validate_resume
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,7 +174,6 @@ def build_run_meta(args: argparse.Namespace, num_train_examples: int) -> dict:
         "model": args.model,
         "teacher_model": args.model,
         "dataset": args.dataset,
-        **dataset_provenance(args.dataset),
         "rollout_root": args.rollout_root,
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,

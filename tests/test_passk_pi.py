@@ -284,98 +284,59 @@ class DemoCohortTest(unittest.TestCase):
                 "final_answer": "42",
                 "solution": "Trace</think>42",
                 "rollout": "attempt",
-                "hint": "old hint",
+                "hint": f"standard advice {i}",
                 "prompt_ids": {},
                 "target_ids": [1],
             }
             for i in range(3)
         ]
-        self.variants = {
-            (r["question_id"], mode): [
-                {
-                    "sample_idx": 0,
-                    "hint": f"{mode} advice",
-                    "invalid_reason": "",
-                    "truncated": False,
-                },
-                {
-                    "sample_idx": 1,
-                    "hint": "other advice",
-                    "invalid_reason": "",
-                    "truncated": False,
-                },
-            ]
-            for r in self.cohort
-            for mode in passk_pi.HINT_VARIANTS
-        }
-        self.meta = {
-            "hints_hash": "hints",
-            "config": {
-                "model": "student",
-                "model_identity": {"model": "student"},
-                "revision": "rev",
-                "samples_per_level": 2,
-            },
-        }
 
-    def load(self, **kwargs):
-        with (
-            mock.patch.object(
-                passk_pi, "load_cohort", return_value=(self.manifest, self.cohort)
-            ),
-            mock.patch.object(
-                passk_pi, "load_variants", return_value=(self.variants, self.meta)
-            ),
-            mock.patch.object(Path, "is_file", return_value=True),
+    def load(self, modes=None, limit=0):
+        with mock.patch.object(
+            passk_pi, "load_cohort", return_value=(self.manifest, self.cohort)
         ):
             return passk_pi.load_demo_problems(
-                "cohort", "student", passk_pi.DEFAULT_PI_MODES, 0, **kwargs
+                "cohort", "student", modes or passk_pi.DEFAULT_PI_MODES, limit
             )
 
-    def test_common_valid_set_uses_fixed_hint_sample_not_best_available(self):
-        self.variants[("q0", "hint_short")][0]["truncated"] = True
-        self.variants[("q1", "hint_detailed")][0]["invalid_reason"] = "answer_leak"
-        rows, metadata = self.load()
-        self.assertEqual([r["question_id"] for r in rows], ["q2"])
-        self.assertEqual(metadata["n_prepared"], 3)
-        self.assertEqual(metadata["n_valid_pi"], 1)
-        self.assertEqual(rows[0]["hint_short"], "hint_short advice")
+    def test_uses_standard_cohort_hint_without_variant_artifacts(self):
+        with mock.patch.object(
+            passk_pi,
+            "load_from_disk",
+            side_effect=AssertionError("Unexpected cache load"),
+        ):
+            rows, meta = self.load()
+        self.assertEqual([r["hint"] for r in rows], [r["hint"] for r in self.cohort])
+        self.assertEqual(meta["n_valid_pi"], 3)
+        self.assertEqual(meta["hint_source"], "cohort.hint")
+        self.assertNotIn("hint_sample_idx", meta)
         self.assertNotIn("target_ids", rows[0])
-        self.assertEqual(len(self.load(hint_sample_idx=1)[0]), 3)
+        prompt = passk_pi.build_teacher_messages(rows[0], "hint")[-1]["content"]
+        self.assertIn("standard advice 0", prompt)
+        self.assertNotIn("Trace</think>42", prompt)
 
-    def test_missing_artifact_is_error_even_if_another_hint_is_invalid(self):
-        self.variants[("q0", "hint_short")][0]["truncated"] = True
-        del self.variants[("q0", "hint_detailed")]
-        with self.assertRaisesRegex(ValueError, "Missing fixed"):
+    def test_missing_standard_hint_is_error_only_when_requested(self):
+        for hint in (None, "", "  "):
+            with self.subTest(hint=hint):
+                self.cohort[0]["hint"] = hint
+                with self.assertRaisesRegex(ValueError, "Missing standard hint"):
+                    self.load()
+        del self.cohort[0]["hint"]
+        with self.assertRaisesRegex(ValueError, "Missing standard hint"):
             self.load()
+        self.assertEqual(len(self.load(modes=["none", "answer"])[0]), 3)
 
-    def test_foreign_teacher_or_revision_is_rejected(self):
-        for key, value in [
-            ("model", "another-teacher"),
-            ("revision", "another-revision"),
-        ]:
-            with (
-                self.subTest(key=key),
-                mock.patch.dict(self.meta["config"], {key: value}),
-                self.assertRaisesRegex(ValueError, "Hint generator"),
-            ):
-                self.load()
+    def test_rollout_filter_and_limit_keep_prepared_order(self):
+        self.cohort[0]["rollout"] = None
+        rows, meta = self.load(limit=1)
+        self.assertEqual([r["question_id"] for r in rows], ["q1"])
+        self.assertEqual(meta["n_valid_pi"], 2)
+        self.assertEqual(meta["exclusions"], {"missing_rollout": 1})
 
-    def test_variant_prompts_use_the_requested_hint_only(self):
-        row = self.load()[0][0]
-        for mode in passk_pi.HINT_VARIANTS:
-            messages = passk_pi.build_teacher_messages(row, mode)
-            self.assertIn(f"{mode} advice", messages[-1]["content"])
-            self.assertNotIn("Trace</think>42", messages[-1]["content"])
-            for other in set(passk_pi.HINT_VARIANTS) - {mode}:
-                self.assertNotIn(f"{other} advice", messages[-1]["content"])
-        self.assertNotIn(
-            "advice", passk_pi.build_teacher_messages(row, "none")[-1]["content"]
-        )
-        self.assertIn(
-            "Trace</think>42",
-            passk_pi.build_teacher_messages(row, "full")[-1]["content"],
-        )
+    def test_foreign_cohort_model_is_rejected(self):
+        self.manifest["model"] = "another-teacher"
+        with self.assertRaisesRegex(ValueError, "Self-teacher"):
+            self.load()
 
 
 class AllArmPairingTest(unittest.TestCase):
@@ -389,11 +350,11 @@ class AllArmPairingTest(unittest.TestCase):
             {"question_idx": 1, "n_samples": 4, "n_correct": 2},
         ]
         report = passk_pi.paired_against_none(
-            {"none": baseline, "hint_short": arm}, [1, 2, 4], 100, 42
+            {"none": baseline, "hint": arm}, [1, 2, 4], 100, 42
         )
         self.assertEqual(report["none"]["pass@2"]["mean"], 0.25)
-        self.assertAlmostEqual(report["hint_short"]["pass@2"]["mean"], 11 / 12)
-        self.assertAlmostEqual(report["hint_short"]["pass@2"]["delta_vs_none"], 2 / 3)
+        self.assertAlmostEqual(report["hint"]["pass@2"]["mean"], 11 / 12)
+        self.assertAlmostEqual(report["hint"]["pass@2"]["delta_vs_none"], 2 / 3)
         self.assertEqual(report["none"]["pass@4"]["delta_ci95"], [0, 0])
         with self.assertRaisesRegex(ValueError, "Cannot pair"):
             passk_pi.paired_against_none(
@@ -455,7 +416,7 @@ class GenerationCacheTest(unittest.TestCase):
             )
             self.assertEqual(llm.generate.call_count, 2)
 
-    def test_all_hint_prompts_participate_in_context_filter(self):
+    def test_hint_prompt_participates_in_context_filter(self):
         class Tokenizer:
             @staticmethod
             def apply_chat_template(conversations, **kwargs):
@@ -464,16 +425,36 @@ class GenerationCacheTest(unittest.TestCase):
                 return {"input_ids": [list(range(50 if "long hint" in text else 5))]}
 
         problems = [
-            {"question": "q1", "hint_short": "short"},
-            {"question": "q2", "hint_short": "long hint"},
+            {"question": "q1", "hint": "short"},
+            {"question": "q2", "hint": "long hint"},
         ]
         actual = passk_pi.restrict_to_pi_feasible(
-            problems, Tokenizer(), 10, ["none", "hint_short"], enable_thinking=False
+            problems, Tokenizer(), 10, ["none", "hint"], enable_thinking=False
         )
         self.assertEqual(actual, problems[:1])
 
 
 class PasskCliTest(unittest.TestCase):
+    def test_removed_hint_modes_and_sample_option_are_rejected_before_loading(self):
+        for extra in (
+            ["--pi-modes", "none", "hint_short"],
+            ["--pi-modes", "none", "hint_medium"],
+            ["--pi-modes", "none", "hint_detailed"],
+            ["--hint-sample-idx", "0"],
+        ):
+            with (
+                self.subTest(extra=extra),
+                mock.patch.object(sys, "argv", ["passk_pi", *extra]),
+                mock.patch.object(sys, "stderr"),
+                mock.patch.object(passk_pi, "load_demo_problems") as cohort,
+                mock.patch.object(passk_pi, "load_eval_problems") as cache,
+                self.assertRaises(SystemExit) as raised,
+            ):
+                passk_pi.main()
+            self.assertEqual(raised.exception.code, 2)
+            cohort.assert_not_called()
+            cache.assert_not_called()
+
     def test_preflight_then_all_arms_resume_and_settings_guard_without_model(self):
         class Tokenizer:
             def apply_chat_template(self, messages, tokenize, **kwargs):
@@ -489,7 +470,7 @@ class PasskCliTest(unittest.TestCase):
                 "answer": "42",
                 "solution": "trace</think>42",
                 "rollout": "attempt",
-                **{mode: mode + " advice" for mode in passk_pi.HINT_VARIANTS},
+                "hint": "standard advice",
             }
             for i in range(2)
         ]
@@ -558,7 +539,7 @@ class PasskCliTest(unittest.TestCase):
             self.assertEqual(
                 summary["pass_at_k"]["none"], {"pass@1": 0.5, "pass@2": 1.0}
             )
-            self.assertEqual(summary["truncation_rate"]["hint_short"], 0.5)
+            self.assertEqual(summary["truncation_rate"]["hint"], 0.5)
             self.assertEqual(
                 summary["cache_stats"],
                 {"hits": 2 * len(passk_pi.DEFAULT_PI_MODES), "misses": 0},

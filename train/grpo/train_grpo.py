@@ -24,17 +24,15 @@ import json
 import os
 
 from trl import GRPOConfig, GRPOTrainer
-from utils import accuracy_reward_for_dataset
+from trl.rewards import accuracy_reward
 
 from utils import (
-    dataset_provenance,
     DATASET_REGISTRY_TRAIN,
     format_prompt,
-    reward_solution,
     load_train_dataset,
+    reward_solution,
     validate_resume,
 )
-
 
 # ---------------------------------------------------------------------------
 # Resume
@@ -48,7 +46,6 @@ def build_run_meta(args, num_train_examples: int) -> dict:
         "method": "grpo",
         "model": args.model,
         "dataset": args.dataset,
-        **dataset_provenance(args.dataset),
         "max_samples": args.max_samples,
         "num_train_examples": num_train_examples,
         "loss_type": args.loss_type,
@@ -230,7 +227,7 @@ def main():
 
     trainer = GRPOTrainer(
         model=args.model,
-        reward_funcs=accuracy_reward_for_dataset(args.dataset),
+        reward_funcs=accuracy_reward,
         args=training_args,
         train_dataset=train_dataset,
     )

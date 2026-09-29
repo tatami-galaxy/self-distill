@@ -62,11 +62,6 @@ HINT_USER = (
 
 
 def build_messages(problem: str, solution: str, dataset: str = "deepmath") -> list[dict]:
-    if dataset == "codeio":
-        return [
-            {"role": "system", "content": "You are given a code output-prediction task and a verified worked response. Extract a SHORT list of useful reasoning hints."},
-            {"role": "user", "content": f"Task:\n{problem}\n\nVerified response (for reference only):\n{solution}\n\nGive only a few brief hints about control flow, intermediate states, or relevant concepts. Do NOT state the final output or an output JSON answer."},
-        ]
     return [
         {"role": "system", "content": HINT_SYSTEM},
         {"role": "user", "content": HINT_USER.format(problem=problem, solution=solution)},
@@ -104,9 +99,6 @@ def leaks_answer(hint: str, gold: str, dataset: str = "deepmath") -> bool:
     not as a standalone hint or in an explicit answer statement. This is a lexical
     guard, not a guarantee against every mathematical or semantic paraphrase.
     """
-    if dataset == "codeio":
-        from utils.codeio import leaks_output
-        return leaks_output(hint, gold)
     if "\\boxed" in hint:
         return True
     g = str(gold).strip()

@@ -1249,7 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Separate from --completions-root so --force can never overwrite "
                         "generation output.")
     p.add_argument("--pi-modes", nargs="+", default=list(LEGACY_PI_MODES), choices=list(PI_MODES),
-                   help="Arms to classify, including hint_short, hint_medium and hint_detailed. "
+                   help="Arms to classify; hint uses the standard cached self-hint. "
                         "Selected arms must share question/sample identities.")
     p.add_argument("--samples-per-problem", type=int, default=4,
                    help="Keep sample_idx < N. Thins SAMPLES, never problems: the CI resamples "

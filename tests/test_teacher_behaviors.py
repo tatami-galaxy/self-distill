@@ -612,22 +612,32 @@ class RunConfigTest(unittest.TestCase):
 
 
 class HintPiIntegrationTest(unittest.TestCase):
-    def test_cli_accepts_generated_hint_conditions(self):
-        modes = ["none", "answer", "rollout", "full", "solution", "hint_short", "hint_medium", "hint_detailed"]
+    def test_cli_accepts_standard_hint_conditions(self):
+        modes = ["none", "answer", "rollout", "full", "solution", "hint"]
         args = tb.build_parser().parse_args(["--pi-modes", *modes])
         self.assertEqual(args.pi_modes, modes)
 
+    def test_cli_rejects_removed_hint_conditions(self):
+        for mode in ("hint_short", "hint_medium", "hint_detailed"):
+            with (
+                self.subTest(mode=mode),
+                mock.patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                tb.build_parser().parse_args(["--pi-modes", "none", mode])
+            self.assertEqual(raised.exception.code, 2)
+
     def test_matching_hint_arms_keep_question_sample_pairing(self):
         rows = [source_record(0, 0), source_record(0, 1), source_record(1, 0)]
-        tb.validate_common_sources({"none": rows, "hint_short": list(reversed(rows))})
+        tb.validate_common_sources({"none": rows, "hint": list(reversed(rows))})
         with self.assertRaisesRegex(ValueError, "same question/sample"):
-            tb.validate_common_sources({"none": rows, "hint_medium": rows[:1]})
+            tb.validate_common_sources({"none": rows, "hint": rows[:1]})
         with self.assertRaisesRegex(ValueError, "Duplicate"):
-            tb.validate_common_sources({"hint_detailed": rows + rows[:1]})
+            tb.validate_common_sources({"hint": rows + rows[:1]})
         with self.assertRaisesRegex(ValueError, "Question identity"):
             tb.validate_common_sources({
                 "none": [source_record(0, 0, question_id="a")],
-                "hint_short": [source_record(0, 0, question_id="b")],
+                "hint": [source_record(0, 0, question_id="b")],
             })
 
     def test_changed_completion_text_invalidates_judge_cache(self):

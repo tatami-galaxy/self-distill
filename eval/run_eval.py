@@ -23,15 +23,15 @@ import json
 import os
 import re
 import time
+
 from vllm import LLM, SamplingParams
+
 from utils import (
-    grade,
-    dataset_provenance,
     DATASET_REGISTRY_EVAL,
     DATASET_REGISTRY_TRAIN,
     format_prompt,
+    grade,
 )
-
 
 # ---------------------------------------------------------------------------
 # Result layout
@@ -384,7 +384,7 @@ def save_results(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate models on math and CodeIO benchmarks")
+    parser = argparse.ArgumentParser(description="Evaluate models on math benchmarks")
     parser.add_argument(
         "--model", type=str, required=True,
         help="HuggingFace model name or local checkpoint path",
@@ -523,7 +523,6 @@ def main():
 
     eval_config = {
         "eval_dataset": args.dataset,
-        **dataset_provenance(args.dataset),
         "n": args.n,
         "k": args.k,
         "max_tokens": args.max_tokens,

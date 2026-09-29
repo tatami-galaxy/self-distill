@@ -10,8 +10,8 @@ here would drag an inference engine into every `import utils`. Run it as `python
 utils.gen_hints`.
 """
 
-from utils.tasks import dataset_provenance, accuracy_reward_for_dataset, answer_context, format_prompt, reward_solution
 from utils.pi import PI_ANSWER, PI_FULL, PI_HINT, PI_ROLLOUT, extract_final_solution
+from utils.tasks import answer_context, format_prompt, reward_solution
 from utils.utils import (
     # dataset registries and loaders
     DATASET_REGISTRY_EVAL,
@@ -30,19 +30,14 @@ from utils.utils import (
     hint_path,
     load_hint_cache,
     load_train_dataset,
-    rollout_path,
     register_dataset_eval,
     register_dataset_train,
+    rollout_path,
     # resume validation
     validate_resume,
 )
 
 __all__ = [
-    "accuracy_reward_for_dataset",
-    "dataset_provenance",
-    "answer_context",
-    "format_prompt",
-    "reward_solution",
     "DATASET_REGISTRY_EVAL",
     "DATASET_REGISTRY_TRAIN",
     "MATH_SYSTEM_PROMPT",
@@ -51,9 +46,11 @@ __all__ = [
     "PI_HINT",
     "PI_ROLLOUT",
     "TEACHER_PROMPT_TEMPLATE",
+    "answer_context",
     "compose_pi_messages",
     "extract_answer",
     "extract_final_solution",
+    "format_prompt",
     "format_prompt_math",
     "grade",
     "grade_answer",
@@ -61,8 +58,9 @@ __all__ = [
     "hint_path",
     "load_hint_cache",
     "load_train_dataset",
-    "rollout_path",
     "register_dataset_eval",
     "register_dataset_train",
+    "reward_solution",
+    "rollout_path",
     "validate_resume",
 ]
