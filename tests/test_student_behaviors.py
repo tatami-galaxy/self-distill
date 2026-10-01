@@ -1,313 +1,555 @@
-"""Cached student analysis: cohort matching, provenance, paired statistics, and resume."""
+"""Student generation, checkpoint selection, pairing and resume without downloads."""
 
-import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
-
-from datasets import Dataset
 
 from eval import student_behaviors as sb
 from eval import teacher_behaviors as tb
 from tests.test_teacher_behaviors import WordTokenizer
 
 
-def rollout(
-    question=1, sample=0, text="Check the result.\n\nNow use a different approach."
-):
+class ChatTokenizer(WordTokenizer):
+    chat_template = "test-template"
+
+    def get_vocab(self):
+        return {"Check": 1, "result": 2}
+
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs["enable_thinking"] and kwargs["add_generation_prompt"]
+        return "\n".join(m["content"] for m in messages) + "\nassistant"
+
+
+def completion(p, sample=0):
     return {
-        "question_id": f"q{question}",
-        "question_idx": question,
+        "question_id": p["question_id"],
+        "question_idx": p["question_idx"],
         "sample_idx": sample,
-        "question": f"problem {question}",
-        "final_answer": "42",
-        "completion_text": text,
-        "completion_ids": [1, 2, 3],
-        "n_tokens": 3,
-        "reward": 1.0,
-        "truncated": False,
-        "finish_reason": "stop",
-        "rollout_id": f"r{question}-{sample}",
-    }
-
-
-def trajectory(q, s, count, tokens=1000):
-    return {
-        "question_idx": q,
-        "sample_idx": s,
-        "n_tokens": tokens,
+        "text": "Check result.",
+        "completion_ids": [1, 2],
+        "n_tokens": 2,
         "correct": True,
         "truncated": False,
-        **{name: count for name in tb.BEHAVIORS},
+        "unclosed": True,
+        "finish_reason": "stop",
+        "e_total": 1,
+        "e_think": 1,
+        "e_post": 0,
+        "e_by_marker": {m: int(m == "check") for m in tb.EPISTEMIC_MARKERS},
     }
 
 
-class SourceTest(unittest.TestCase):
-    def test_selection_keeps_same_questions_and_first_samples(self):
-        rows = [rollout(q, s) for q in range(3) for s in range(3)]
-        selected = sb.adapt_rollouts(rows, {"q1": (1, "problem 1", "42")}, 2)
-        self.assertEqual(
-            [(r["question_idx"], r["sample_idx"]) for r in selected], [(1, 0), (1, 1)]
-        )
-        self.assertTrue(selected[0]["unclosed"])
-        self.assertEqual(selected[0]["e_total"], 1)
-
-    def test_missing_duplicate_and_misaligned_rollouts_fail(self):
-        questions = {"q1": (1, "problem 1", "42")}
-        for rows in (
-            [],
-            [rollout(), rollout()],
-            [{**rollout(), "question": "different"}],
-        ):
-            with self.subTest(rows=rows), self.assertRaises(ValueError):
-                sb.adapt_rollouts(rows, questions, 1)
-
-    def test_content_changes_invalidate_cache_even_with_same_ids(self):
-        args = sb.build_parser().parse_args([])
-        args.max_output_tokens = 1024
-        job = {
-            "model": "model",
-            "arm": "hint",
-            "step": 20,
-            "source": Path("cache"),
-            "generation": {},
-            "questions": {"q1": (1, "problem 1", "42")},
-        }
-        old = sb.adapt_rollouts([rollout()], job["questions"], 1)
-        new = sb.adapt_rollouts(
-            [rollout(text="Entirely different reasoning.")], job["questions"], 1
-        )
-        before = sb.classification_config(args, job, old)
-        after = sb.classification_config(args, job, new)
-        self.assertNotEqual(before["source_fingerprint"], after["source_fingerprint"])
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            rows = [{"verification": 1}]
-            sb.write_jsonl(root / "behaviors.jsonl", rows)
-            tb.write_json_atomic(
-                root / "meta.json",
-                {
-                    "status": "complete",
-                    "config": before,
-                    "chunks_fingerprint": sb.fingerprint(rows),
-                },
-            )
-            self.assertEqual(sb.cached_classification(root, before, False), rows)
-            with self.assertRaisesRegex(ValueError, "Incompatible"):
-                sb.cached_classification(root, after, False)
-            self.assertIsNone(sb.cached_classification(root, after, True))
-            sb.write_jsonl(root / "behaviors.jsonl", [{"verification": 999}])
-            with self.assertRaisesRegex(ValueError, "content mismatch"):
-                sb.cached_classification(root, before, False)
-
-
-class PairedTest(unittest.TestCase):
-    def test_pooled_rate_not_mean_of_question_rates(self):
-        base = [trajectory(0, 0, 0, 1000), trajectory(1, 0, 0, 9000)]
-        candidate = [trajectory(0, 0, 10, 1000), trajectory(1, 0, 0, 9000)]
-        result = sb.paired_differences(candidate, base, 100, 42, 1)
-        self.assertEqual(result["metrics"]["verification/rate_per_1k"]["delta"], 1.0)
-        self.assertEqual(result["metrics"]["verification/prevalence"]["delta"], 0.5)
-
-    def test_identical_conditions_have_exactly_zero_paired_uncertainty(self):
-        rows = [trajectory(q, s, q + s) for q in range(4) for s in range(2)]
-        result = sb.paired_differences(rows, rows, 100, 42, 2)
-        for metric in result["metrics"].values():
-            self.assertEqual(metric, {"delta": 0.0, "ci95": [0.0, 0.0]})
-
-    def test_failed_samples_drop_question_from_paired_estimate(self):
-        base = [trajectory(q, s, 1) for q in range(2) for s in range(2)]
-        result = sb.paired_differences(base[:-1], base, 20, 42, 2)
-        self.assertEqual(result["question_indices"], [0])
-        self.assertEqual(result["n_questions"], 1)
-
-    def test_no_usable_questions_is_reported(self):
-        result = sb.paired_differences([], [trajectory(1, 0, 1)], 20, 42, 1)
-        self.assertEqual(result["metrics"], {})
-        self.assertEqual(result["n_questions"], 0)
-
-
-class DriverTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.input = self.root / "input"
-        self.output = self.root / "output"
-        self.model = "Qwen3-1.7B"
-        for arm, questions in (("hint", [0, 1]), ("full", [1, 2])):
-            run = self.input / self.model / f"deepmath_{arm}"
-            cohort = [
-                {
-                    "question_id": f"q{q}",
-                    "question_idx": q,
-                    "question": f"problem {q}",
-                    "final_answer": "42",
-                }
-                for q in questions
-            ]
-            Dataset.from_list(cohort).save_to_disk(str(run / "cohort"))
-            ids = [r["question_id"] for r in cohort]
-            cohort_fp = tb.fingerprint_ids(ids)
-            tb.write_json_atomic(
-                run / "cohort_meta.json",
-                {
-                    "status": "complete",
-                    "question_ids": ids,
-                    "cohort_fingerprint": cohort_fp,
-                },
-            )
-            for step in (0, 20):
-                path = run / f"step-{step:06d}"
-                Dataset.from_list(
-                    [rollout(q, s) for q in questions for s in range(2)]
-                ).save_to_disk(str(path / "rollouts"))
-                config = {
-                    "base_model": f"Qwen/{self.model}",
-                    "dataset": "deepmath",
-                    "step": step,
-                    "student_model": f"model-{step}",
-                    "cohort_fingerprint": cohort_fp,
-                    "n": 2,
-                    "seed": 42,
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "top_k": 0,
-                    "min_p": 0.0,
-                    "repetition_penalty": 1.0,
-                    "max_completion_length": 8192,
-                }
-                tb.write_json_atomic(
-                    path / "rollout_meta.json", {"status": "complete", "config": config}
+def judged(plan, fail=False):
+    return [
+        {
+            **{
+                k: r[k]
+                for k in (
+                    "question_idx",
+                    "sample_idx",
+                    "chunk_idx",
+                    "char_start",
+                    "char_end",
+                    "n_classifier_tokens",
                 )
+            },
+            "parse_failed": fail,
+            **{b: 1 for b in tb.BEHAVIORS},
+        }
+        for r in plan
+    ]
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.study, self.cohort = self.root / "study", self.root / "cohort"
+        self.output, self.run, self.benchmark = (
+            self.root / "output",
+            self.root / "run",
+            self.root / "bench",
+        )
+        self.rows = [
+            {
+                "question_id": f"q{i}",
+                "question_idx": 10 + i,
+                "question": f"Question {i}",
+                "final_answer": "42",
+                "hint": "DO NOT INCLUDE HINT",
+                "solution": "DO NOT INCLUDE SOLUTION",
+            }
+            for i in range(3)
+        ]
+        tok_hash = sb.digest(
+            {
+                "vocab": ChatTokenizer().get_vocab(),
+                "template": ChatTokenizer.chat_template,
+            }
+        )
+        sb.write_rows(self.cohort / "cohort.jsonl", self.rows)
+        sb.write_json(
+            self.cohort / "manifest.json",
+            {
+                "model": "Qwen/test",
+                "dataset": "deepmath",
+                "cohort_hash": sb.digest(self.rows),
+                "tokenizer_hash": tok_hash,
+            },
+        )
+        self.teacher = {
+            "teacher_model": "Qwen/test",
+            "n_problems": 2,
+            "n_samples": 2,
+            "source": {
+                "problem_model": "Qwen/test",
+                "question_ids": ["q2", "q0"],
+                "question_indices": [12, 10],
+                "cohort": {
+                    "cohort_dir": str(self.cohort),
+                    "cohort_hash": sb.digest(self.rows),
+                    "tokenizer_hash": tok_hash,
+                },
+            },
+            "generation": {
+                "revision": "rev",
+                "tokenizer_hash": tok_hash,
+                "enable_thinking": True,
+                "dtype": "bfloat16",
+                "max_tokens": 100,
+                "max_model_len": 1000,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "seed": 42,
+            },
+        }
+        sb.write_json(self.study / "teacher_uncertainty_run_meta.json", self.teacher)
+        self.meta = {"model": "Qwen/test", "dataset": "deepmath", "pi_mode": "hint"}
+        sb.write_json(self.run / "run_meta.json", self.meta)
+        for step in (20, 40):
+            path = self.run / f"checkpoint-{step}"
+            path.mkdir()
+            (path / "model.safetensors").write_bytes(b"test weights")
         self.argv = [
-            "student_behaviors",
-            "--rollout-root",
-            str(self.input),
-            "--output-root",
+            "--teacher-study-dir",
+            str(self.study),
+            "--run",
+            f"hint={self.run}",
+            "--output-dir",
             str(self.output),
-            "--models",
-            self.model,
-            "--arms",
-            "hint",
-            "full",
             "--samples-per-problem",
             "2",
             "--bootstrap-samples",
-            "16",
+            "20",
             "--no-plots",
         ]
 
-    def test_intersection_and_automatic_base_step(self):
-        args = sb.build_parser().parse_args(self.argv[1:] + ["--steps", "20"])
-        jobs, manifest = sb.prepare_model(args, self.model)
-        self.assertEqual(manifest["question_ids"], ["q1"])
-        self.assertEqual(
-            [(j["arm"], j["step"]) for j in jobs],
-            [("hint", 0), ("hint", 20), ("full", 0), ("full", 20)],
-        )
+    def args(self, *extra):
+        args = sb.build_parser().parse_args(self.argv + list(extra))
+        args.judge_max_tokens = 1024
+        return args
 
-    def test_mismatched_generation_settings_fail(self):
-        path = self.input / self.model / "deepmath_full/step-000020/rollout_meta.json"
-        meta = json.loads(path.read_text())
-        meta["config"]["max_completion_length"] = 16384
-        path.write_text(json.dumps(meta))
-        args = sb.build_parser().parse_args(self.argv[1:])
-        with self.assertRaisesRegex(ValueError, "Generation settings differ"):
-            sb.prepare_model(args, self.model)
-
-    def test_end_to_end_resume_and_cpu_summary(self):
-        def classify(llm, sampling, plan, prompt, evidence):
-            return [
+    def result(self, step, correct, pass16=1.0, **overrides):
+        path = self.benchmark / f"checkpoint-{step}" / "summary.json"
+        summary = {
+            "model": str(self.run / f"checkpoint-{step}"),
+            "arm": {
+                "algo": "sdft",
+                "model": "test",
+                "train_dataset": "deepmath",
+                "variant": "hint",
+                "run": "run-1",
+                "step": f"checkpoint-{step}",
+            },
+            "n_samples": 16,
+            "dataset_size": 2,
+            "pass_at_k": {"pass@1": correct / 16, "pass@16": pass16},
+            "eval_config": {
+                "n": 16,
+                "eval_dataset": "aime24",
+                "max_tokens": 32000,
+                "seed": 42,
+                "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
+            },
+        }
+        summary.update(overrides)
+        sb.write_json(path, summary)
+        sb.write_json(
+            path.parent / "results.json",
+            [
                 {
-                    **{
-                        key: row[key]
-                        for key in (
-                            "question_idx",
-                            "sample_idx",
-                            "chunk_idx",
-                            "char_start",
-                            "char_end",
-                            "n_classifier_tokens",
-                        )
-                    },
-                    "parse_failed": False,
-                    **{name: 1 for name in tb.BEHAVIORS},
+                    "problem": f"Benchmark {i}",
+                    "answer": "42",
+                    "n_samples": 16,
+                    "n_correct": correct,
+                    "samples": [{"correct": j < correct} for j in range(16)],
                 }
-                for row in plan
-            ]
-
-        with (
-            mock.patch.object(sys, "argv", self.argv),
-            mock.patch(
-                "transformers.AutoTokenizer.from_pretrained",
-                return_value=WordTokenizer(),
-            ),
-            mock.patch.object(
-                tb, "create_classifier", return_value=(object(), object())
-            ) as factory,
-            mock.patch.object(
-                tb, "classify_chunks", side_effect=classify
-            ) as classify_mock,
-        ):
-            sb.main()
-            factory.assert_called_once()
-            self.assertEqual(classify_mock.call_count, 4)
-        for extra in ([], ["--phase", "summarize"]):
-            with (
-                mock.patch.object(sys, "argv", self.argv + extra),
-                mock.patch(
-                    "transformers.AutoTokenizer.from_pretrained",
-                    side_effect=AssertionError("tokenizer loaded"),
-                ),
-                mock.patch.object(
-                    tb, "create_classifier", side_effect=AssertionError("judge loaded")
-                ),
-            ):
-                sb.main()
-        summary = json.loads((self.output / self.model / "summary.json").read_text())
-        self.assertEqual(summary["n_questions"], 1)
-        self.assertEqual(set(summary["arms"]), {"hint", "full"})
-        self.assertEqual(
-            summary["arms"]["hint"]["20"]["paired_vs_step_zero"]["n_questions"], 1
+                for i in range(2)
+            ],
         )
-        sb.plot_curves(summary, self.output / self.model)
-        self.assertTrue((self.output / self.model / "rate_per_1k.png").is_file())
+        return path
 
-    def test_dry_run_never_loads_judge_or_writes_results(self):
-        with (
-            mock.patch.object(sys, "argv", self.argv + ["--dry-run"]),
-            mock.patch(
-                "transformers.AutoTokenizer.from_pretrained",
-                return_value=WordTokenizer(),
-            ),
-            mock.patch.object(
-                tb, "create_classifier", side_effect=AssertionError("judge loaded")
-            ),
+    def best_args(self, *extra):
+        return self.args(
+            "--checkpoint-selection",
+            "best",
+            "--selection-benchmark",
+            "aime24",
+            "--benchmark-results",
+            f"hint={self.benchmark}",
+            *extra,
+        )
+
+    def prepared(self):
+        args = self.args()
+        experiment, plan = sb.make_plan(args)
+        for job in plan["jobs"]:
+            rows = [completion(p, i) for p in experiment["problems"] for i in range(2)]
+            sb.save_artifact(
+                self.output / job["relative_dir"],
+                "completions",
+                sb.generation_config(experiment, job),
+                rows,
+            )
+        return args, experiment, plan
+
+
+class CohortTests(Fixture):
+    def test_exact_retained_order_and_no_pi(self):
+        rows, _ = sb.load_teacher_cohort(self.study)
+        self.assertEqual([r["question_id"] for r in rows], ["q2", "q0"])
+        self.assertTrue(
+            all(
+                "DO NOT INCLUDE" not in p
+                for p in sb.render_prompts(rows, ChatTokenizer(), 1000, 100)
+            )
+        )
+        self.assertNotIn("hint", rows[0])
+
+    def test_checksum_and_index_mismatch(self):
+        sb.write_rows(self.cohort / "cohort.jsonl", self.rows[:-1])
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            sb.load_teacher_cohort(self.study)
+        sb.write_rows(self.cohort / "cohort.jsonl", self.rows)
+        self.teacher["source"]["question_indices"][0] = 999
+        sb.write_json(self.study / "teacher_uncertainty_run_meta.json", self.teacher)
+        with self.assertRaisesRegex(ValueError, "misaligned"):
+            sb.load_teacher_cohort(self.study)
+
+    def test_no_silent_context_filtering(self):
+        rows, _ = sb.load_teacher_cohort(self.study)
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            sb.render_prompts(rows, ChatTokenizer(), 101, 100)
+
+    def test_bad_completion_groups(self):
+        problems, _ = sb.load_teacher_cohort(self.study)
+        rows = [completion(p) for p in problems]
+        for invalid in (
+            rows[:-1],
+            rows + [rows[0]],
+            [{**rows[0], "n_tokens": 3}, rows[1]],
         ):
-            sb.main()
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                sb.validate_rows(invalid, problems, 1)
+
+
+class SelectionTests(Fixture):
+    def test_legacy_results_require_explicit_option_and_record_missing_provenance(self):
+        for step in (20, 40):
+            path = self.result(step, 8 if step == 20 else 10)
+            data = sb.read_json(path)
+            data.pop("eval_config")
+            data.pop("arm")
+            data["max_tokens"] = 32000
+            sb.write_json(path, data)
+        with self.assertRaisesRegex(ValueError, "Legacy result lacks eval_config"):
+            sb.make_plan(self.best_args())
+        _, plan = sb.make_plan(self.best_args("--allow-legacy-benchmark-results"))
+        report = plan["selection"]["hint"]
+        self.assertEqual(report["selected_steps"], [40])
+        self.assertFalse(report["generation_protocol_verified"])
+        self.assertTrue(report["candidates"][0]["provenance_gaps"])
+
+    def test_avg16_not_pass16_and_earliest_tie(self):
+        self.result(20, 8, pass16=1.0)
+        self.result(40, 10, pass16=0.5)
+        _, plan = sb.make_plan(self.best_args())
+        self.assertEqual([j["step"] for j in plan["jobs"]], [0, 40])
+        self.result(20, 10)
+        _, plan = sb.make_plan(self.best_args())
+        self.assertEqual(plan["jobs"][1]["step"], 20)
+
+    def test_ineligible_counts_excluded(self):
+        self.result(20, 8)
+        self.result(40, 16, n_samples=8)
+        _, plan = sb.make_plan(self.best_args())
+        report = plan["selection"]["hint"]
+        self.assertEqual(report["selected_steps"], [20])
+        self.assertEqual(report["without_eligible_results"], [40])
+
+    def test_missing_winner_never_falls_back(self):
+        self.result(20, 8)
+        self.result(60, 12)
+        with self.assertRaisesRegex(ValueError, "weights unavailable"):
+            sb.make_plan(self.best_args())
+
+    def test_mixed_questions_or_sampling(self):
+        self.result(20, 8)
+        path = self.result(40, 10)
+        rows = sb.read_json(path.parent / "results.json")
+        rows[0]["problem"] = "Different question"
+        sb.write_json(path.parent / "results.json", rows)
+        with self.assertRaisesRegex(ValueError, "questions or generation"):
+            sb.make_plan(self.best_args())
+        path = self.result(40, 10)
+        data = sb.read_json(path)
+        data["eval_config"]["sampling"]["temperature"] = 0.6
+        sb.write_json(path, data)
+        with self.assertRaisesRegex(ValueError, "questions or generation"):
+            sb.make_plan(self.best_args())
+
+    def test_inconsistent_score_or_other_run(self):
+        path = self.result(20, 8)
+        data = sb.read_json(path)
+        data["pass_at_k"]["pass@1"] = 0.99
+        sb.write_json(path, data)
+        with self.assertRaisesRegex(ValueError, "does not equal avg@16"):
+            sb.make_plan(self.best_args())
+        self.result(20, 8, model=str(self.root / "other" / "checkpoint-20"))
+        with self.assertRaisesRegex(ValueError, "path differs"):
+            sb.make_plan(self.best_args())
+
+    def test_all_numeric_single_base_solution_supported_rollout_excluded(self):
+        (self.run / "final").mkdir()
+        _, plan = sb.make_plan(self.args())
+        self.assertEqual([j["step"] for j in plan["jobs"]], [0, 20, 40])
+        self.meta["pi_mode"] = "solution"
+        sb.write_json(self.run / "run_meta.json", self.meta)
+        _, plan = sb.make_plan(self.args())
+        self.assertEqual(plan["jobs"][1]["arm"], "solution")
+        self.meta["pi_mode"] = "rollout"
+        sb.write_json(self.run / "run_meta.json", self.meta)
+        with self.assertRaisesRegex(ValueError, "rollout is excluded"):
+            sb.make_plan(self.args())
+
+    def test_frozen_selection_and_shared_paths(self):
+        self.result(20, 8)
+        self.result(40, 10)
+        args = self.best_args()
+        experiment, plan = sb.make_plan(args)
+        sb.write_json(self.output / "experiment.json", experiment)
+        sb.write_json(sb.selection_path(args), plan)
+        self.result(20, 16)
+        _, frozen = sb.make_plan(args)
+        self.assertEqual(frozen["jobs"][1]["step"], 40)
+        _, refreshed = sb.make_plan(self.best_args("--refresh-selection"))
+        self.assertEqual(refreshed["jobs"][1]["step"], 20)
+        _, all_plan = sb.make_plan(self.args())
+        self.assertEqual(plan["jobs"][1], all_plan["jobs"][2])
+
+    def test_dry_run_no_writes_or_solver(self):
+        with mock.patch.object(sb, "generate_phase") as generate:
+            sb.main(self.argv + ["--dry-run"])
+        generate.assert_not_called()
         self.assertFalse(self.output.exists())
 
 
-class SharedJudgeTest(unittest.TestCase):
-    def test_student_and_teacher_share_judge_defaults(self):
-        teacher = tb.build_parser().parse_args([])
-        student = sb.build_parser().parse_args([])
+class PipelineTests(Fixture):
+    def test_teacher_reference_alignment_and_judge_provenance(self):
+        args, experiment, _plan = self.prepared()
+        rows = sb.read_rows(self.output / "base" / "completions.jsonl")
+        sb.write_rows(self.study / "completions_hint.jsonl", rows)
+        behavior_dir = self.root / "teacher-behaviors"
+        args.teacher_behaviors_dir = str(behavior_dir)
+        judge = {**vars(sb.judge_args(args)), "rubric": tb.rubric_fingerprint()}
+        config = {
+            **vars(sb.judge_args(args)),
+            "rubric_fingerprint": tb.rubric_fingerprint(),
+            "samples_per_problem": 2,
+            "limit": None,
+            "source_fingerprint": tb.source_fingerprint(rows),
+        }
+        sb.write_json(
+            behavior_dir / "behaviors_meta_hint.json",
+            {"status": "complete", "config": config},
+        )
+        chunks = tb.build_chunk_plan(rows, ChatTokenizer(), 1000, 0)
+        sb.write_rows(behavior_dir / "behaviors_hint.jsonl", judged(chunks))
+        result = sb.teacher_references(experiment, args, judge)
+        self.assertTrue(result["same_generation_protocol"])
+        self.assertEqual(result["arms"]["hint"]["cognitive_status"], "available")
+        self.assertFalse(result["arms"]["hint"]["judge_revision_verified"])
+        judge["temperature"] = 0.1
+        result = sb.teacher_references(experiment, args, judge)
         self.assertEqual(
-            {k: getattr(teacher, k) for k in sb.JUDGE_KEYS},
-            {k: getattr(student, k) for k in sb.JUDGE_KEYS},
+            result["arms"]["hint"]["cognitive_status"], "judge_configuration_mismatch"
+        )
+        sb.write_rows(self.study / "completions_hint.jsonl", rows[:-1])
+        with self.assertRaisesRegex(ValueError, "identities differ"):
+            sb.teacher_references(experiment, args, judge)
+
+    def test_generation_partial_resume_and_completed_skip(self):
+        from eval import teacher_uncertainty as tu
+
+        args = self.args("--batch-size", "1")
+        experiment, plan = sb.make_plan(args)
+        job = plan["jobs"][1]
+        response = SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    text="Check result.", token_ids=[1, 2], finish_reason="stop"
+                )
+                for _ in range(2)
+            ]
+        )
+        with (
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=ChatTokenizer(),
+            ),
+            mock.patch("vllm.LLM") as engine,
+            mock.patch.object(tu, "grade", return_value=("42", True)),
+        ):
+            engine.return_value.generate.side_effect = [
+                [response],
+                RuntimeError("interrupted"),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                sb.generate_job(experiment, job, vars(args))
+            self.assertFalse(
+                (self.output / job["relative_dir"] / "completions_meta.json").exists()
+            )
+            engine.reset_mock()
+            engine.return_value.generate.side_effect = None
+            engine.return_value.generate.return_value = [response]
+            sb.generate_job(experiment, job, vars(args))
+            self.assertEqual(engine.return_value.generate.call_count, 1)
+            self.assertNotIn(
+                "DO NOT INCLUDE", engine.return_value.generate.call_args.args[0][0]
+            )
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=AssertionError("loaded"),
+        ):
+            sb.generate_job(experiment, job, vars(args))
+        self.assertEqual(
+            len(sb.load_artifact(self.output / job["relative_dir"], "completions")), 4
         )
 
-    def test_shared_chunk_context_is_not_counted_twice(self):
-        source = [{"question_idx": 1, "sample_idx": 0, "text": "a b\n\nc d\n\ne f"}]
-        plan = tb.build_chunk_plan(source, WordTokenizer(), 2, 1)
-        self.assertEqual(len(plan), 3)
-        self.assertNotIn("context", plan[0])
-        self.assertEqual(plan[1]["context"], "a b")
-        self.assertEqual(plan[2]["text"], "e f")
-        self.assertEqual(plan[2]["context"], "c d")
+    def test_judge_resume_cpu_summary_and_generation_denominators(self):
+        args, experiment, plan = self.prepared()
+        args.judge_batch_size = 2
+        calls = []
+
+        def classify(llm, sampling, chunks, prompt, evidence):
+            calls.append(chunks)
+            if len(calls) == 2:
+                raise RuntimeError("judge interrupted")
+            return judged(chunks, fail=len(calls) == 1)
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=SimpleNamespace(_commit_hash="judge-rev"),
+            ),
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=ChatTokenizer(),
+            ),
+            mock.patch.object(
+                tb, "create_classifier", return_value=(object(), object())
+            ) as create,
+            mock.patch.object(tb, "classify_chunks", side_effect=classify),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "judge interrupted"):
+                sb.classify_phase(experiment, plan, args)
+            self.assertEqual(
+                len(
+                    list(
+                        (self.output / "base" / "score_cache" / "classification").glob(
+                            "*.json"
+                        )
+                    )
+                ),
+                2,
+            )
+            sb.classify_phase(experiment, plan, args)
+            self.assertEqual(create.call_count, 2)
+            create.reset_mock()
+            sb.classify_phase(experiment, plan, args)
+            create.assert_not_called()
+        with (
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                side_effect=AssertionError("loaded"),
+            ),
+            mock.patch.object(
+                tb, "create_classifier", side_effect=AssertionError("loaded")
+            ),
+        ):
+            result = sb.summarize_phase(experiment, plan, args)
+        base = result["jobs"]["base"]
+        self.assertEqual(base["uncertainty"]["n_completions"], 4)
+        self.assertEqual(base["cognitive"]["n_trajectories"], 2)
+        self.assertEqual(base["cognitive"]["n_trajectories_dropped"], 2)
+        self.assertEqual(
+            result["jobs"]["hint/checkpoint-20"]["cognitive_vs_base"]["n_questions"], 1
+        )
+        self.assertFalse(result["missing_classifications"])
+        sb.plot_results(result, self.output / "test.png")
+        self.assertTrue((self.output / "test.png").is_file())
+
+    def test_corrupted_artifacts_and_changed_settings(self):
+        _, experiment, plan = self.prepared()
+        root = self.output / "base"
+        config = sb.generation_config(experiment, plan["jobs"][0])
+        with self.assertRaisesRegex(ValueError, "Incompatible"):
+            sb.load_artifact(root, "completions", {**config, "revision": "different"})
+        rows = sb.read_rows(root / "completions.jsonl")
+        rows[0]["text"] = "changed"
+        sb.write_rows(root / "completions.jsonl", rows)
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            sb.load_artifact(root, "completions", config)
+
+    def test_uncertainty_before_judging(self):
+        args, experiment, plan = self.prepared()
+        result = sb.summarize_phase(experiment, plan, args)
+        self.assertEqual(len(result["missing_classifications"]), 3)
+        self.assertEqual(
+            result["jobs"]["base"]["uncertainty"]["e_per_1k_tokens"], 500.0
+        )
+
+
+class StatisticsTests(unittest.TestCase):
+    def rows(self):
+        return [
+            {
+                **completion({"question_id": f"q{q}", "question_idx": q}, s),
+                "n_tokens": 1000 if q == 0 else 9000,
+                **{b: 10 if q == 0 else 0 for b in sb.BEHAVIORS},
+            }
+            for q in range(2)
+            for s in range(2)
+        ]
+
+    def test_pooled_rate_and_identical_paired_zero(self):
+        rows = self.rows()
+        result = sb.bootstrap_metrics(rows, 50, 42, cognitive=True)
+        self.assertEqual(result["metrics"]["verification/rate_per_1k"]["mean"], 1.0)
+        result = sb.bootstrap_metrics(rows, 50, 42, baseline=rows, n=2, cognitive=True)
+        for value in result["metrics"].values():
+            self.assertEqual(value, {"delta": 0.0, "ci95": [0.0, 0.0]})
+
+    def test_incomplete_samples_drop_question_from_paired_estimate(self):
+        rows = self.rows()
+        result = sb.bootstrap_metrics(
+            rows[:-1], 50, 42, baseline=rows, n=2, cognitive=True
+        )
+        self.assertEqual(result["question_indices"], [0])
 
 
 if __name__ == "__main__":

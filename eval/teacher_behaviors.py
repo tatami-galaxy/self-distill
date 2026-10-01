@@ -912,6 +912,8 @@ def create_classifier(args):
 
     llm = LLM(
         model=args.classifier_model,
+        revision=getattr(args, "revision", None),
+        tokenizer_revision=getattr(args, "revision", None),
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
