@@ -23,11 +23,18 @@ fresh unprivileged student rollouts once and scores those same tokens under exac
 two frozen-base-teacher conditions:
 
 * ``none``: no PI, a control measuring policy drift from the base model;
-* the training PI: the answer, hint, full solution, or cached rollout used by the
+* the training PI: the answer, hint, full reference, or post-thinking solution used by the
   run, reproducing the kind of advantage used during training.
 
 At step 0 the ``none`` advantage is zero up to numerical error. No other PI modes
 are evaluated.
+
+Questions and original PI come from the retained self-teacher study specified by
+``--teacher-study-dir``, in the same order as student_behaviors. All questions are
+used by default. Full-PI prompts exceeding the training/context budget are dropped
+and recorded without replacement; other prompt overflows are errors. Fresh raw
+student sampling is retained (temperature 1, no top-p/top-k filtering), independently
+of the behavior study's sampling settings. See docs/advantage_dynamics.md.
 
 ``sweep`` runs generation and scoring in distinct spawned processes for every
 requested checkpoint, then aggregates. This is a correctness boundary: initializing
@@ -36,11 +43,12 @@ clean interpreter.
 
 Example:
 
-    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.advantage_dynamics \
+    CUDA_VISIBLE_DEVICES=0 uv run python -m eval.advantage_dynamics_sdft \
       --phase sweep \
       --run-dir /mnt/data/ujan/self-distill/outputs/sdft/Qwen3-1.7B/deepmath_hint \
+      --teacher-study-dir results/teacher_uncertainty/default_hint/Qwen_Qwen3-1.7B \
       --pi-mode hint \
-      --num-problems 128 --n 8
+      --n 2
 """
 
 from __future__ import annotations
@@ -60,11 +68,12 @@ from typing import Any, Iterable
 
 from datasets import Dataset, load_from_disk
 
-from train.opsd.train_sdft import PI_FULL, PI_HINT, PI_ROLLOUT
-from utils import answer_context, compose_pi_messages, format_prompt, grade, load_hint_cache, load_train_dataset, rollout_path
+from eval.hint_compare_cache import digest
+from eval.teacher_cohort import load_teacher_cohort
+from utils import PI_FULL, PI_HINT, answer_context, compose_pi_messages, extract_final_solution, format_prompt, grade
 
 
-PI_MODES = ("none", "answer", "hint", "full", "rollout")
+PI_MODES = ("none", "answer", "hint", "full", "solution")
 TRAINING_PI_MODES = PI_MODES[1:]
 REQUIRED_TRAINING_CONFIG = {
     "distillation_mode": "sampled_token",
@@ -339,8 +348,8 @@ def privileged_context(problem: dict, pi_mode: str) -> str:
         return PI_HINT.format(hint=problem["hint"])
     if pi_mode == "full":
         return PI_FULL.format(demo=problem["solution"])
-    if pi_mode == "rollout":
-        return PI_ROLLOUT.format(attempt=problem["rollout"])
+    if pi_mode == "solution":
+        return PI_FULL.format(demo=extract_final_solution(problem["solution"]))
     raise ValueError(f"Unknown PI mode {pi_mode!r}")
 
 
@@ -352,135 +361,101 @@ def build_teacher_messages(problem: dict, pi_mode: str) -> list[dict]:
     return compose_pi_messages(student, privileged_context(problem, pi_mode))
 
 
-def _load_rollout_attempts(model: str, dataset: str, root: str, sample_idx: int):
-    """Load one provenance-checked attempted solution per cached question."""
-    path = Path(rollout_path(model, dataset, root))
-    if not path.is_dir():
-        raise FileNotFoundError(f"No rollout-PI cache at {path}")
-    cache = load_from_disk(str(path))
-    required = {
-        "question", "question_idx", "completion_text", "sample_idx", "gen_model",
-        "dataset", "question_source", "mixed_only",
+def _cohort_source(args: argparse.Namespace, run: dict) -> tuple[list[dict], dict]:
+    """Resolve exact teacher questions and validate their immutable source content."""
+    problems, meta = load_teacher_cohort(args.teacher_study_dir, args.cohort_dir)
+    if meta["teacher_model"] != run["base_model"]:
+        raise ValueError("Teacher study model differs from the training base model")
+    if any(p["dataset"] != run["dataset"] for p in problems):
+        raise ValueError("Teacher study dataset differs from the training dataset")
+    source = {
+        "teacher_study_dir": str(Path(args.teacher_study_dir).resolve()),
+        "teacher_meta_hash": digest(meta),
+        "cohort_dir": str(Path(args.cohort_dir or meta["source"]["cohort"]["cohort_dir"]).resolve()),
+        "cohort_hash": meta["source"]["cohort"]["cohort_hash"],
+        "tokenizer_hash": meta["source"]["cohort"]["tokenizer_hash"],
+        "num_teacher_questions": len(problems),
     }
-    missing = required - set(cache.column_names)
-    if missing:
-        raise ValueError(f"Rollout-PI cache {path} is missing {sorted(missing)}")
-    if set(cache.unique("gen_model")) != {model} or set(cache.unique("dataset")) != {dataset}:
-        raise ValueError(f"Rollout-PI cache {path} has incompatible model/dataset provenance")
-    if set(cache.unique("question_source")) != {"hints"}:
-        raise ValueError(f"Rollout-PI cache {path} was not generated from hints")
-    if set(cache.unique("mixed_only")) != {False}:
-        raise ValueError(f"Rollout-PI cache {path} used outcome-dependent selection")
-    attempts = {}
-    for idx, question, completion, cached_sample in zip(
-        cache["question_idx"], cache["question"], cache["completion_text"],
-        cache["sample_idx"], strict=True,
-    ):
-        if int(cached_sample) != sample_idx:
-            continue
-        idx = int(idx)
-        if idx in attempts:
-            raise ValueError(f"Duplicate rollout PI sample for question_idx={idx}")
-        attempts[idx] = (str(question), str(completion))
-    if not attempts:
-        raise ValueError(f"No rollout PI sample_idx={sample_idx} found in {path}")
-    return attempts
+    if args.num_problems:
+        problems = problems[:args.num_problems]
+    source["selected_question_ids"] = [p["question_id"] for p in problems]
+    source["selected_content_hash"] = digest(problems)
+    return problems, source
 
 
-def _cohort_config(args: argparse.Namespace, run: dict) -> dict:
+def _cohort_config(args: argparse.Namespace, run: dict, source: dict | None = None) -> dict:
     """Return the cohort settings that determine cache identity."""
     return {
+        "version": 2,
+        "source": source if source is not None else _cohort_source(args, run)[1],
         "base_model": run["base_model"],
         "dataset": run["dataset"],
         "pi_modes": run["eval_pi_modes"],
         "num_problems": args.num_problems,
-        "seed": args.seed,
         "max_model_len": args.max_model_len,
         "max_completion_length": args.max_completion_length,
         "training_max_prompt_length": run["training_config"]["max_prompt_length"],
-        "rollout_pi_root": args.rollout_pi_root,
-        "rollout_pi_sample_idx": args.rollout_pi_sample_idx,
     }
 
 
-def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
-    """Build a deterministic cohort feasible under none and the matched training PI."""
+def build_cohort(args: argparse.Namespace, run: dict, source_data=None) -> tuple[Dataset, dict]:
+    """Retain teacher-study order, allowing only full-PI length exclusions."""
     from transformers import AutoTokenizer
+    from eval.demo_gain import tokenizer_hash
 
-    hints = load_hint_cache(run["base_model"], run["dataset"])
-    solutions = None
-    if "full" in run["eval_pi_modes"]:
-        source = load_train_dataset(run["dataset"], require_solution=True)
-        solutions = {str(row["question"]): str(row["solution"]) for row in source}
-    attempts = None
-    if "rollout" in run["eval_pi_modes"]:
-        attempts = _load_rollout_attempts(
-            run["base_model"], run["dataset"], args.rollout_pi_root,
-            args.rollout_pi_sample_idx,
-        )
-
+    problems, source = source_data if source_data is not None else _cohort_source(args, run)
     tokenizer = AutoTokenizer.from_pretrained(run["base_model"], trust_remote_code=True)
+    if tokenizer_hash(tokenizer) != source["tokenizer_hash"]:
+        raise ValueError("Tokenizer differs from the teacher source cohort")
     available_context = args.max_model_len - args.max_completion_length
     if available_context < 1:
         raise ValueError("--max-model-len must exceed --max-completion-length")
     # Match the trainer's prompt cap while also reserving the requested generation budget.
     budget = min(run["training_config"]["max_prompt_length"], available_context)
 
-    candidates = list(range(len(hints)))
-    random.Random(args.seed).shuffle(candidates)
-    rows, seen_ids = [], set()
-    considered = missing_context = too_long = 0
-    for question_idx in candidates:
-        if len(rows) >= args.num_problems:
-            break
-        considered += 1
-        hint_row = hints[question_idx]
+    rows, excluded = [], []
+    for original in problems:
         problem = {
-            "question_idx": question_idx,
+            "question_id": original["question_id"],
+            "question_idx": original["question_idx"],
             "dataset": run["dataset"],
-            "question": str(hint_row["question"]),
-            "final_answer": str(hint_row["final_answer"]),
-            "hint": str(hint_row["hint"]),
+            "question": str(original["question"]),
+            "final_answer": str(original["final_answer"]),
+            "hint": original.get("hint"),
+            "solution": original.get("solution"),
         }
-        if solutions is not None:
-            solution = solutions.get(problem["question"])
-            if not solution:
-                missing_context += 1
-                continue
-            problem["solution"] = solution
-        if attempts is not None:
-            attempt = attempts.get(question_idx)
-            if attempt is None:
-                missing_context += 1
-                continue
-            cached_question, completion = attempt
-            if cached_question != problem["question"]:
-                raise ValueError(f"Hint/rollout cache mismatch at question_idx={question_idx}")
-            problem["rollout"] = completion
-
-        question_id = stable_question_id(problem["question"], problem["final_answer"])
-        if question_id in seen_ids:
-            question_id = _sha256_text(f"{question_id}\0{question_idx}")[:24]
+        required = "hint" if run["training_pi_mode"] == "hint" else "solution"
+        if run["training_pi_mode"] != "answer" and not str(problem[required] or "").strip():
+            raise ValueError(f"Missing source {required} for {problem['question_id']}")
         student_messages = format_prompt(problem["question"], problem.get("dataset", "deepmath"))
         student_ids = tokenizer.apply_chat_template(
             [student_messages], add_generation_prompt=True, tokenize=True, return_dict=True
         )["input_ids"][0]
-        prompt_columns, fits = {}, len(student_ids) <= budget
+        if len(student_ids) > budget:
+            raise ValueError(f"Student prompt does not fit for {problem['question_id']}")
+        prompt_columns, fits = {}, True
         for pi_mode in run["eval_pi_modes"]:
             ids = tokenizer.apply_chat_template(
                 [build_teacher_messages(problem, pi_mode)], add_generation_prompt=True,
                 tokenize=True, return_dict=True,
             )["input_ids"][0]
             prompt_columns[f"teacher_prompt_ids_{pi_mode}"] = list(ids)
-            fits = fits and len(ids) <= budget
+            if len(ids) > budget:
+                if pi_mode != "full":
+                    raise ValueError(f"{pi_mode} prompt does not fit for {problem['question_id']}")
+                fits = False
+                excluded.append({
+                    "question_id": problem["question_id"],
+                    "question_idx": problem["question_idx"],
+                    "reason": "full_prompt_too_long",
+                    "prompt_tokens": len(ids),
+                    "prompt_budget": budget,
+                })
         if not fits:
-            too_long += 1
             continue
-        seen_ids.add(question_id)
         rows.append(
             {
                 **problem,
-                "question_id": question_id,
                 "student_prompt_ids": list(student_ids),
                 "student_prompt_text": tokenizer.apply_chat_template(
                     student_messages, tokenize=False, add_generation_prompt=True
@@ -488,23 +463,19 @@ def build_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
                 **prompt_columns,
             }
         )
-    if len(rows) < args.num_problems:
-        raise RuntimeError(
-            f"Only {len(rows)}/{args.num_problems} questions have both evaluation "
-            f"conditions and fit "
-            f"the common {budget}-token prompt budget"
-        )
+    if not rows:
+        raise ValueError("No teacher-study questions remain after full-PI length filtering")
     dataset = Dataset.from_list(rows)
     metadata = {
         "status": "complete",
-        "config": _cohort_config(args, run),
+        "config": _cohort_config(args, run, source),
         "cohort_fingerprint": fingerprint_ids(dataset["question_id"]),
+        "cohort_content_hash": digest(dataset.to_list()),
         "question_ids": list(dataset["question_id"]),
         "num_questions": len(dataset),
-        "source_hint_rows": len(hints),
-        "candidates_considered": considered,
-        "missing_required_context": missing_context,
-        "prompt_too_long": too_long,
+        "num_source_questions": len(problems),
+        "excluded_questions": excluded,
+        "prompt_too_long": len(excluded),
         "prompt_budget": budget,
         "tokenizer": tokenizer_metadata(tokenizer),
     }
@@ -515,18 +486,22 @@ def ensure_cohort(args: argparse.Namespace, run: dict) -> tuple[Dataset, dict]:
     """Reuse a valid cohort cache or build and persist a new one."""
     root = Path(run["output_dir"])
     dataset_path, meta_path = root / "cohort", root / "cohort_meta.json"
-    config = _cohort_config(args, run)
+    source_data = _cohort_source(args, run)
+    config = _cohort_config(args, run, source_data[1])
     if dataset_path.is_dir() and meta_path.is_file():
         metadata = read_json(meta_path)
         if metadata.get("config") == config:
             dataset = load_from_disk(str(dataset_path))
-            if fingerprint_ids(dataset["question_id"]) == metadata.get("cohort_fingerprint"):
+            if (
+                fingerprint_ids(dataset["question_id"]) == metadata.get("cohort_fingerprint")
+                and digest(dataset.to_list()) == metadata.get("cohort_content_hash")
+            ):
                 return dataset, metadata
             if not args.force:
                 raise ValueError(f"Cohort fingerprint mismatch at {dataset_path}")
         elif not args.force:
             raise ValueError(f"Existing cohort at {dataset_path} has different provenance")
-    dataset, metadata = build_cohort(args, run)
+    dataset, metadata = build_cohort(args, run, source_data)
     save_dataset_atomic(dataset, dataset_path)
     write_json_atomic(meta_path, metadata)
     return dataset, metadata
@@ -545,6 +520,8 @@ def _rollout_config(args, run, step, cohort_meta) -> dict:
         "step": step,
         "dataset": run["dataset"],
         "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+        "cohort_content_hash": cohort_meta["cohort_content_hash"],
+        "cohort_config": cohort_meta["config"],
         "num_questions": cohort_meta["num_questions"],
         "n": args.n,
         "seed": args.seed,
@@ -711,6 +688,8 @@ def _score_config(args, run, step, cohort_meta, rollout_meta) -> dict:
         "training_pi_mode": run["training_pi_mode"],
         "eval_pi_modes": run["eval_pi_modes"],
         "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+        "cohort_content_hash": cohort_meta["cohort_content_hash"],
+        "cohort_config": cohort_meta["config"],
         "rollout_fingerprint": rollout_meta["rollout_fingerprint"],
         "dtype": args.dtype,
         "num_loss_tokens_to_skip": run["training_config"]["num_loss_tokens_to_skip"],
@@ -935,6 +914,13 @@ def aggregate_step(args, run, step) -> dict:
     scores_dir = out / "scores"
     if not scores_dir.is_dir():
         raise FileNotFoundError(f"No scores for step {step}: {scores_dir}")
+    _, cohort_meta = ensure_cohort(args, run)
+    rollout_meta = read_json(out / "rollout_meta.json")
+    score_meta = read_json(out / "score_meta.json")
+    if rollout_meta.get("config") != _rollout_config(args, run, step, cohort_meta):
+        raise ValueError(f"Rollout provenance mismatch at {out}")
+    if score_meta.get("config") != _score_config(args, run, step, cohort_meta, rollout_meta):
+        raise ValueError(f"Score provenance mismatch at {out}")
     scores = load_from_disk(str(scores_dir))
     summary = {
         "method": "sdft_advantage_dynamics",
@@ -946,6 +932,10 @@ def aggregate_step(args, run, step) -> dict:
         "step": step,
         "definition": "log_p_frozen_base_teacher_minus_log_p_checkpoint_student",
         "aggregation": "token_weighted",
+        "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+        "cohort_content_hash": cohort_meta["cohort_content_hash"],
+        "cohort_source": cohort_meta["config"]["source"],
+        "excluded_questions": cohort_meta["excluded_questions"],
         "num_loss_tokens_to_skip": run["training_config"]["num_loss_tokens_to_skip"],
         "rollout_fingerprint": read_json(out / "rollout_meta.json")["rollout_fingerprint"],
         "score_fingerprint": read_json(out / "score_meta.json")["score_fingerprint"],
@@ -1012,6 +1002,10 @@ def write_run_manifest(args, run, cohort_meta) -> None:
             "selected_steps": run["selected_steps"],
             "eval_pi_modes": run["eval_pi_modes"],
             "cohort_fingerprint": cohort_meta["cohort_fingerprint"],
+            "cohort_content_hash": cohort_meta["cohort_content_hash"],
+            "cohort_source": cohort_meta["config"]["source"],
+            "num_questions": cohort_meta["num_questions"],
+            "excluded_questions": cohort_meta["excluded_questions"],
             "generation": {
                 "n": args.n,
                 "seed": args.seed,
@@ -1042,6 +1036,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-dir", required=True, help="SDFT run directory containing checkpoints.")
     parser.add_argument(
+        "--teacher-study-dir", required=True,
+        help="Self-teacher study containing teacher_uncertainty_run_meta.json; reuse its retained questions.",
+    )
+    parser.add_argument(
+        "--cohort-dir", default=None,
+        help="Override the recorded source-cohort location (checksums must still match).",
+    )
+    parser.add_argument(
         "--steps", nargs="+", type=int, default=None,
         help="Checkpoint steps to evaluate; defaults to step 0 and all checkpoints.",
     )
@@ -1054,8 +1056,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training PI for this run; must match run_meta.json.",
     )
     parser.add_argument(
-        "--num-problems", type=int, default=128,
-        help="Number of shared training problems to evaluate (default: %(default)s).",
+        "--num-problems", type=int, default=0,
+        help="Use the first N teacher-study questions before filtering; 0 uses all (default).",
     )
     parser.add_argument(
         "--n", type=int, default=2,
@@ -1071,19 +1073,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="vLLM context-window limit, including prompt and completion (default: %(default)s).",
     )
     parser.add_argument(
-        "--rollout-pi-root", default="data/pi/attempted_solution_8k",
-        help="Root of attempted-solution caches used by rollout PI.",
-    )
-    parser.add_argument(
-        "--rollout-pi-sample-idx", type=int, default=0,
-        help="Fixed cached attempt index used by rollout PI (default: %(default)s).",
-    )
-    parser.add_argument(
         "--bootstrap-samples", type=int, default=10_000,
         help="Question-cluster bootstrap replicates (default: %(default)s).",
     )
     parser.add_argument(
-        "--output-root", default="results/advantage_dynamics",
+        "--output-root", default="results/advantage_dynamics/teacher_cohort",
         help="Root directory for cohorts, scores, and summaries (default: %(default)s).",
     )
     parser.add_argument(
@@ -1107,8 +1101,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_cli(parser, args) -> None:
     """Reject invalid or ambiguous command-line argument combinations."""
-    if args.num_problems < 1:
-        parser.error("--num-problems must be >= 1")
+    if args.num_problems < 0:
+        parser.error("--num-problems must be >= 0")
     if args.n < 1:
         parser.error("--n must be >= 1")
     if args.seed < 0:
@@ -1117,8 +1111,6 @@ def validate_cli(parser, args) -> None:
         parser.error("--bootstrap-samples must be >= 1")
     if args.max_model_len < 2:
         parser.error("--max-model-len must be >= 2")
-    if args.rollout_pi_sample_idx < 0:
-        parser.error("--rollout-pi-sample-idx must be >= 0")
     if args.step is not None and args.steps is not None:
         parser.error("Pass only one of --step and --steps")
     if args.phase in ("generate", "score") and args.step is None:

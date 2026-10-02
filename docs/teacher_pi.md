@@ -156,3 +156,7 @@ questions, and the retained cohorts can differ across model sizes.
 
 For checkpoint analysis of students trained with different PI, see
 [Student cognitive behaviors and uncertainty verbalization](student_behaviors.md).
+
+For the fraction of backtracking-marked answer-PI trajectories containing an explicit
+answer mismatch followed by revision, see
+[Answer-triggered revision](answer_triggered_revision.md).

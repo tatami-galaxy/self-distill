@@ -1,14 +1,14 @@
 """Plots for the SDFT advantage-dynamics sweep.
 
-Reads results/advantage_dynamics/<model>/<dataset>_<pi>/dynamics.json and writes:
+Reads results/advantage_dynamics/teacher_cohort/<model>/<dataset>_<pi>/dynamics.json and writes:
 
   advantage_signal_vs_drift.png     A[training PI] and A[none] per checkpoint. A[none] is
                                     the drift control: -KL(pi_k || pi_0), zero at step 0.
   advantage_response_length.png     Mean tokens per unprivileged student rollout.
 
-Each run keeps its own 128-problem cohort as recorded. `full` requires a reference
-solution so its cohort overlaps the others by only 114 (1.7B) / 111 (4B) problems;
-absolute levels are therefore not strictly comparable across PI at a given step.
+Runs start from the exact teacher-behavior question cohort. Full PI may exclude
+questions exceeding the training prompt budget; consult each run's manifest for
+exclusions before interpreting differences across PI.
 
 Usage:
     .venv/bin/python eval/viz/advantage_dynamics_plots.py
@@ -38,12 +38,12 @@ def find_repo_root(start: Path | None = None) -> Path:
 
 ROOT = find_repo_root()
 RESULTS = ROOT / "results"
-DYNAMICS = RESULTS / "advantage_dynamics"
+DYNAMICS = RESULTS / "advantage_dynamics" / "teacher_cohort"
 FIGURES = RESULTS / "figures"  # generated output; not tracked by git
 
 MODELS = ["Qwen3-1.7B", "Qwen3-4B"]
 DATASET = "deepmath"
-PI_MODES = ["hint", "answer", "rollout", "full"]
+PI_MODES = ["hint", "answer", "solution", "full"]
 
 # -------------------- style --------------------
 
@@ -61,7 +61,7 @@ SERIF = FontProperties(family=["Caladea", "DejaVu Serif"])
 PI_COLOR = {
     "hint": "#3D74D0",
     "answer": "#E9B02E",
-    "rollout": "#E0673C",
+    "solution": "#E0673C",
     "full": "#49B083",
 }
 
