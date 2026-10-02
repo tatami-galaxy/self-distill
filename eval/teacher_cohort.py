@@ -6,6 +6,21 @@ from pathlib import Path
 from eval.hint_compare_cache import digest
 
 
+def resolve_cohort_dir(recorded_dir, cohort_dir=None):
+    """Resolve recorded results paths from the current project root.
+
+    Older manifests store absolute paths from the machine that prepared them.
+    Reuse their results/... suffix in this checkout, even if the old path still
+    exists. Explicit overrides and absolute paths outside results are left intact.
+    """
+    if cohort_dir is not None:
+        return Path(cohort_dir)
+    root = Path(recorded_dir)
+    if root.is_absolute() and "results" in root.parts:
+        root = Path(*root.parts[root.parts.index("results"):])
+    return root
+
+
 def load_teacher_cohort(study_dir, cohort_dir=None):
     """Validate frozen sources and recover retained rows in teacher-study order.
 
@@ -18,7 +33,7 @@ def load_teacher_cohort(study_dir, cohort_dir=None):
     recorded = source.get("cohort")
     if not recorded:
         raise ValueError("Teacher study needs recorded cohort provenance and question IDs")
-    root = Path(cohort_dir or recorded["cohort_dir"])
+    root = resolve_cohort_dir(recorded["cohort_dir"], cohort_dir)
     manifest = json.loads((root / "manifest.json").read_text())
     with (root / "cohort.jsonl").open() as handle:
         rows = [json.loads(line) for line in handle if line.strip()]

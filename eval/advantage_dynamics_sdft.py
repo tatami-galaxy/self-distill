@@ -69,7 +69,7 @@ from typing import Any, Iterable
 from datasets import Dataset, load_from_disk
 
 from eval.hint_compare_cache import digest
-from eval.teacher_cohort import load_teacher_cohort
+from eval.teacher_cohort import load_teacher_cohort, resolve_cohort_dir
 from utils import PI_FULL, PI_HINT, answer_context, compose_pi_messages, extract_final_solution, format_prompt, grade
 
 
@@ -371,7 +371,7 @@ def _cohort_source(args: argparse.Namespace, run: dict) -> tuple[list[dict], dic
     source = {
         "teacher_study_dir": str(Path(args.teacher_study_dir).resolve()),
         "teacher_meta_hash": digest(meta),
-        "cohort_dir": str(Path(args.cohort_dir or meta["source"]["cohort"]["cohort_dir"]).resolve()),
+        "cohort_dir": str(resolve_cohort_dir(meta["source"]["cohort"]["cohort_dir"], args.cohort_dir).resolve()),
         "cohort_hash": meta["source"]["cohort"]["cohort_hash"],
         "tokenizer_hash": meta["source"]["cohort"]["tokenizer_hash"],
         "num_teacher_questions": len(problems),

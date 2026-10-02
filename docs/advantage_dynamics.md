@@ -17,9 +17,11 @@ hints and reference solutions. It does not resample the hint cache or filter on
 correctness or judge success. The current studies contain 200 questions per model.
 
 The default `--num-problems 0` uses all retained questions. A positive value uses
-the first N in teacher-study order, before length filtering. `--cohort-dir` can
-override the recorded source location if artifacts have moved; checksums must
-still match. IDs are preserved verbatim for joins with behavior measurements.
+the first N in teacher-study order, before length filtering. Run from the project
+root: historical absolute cohort paths are resolved using their `results/...`
+suffix in the current checkout. `--cohort-dir` explicitly overrides this location;
+checksums must still match. IDs are preserved verbatim for joins with behavior
+measurements.
 
 Prompts must fit the smaller of the training prompt cap and
 `max_model_len - max_completion_length`. An oversized **full-PI** prompt drops that
