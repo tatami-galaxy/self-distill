@@ -160,3 +160,7 @@ For checkpoint analysis of students trained with different PI, see
 For the fraction of backtracking-marked answer-PI trajectories containing an explicit
 answer mismatch followed by revision, see
 [Answer-triggered revision](answer_triggered_revision.md).
+
+For the alternative sequence of a matching-answer conclusion followed by criticism
+and revision of its supporting reasoning, see the two-pass
+[Matching-answer revision study](matching_answer_revision.md).
