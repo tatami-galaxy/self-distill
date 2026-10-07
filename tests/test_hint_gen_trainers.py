@@ -14,6 +14,19 @@ from train.opsd.train_hint_gen.lib import (
 
 
 class HintTrainerLoRAConfigTest(unittest.TestCase):
+    def test_constrained_length_ablation_reaches_reward_config_and_metadata(self):
+        for value in (0.0, 1.0):
+            args = train_constrained_hint_gen.build_parser().parse_args([
+                "--length-cost-coef", str(value), "--gamma", "6",
+            ])
+            train_constrained_hint_gen.validate_args(args)
+            config = train_constrained_hint_gen.reward_config_from_args(args)
+            meta = train_constrained_hint_gen.build_run_meta(args, 10)
+            self.assertEqual(config.length_cost_coef, value)
+            self.assertEqual(meta["length_cost_coef"], value)
+            self.assertEqual(config.hint_budget, 128)
+            self.assertEqual(config.gamma, 6)
+
     def test_both_trainers_expose_dedicated_vllm_teacher_and_record_backend(self):
         with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "4", "WORLD_SIZE": "1"}):
             for module in (train_hint_gen, train_constrained_hint_gen):

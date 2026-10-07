@@ -1,5 +1,9 @@
 # Hint-generator comparison: two GPUs and incremental scores
 
+For matched full-objective, no-transfer, and no-length training runs, see
+[Hint objective ablations](hint_gen_ablations.md). The evaluator accepts explicit
+cross-run checkpoint labels and additional `--compare CANDIDATE=REFERENCE` contrasts.
+
 Use two independent GPUs for a sweep:
 
 ```sh

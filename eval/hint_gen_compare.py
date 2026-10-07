@@ -1247,6 +1247,7 @@ def metric_maps(
     sufficiency_by_hint: dict[str, dict],
     transfer_by_hint: dict[str, list[dict]],
     ks: list[int],
+    hint_budget: int = 128,
 ) -> dict[str, dict[str, float]]:
     per_hint_transfer = {
         hint_id: sum(float(row["raw_transfer"]) for row in rows) / len(rows)
@@ -1254,11 +1255,26 @@ def metric_maps(
     }
     maps = {
         "mean_hint_tokens": question_means(hints, lambda row: row["num_hint_tokens"]),
+        "normalized_cost": question_means(
+            hints, lambda row: min(row["num_hint_tokens"] / hint_budget, 1.0)
+        ),
+        "truncated_fraction": question_means(hints, lambda row: row["truncated"]),
+        # Matches the dual update: invalid hints contribute zero, rather than
+        # disappearing from the denominator or benefiting from leaked answers.
+        "training_aligned_sufficiency": question_means(
+            hints, lambda row: 0.0 if row["invalid_reason"] else (
+                sufficiency_by_hint[row["hint_id"]]["n_correct"]
+                / sufficiency_by_hint[row["hint_id"]]["n_samples"]
+            )
+        ),
         "invalid_fraction": question_means(
             hints, lambda row: bool(row["invalid_reason"])
         ),
         "raw_transfer_nats_per_token": question_means(
             hints, lambda row: per_hint_transfer[row["hint_id"]]
+        ),
+        "clamped_transfer_nats_per_token": question_means(
+            hints, lambda row: max(0.0, per_hint_transfer[row["hint_id"]])
         ),
     }
     for k in ks:
@@ -1271,6 +1287,32 @@ def metric_maps(
             ),
         )
     return maps
+
+
+def comparison_pairs(generator_ids: list[str], specs: list[str]) -> list[tuple[str, str]]:
+    """Default base contrasts plus explicit CANDIDATE=REFERENCE contrasts."""
+    pairs = [(name, "fresh_base") for name in generator_ids if name != "fresh_base"]
+    for spec in specs:
+        candidate, sep, reference = spec.partition("=")
+        if not sep or candidate not in generator_ids or reference not in generator_ids:
+            raise ValueError(f"Invalid --compare {spec!r}; use CANDIDATE=REFERENCE with known labels")
+        if candidate == reference:
+            raise ValueError("A comparison needs two distinct generator labels")
+        if (candidate, reference) not in pairs:
+            pairs.append((candidate, reference))
+    return pairs
+
+
+def summarize_metric_maps(maps, samples, seed):
+    """Pointwise intervals over questions, conditional on the trained generator."""
+    return {
+        name: {
+            "mean": sum(values.values()) / len(values),
+            "ci95": bootstrap_mean_ci(list(values.values()), samples, seed + index),
+            "n_questions": len(values),
+        }
+        for index, (name, values) in enumerate(maps.items())
+    }
 
 
 def summarize_phase(args: argparse.Namespace) -> dict:
@@ -1363,14 +1405,27 @@ def summarize_phase(args: argparse.Namespace) -> dict:
             "by_student_difficulty": difficulty_summaries,
         }
         metric_maps_by_generator[generator_id] = metric_maps(
-            generator_hints, sufficiency_by_hint, transfer_by_hint, args.k
+            generator_hints, sufficiency_by_hint, transfer_by_hint, args.k,
+            hint_budget=args.hint_max_tokens,
+        )
+        maps = metric_maps_by_generator[generator_id]
+        generator_summaries[generator_id]["metric_estimates"] = summarize_metric_maps(
+            maps, args.bootstrap_samples, args.seed + generator_index * 1000
+        )
+        baseline = {
+            row["question_id"]: row["n_correct"] / row["n_samples"]
+            for row in no_hint_by_question.values()
+        }
+        generator_summaries[generator_id]["training_aligned_lift_over_no_hint"] = (
+            paired_question_difference(
+                maps["training_aligned_sufficiency"], baseline,
+                args.bootstrap_samples, args.seed + generator_index * 1000,
+            )
         )
 
     paired = {}
-    reference = "fresh_base"
-    for candidate_index, candidate in enumerate(expected_generator_ids(args)):
-        if candidate == reference:
-            continue
+    pairs = comparison_pairs(expected_generator_ids(args), getattr(args, "compare", []))
+    for candidate_index, (candidate, reference) in enumerate(pairs):
         label = f"{candidate}_minus_{reference}"
         paired[label] = {
             "candidate": candidate,
@@ -1399,6 +1454,11 @@ def summarize_phase(args: argparse.Namespace) -> dict:
         "no_hint_self_teacher": no_hint_pass,
         "generators": generator_summaries,
         "paired_comparisons": paired,
+        "hint_budget": args.hint_max_tokens,
+        "generator_runs": {
+            label: {"checkpoint": path, "run_meta": load_hint_run_meta(Path(path).parent)}
+            for label, path in generator_variants(args) if label != "fresh_base"
+        },
         "provenance": {
             "cohort": cohort_meta,
             "hints": hint_meta,
@@ -1409,6 +1469,8 @@ def summarize_phase(args: argparse.Namespace) -> dict:
             "primary_control": "fresh_base",
             "transfer_sign": "positive means hinted teacher is farther from the student",
             "uncertainty_unit": "paired question-level bootstrap",
+            "training_aligned_sufficiency": "mean success fraction with invalid hints assigned zero; truncation alone is not invalid",
+            "interval_scope": "pointwise question bootstrap; does not estimate training-seed variability",
         },
     }
     path = output_root(args) / "summary.json"
@@ -1594,6 +1656,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional numeric checkpoint steps selected from --run-dir.",
     )
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--compare", action="append", default=[], metavar="CANDIDATE=REFERENCE",
+        help="Additional paired contrast, e.g. no_transfer-step20=full-step20. "
+             "Repeat for each matched step; base contrasts are always included.",
+    )
     parser.add_argument("--hint-root", default="data/pi/hint")
     parser.add_argument("--rollout-root", default="data/rollouts")
     parser.add_argument("--num-problems", type=int, default=64)
@@ -1695,6 +1762,7 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     # checkpoints, but every phase in this invocation must see the same frozen arm list.
     try:
         args.resolved_checkpoints = generator_variants(args)[1:]
+        comparison_pairs(expected_generator_ids(args), args.compare)
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))
 

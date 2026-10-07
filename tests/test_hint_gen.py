@@ -170,6 +170,56 @@ class CompositeHintRewardTest(unittest.TestCase):
 
 
 class ConstrainedHintRewardTest(unittest.TestCase):
+    def test_ablations_remove_only_requested_reward_term_and_keep_measurements(self):
+        for cost_coef, gamma in [(1.0, 0.0), (0.0, 6.0)]:
+            with self.subTest(cost_coef=cost_coef, gamma=gamma):
+                backend = FakeBackend(sufficiency=0.75, transfer=0.2)
+                reward = ConstrainedHintReward(ConstrainedHintRewardConfig(
+                    model="m", dataset="d", hint_budget=8, tau=0.7,
+                    length_cost_coef=cost_coef, gamma=gamma, dual_init=2.0,
+                ), backend)
+                extras = {}
+                values = reward(
+                    prompts=[[], [], []], completions=["Use parity.", "Use symmetry.", ""],
+                    completion_ids=[[1], [1] * 8, [1]],
+                    question=["q"] * 3, final_answer=["17"] * 3,
+                    log_extra=lambda name, value, extras=extras: extras.__setitem__(name, value),
+                )
+                self.assertAlmostEqual(values[0], 0.1 - cost_coef / 8 - gamma * 0.2)
+                self.assertAlmostEqual(values[0] - values[1], cost_coef * 7 / 8)
+                self.assertLess(values[2], min(values[:2]))
+                self.assertEqual(extras["hint_transfer"], [0.2, 0.2, 0.0])
+                self.assertEqual(extras["hint_cost"], [0.125, 1.0, 0.125])
+                self.assertEqual(len(backend.calls), 4)
+                # Invalid hints remain zero in the dual's sufficiency denominator.
+                self.assertAlmostEqual(reward.dual_lambda, 2.0 + 0.05 * (0.7 - 0.5))
+
+    def test_zero_transfer_weight_is_invariant_to_measured_transfer(self):
+        self.assertEqual(constrained_reward(.75, .2, .01, .7, 0, 2),
+                         constrained_reward(.75, .2, 100, .7, 0, 2))
+
+    def test_length_coefficient_resume_compatibility(self):
+        original = ConstrainedHintReward(ConstrainedHintRewardConfig(model="m", dataset="d"), FakeBackend())
+        legacy = original.state_dict()
+        del legacy["length_cost_coef"]
+        original.load_state_dict(legacy)
+        ablated = ConstrainedHintReward(ConstrainedHintRewardConfig(
+            model="m", dataset="d", length_cost_coef=0,
+        ), FakeBackend())
+        with self.assertRaisesRegex(ValueError, "length_cost_coef"):
+            ablated.load_state_dict(legacy)
+        with self.assertRaisesRegex(ValueError, "length_cost_coef"):
+            original.load_state_dict(ablated.state_dict())
+        ablated.dual_lambda = 3.5
+        ablated.load_state_dict(ablated.state_dict())
+        self.assertEqual(ablated.dual_lambda, 3.5)
+
+    def test_invalid_objective_weights_are_rejected(self):
+        for key in ("gamma", "length_cost_coef"):
+            for value in (-1, float("nan"), float("inf")):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    ConstrainedHintRewardConfig(model="m", dataset="d", **{key: value}).validate()
+
     def test_computes_reward_updates_dual_and_logs_state(self):
         config = ConstrainedHintRewardConfig(
             model="m",
@@ -308,7 +358,7 @@ class InvalidRewardRankingRegressionTest(unittest.TestCase):
                         completions=["Use parity.", "The answer is 17.", "", "Use symmetry."],
                         completion_ids=[[1] * 32, [2] * 8, [3], [4] * 64],
                         question=["q"] * 4, final_answer=["17"] * 4,
-                        log_extra=lambda name, value: extras.__setitem__(name, value),
+                        log_extra=lambda name, value, extras=extras: extras.__setitem__(name, value),
                     )
                     self.assertEqual(values[1], values[2])
                     self.assertLess(values[1], min(values[0], values[3]))
@@ -359,9 +409,11 @@ class InvalidRewardRankingRegressionTest(unittest.TestCase):
                 rank_invalid_hints([value, 0], [0, 1], ['q', 'q'], 1.0)
         for config_type in [HintRewardConfig, ConstrainedHintRewardConfig]:
             for margin in [0, -1, float('nan'), float('inf')]:
-                with self.subTest(config=config_type.__name__, margin=margin):
-                    with self.assertRaisesRegex(ValueError, 'invalid_penalty'):
-                        config_type(model='m', dataset='deepmath', invalid_penalty=margin).validate()
+                with (
+                    self.subTest(config=config_type.__name__, margin=margin),
+                    self.assertRaisesRegex(ValueError, 'invalid_penalty'),
+                ):
+                    config_type(model='m', dataset='deepmath', invalid_penalty=margin).validate()
 
 
 if __name__ == "__main__":

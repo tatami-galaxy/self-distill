@@ -293,6 +293,31 @@ class CheckpointSpecTest(unittest.TestCase):
 
 
 class SummaryTest(unittest.TestCase):
+    def test_training_aligned_sufficiency_preserves_invalid_question_denominators(self):
+        hints = [self.hint("a", "q1", 128, "answer_leak"),
+                 self.hint("b", "q1", 64), self.hint("c", "q2", 32, "empty")]
+        suff = {h["hint_id"]: {"n_samples": 4, "n_correct": 4} for h in hints}
+        transfer = {h["hint_id"]: [{"raw_transfer": -.2}, {"raw_transfer": .1}]
+                    for h in hints}
+        maps = hint_gen_compare.metric_maps(hints, suff, transfer, [1], hint_budget=128)
+        self.assertEqual(maps["pass@1"], {"q1": 1, "q2": 1})
+        self.assertEqual(maps["training_aligned_sufficiency"], {"q1": .5, "q2": 0})
+        self.assertEqual(maps["normalized_cost"], {"q1": .75, "q2": .25})
+        self.assertEqual(maps["clamped_transfer_nats_per_token"], {"q1": 0, "q2": 0})
+        result = hint_gen_compare.summarize_metric_maps(maps, 50, 42)
+        self.assertEqual(result["training_aligned_sufficiency"]["mean"], .25)
+        self.assertEqual(result["training_aligned_sufficiency"]["n_questions"], 2)
+
+    def test_explicit_contrasts_keep_base_controls_and_validate_labels(self):
+        labels = ["fresh_base", "full-step20", "no_length-step20"]
+        pairs = hint_gen_compare.comparison_pairs(labels, ["no_length-step20=full-step20"] * 2)
+        self.assertEqual(pairs, [("full-step20", "fresh_base"),
+                                 ("no_length-step20", "fresh_base"),
+                                 ("no_length-step20", "full-step20")])
+        for spec in ("unknown=full-step20", "full-step20=full-step20", "full-step20"):
+            with self.assertRaises(ValueError):
+                hint_gen_compare.comparison_pairs(labels, [spec])
+
     @staticmethod
     def hint(hint_id, question_id, length, invalid=""):
         return {

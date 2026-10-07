@@ -9,7 +9,7 @@ minimizes hint and transfer costs while a projected dual variable enforces
 For the current multiplier lambda, GRPO receives
 
     lambda * (sufficiency - tau)
-      - generated_hint_tokens / hint_budget
+      - length_cost_coef * generated_hint_tokens / hint_budget
       - gamma * sampled_reverse_KL_on_student_rollouts.
 
 Invalid hints receive the worst valid reward in their question group minus
@@ -133,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required expected teacher sufficiency E[S].",
     )
     p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument(
+        "--length-cost-coef", type=float, default=1.0,
+        help="Length penalty weight; 0 removes it while retaining the hint token cap. "
+             "Use --gamma 0 to remove transfer cost. All components remain measured.",
+    )
     p.add_argument("--dual-lr", type=float, default=0.05)
     p.add_argument("--dual-init", type=float, default=1.0)
     p.add_argument("--dual-max", type=float, default=20.0)
@@ -214,6 +219,7 @@ def reward_config_from_args(args: argparse.Namespace) -> ConstrainedHintRewardCo
         **teacher_backend_kwargs(args),
         tau=args.tau,
         gamma=args.gamma,
+        length_cost_coef=args.length_cost_coef,
         invalid_penalty=args.invalid_penalty,
         dual_lr=args.dual_lr,
         dual_init=args.dual_init,
@@ -262,6 +268,7 @@ def build_run_meta(args: argparse.Namespace, num_train_examples: int) -> dict:
         "mixed_only": args.mixed_only,
         "tau": args.tau,
         "gamma": args.gamma,
+        "length_cost_coef": args.length_cost_coef,
         "dual_lr": args.dual_lr,
         "dual_init": args.dual_init,
         "dual_max": args.dual_max,
@@ -295,7 +302,8 @@ def main() -> None:
 
     model_slug = args.model.rstrip("/").split("/")[-1]
     adapter_suffix = f"_lora_r{args.lora_r}" if args.use_lora else ""
-    default_name = f"{args.dataset}_t{args.tau:g}_g{args.gamma:g}{adapter_suffix}"
+    cost_suffix = f"_c{args.length_cost_coef:g}" if args.length_cost_coef != 1.0 else ""
+    default_name = f"{args.dataset}_t{args.tau:g}_g{args.gamma:g}{cost_suffix}{adapter_suffix}"
     output_dir = args.output_dir or os.path.join(
         args.output_root, model_slug, default_name
     )
@@ -315,7 +323,8 @@ def main() -> None:
     print(f"model: {args.model}  dataset: {args.dataset}  output: {output_dir}")
     print(f"  examples: {len(train_dataset)}")
     print(
-        f"  objective: minimize length/{args.hint_budget} + {args.gamma:g} * transfer "
+        f"  objective: minimize {args.length_cost_coef:g} * length/{args.hint_budget} "
+        f"+ {args.gamma:g} * transfer "
         f"subject to E[sufficiency] >= {args.tau:g}"
     )
     print(f"  dual: init={args.dual_init:g} lr={args.dual_lr:g} max={args.dual_max:g}")
@@ -372,7 +381,8 @@ def main() -> None:
             args.resume_from_checkpoint,
             meta,
             args.force_resume,
-            strict_keys=(("teacher_backend",) if args.teacher_backend == "vllm" else ()) + (
+            strict_keys=(("length_cost_coef",) if args.length_cost_coef != 1.0 else ())
+            + (("teacher_backend",) if args.teacher_backend == "vllm" else ()) + (
                 ("constrained_hint_gen_version", "use_lora")
                 if args.use_lora
                 else ("constrained_hint_gen_version",)

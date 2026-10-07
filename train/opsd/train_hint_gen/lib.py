@@ -393,11 +393,12 @@ def constrained_reward(
     tau: float,
     gamma: float,
     dual_lambda: float,
+    length_cost_coef: float = 1.0,
 ) -> float:
     """Lagrangian reward for E[S] >= tau, using the current dual multiplier."""
     return (
         dual_lambda * (sufficiency - tau)
-        - hint_cost
+        - length_cost_coef * hint_cost
         - gamma * transfer_cost
     )
 
@@ -519,6 +520,7 @@ class ConstrainedHintRewardConfig:
     teacher_timeout: float = 1800.0
     tau: float = 0.7
     gamma: float = 1.0
+    length_cost_coef: float = 1.0
     invalid_penalty: float = 1.0
     dual_lr: float = 0.05
     dual_init: float = 1.0
@@ -540,8 +542,10 @@ class ConstrainedHintRewardConfig:
             raise ValueError("teacher_top_k must be >= 0 (0 disables top-k)")
         if not 0.0 <= self.tau <= 1.0:
             raise ValueError("tau must be in [0, 1]")
-        if self.gamma < 0:
-            raise ValueError("gamma must be nonnegative")
+        if not math.isfinite(self.gamma) or self.gamma < 0:
+            raise ValueError("gamma must be finite and nonnegative")
+        if not math.isfinite(self.length_cost_coef) or self.length_cost_coef < 0:
+            raise ValueError("length_cost_coef must be finite and nonnegative")
         if not math.isfinite(self.invalid_penalty) or self.invalid_penalty <= 0:
             raise ValueError("invalid_penalty must be finite and > 0")
         if self.dual_lr <= 0:
@@ -883,6 +887,7 @@ class ConstrainedHintReward:
             "dual_updates": self.dual_updates,
             "tau": self.config.tau,
             "gamma": self.config.gamma,
+            "length_cost_coef": self.config.length_cost_coef,
             "dual_lr": self.config.dual_lr,
             "dual_max": self.config.dual_max,
         }
@@ -897,9 +902,12 @@ class ConstrainedHintReward:
         expected = {
             "tau": self.config.tau,
             "gamma": self.config.gamma,
+            "length_cost_coef": self.config.length_cost_coef,
             "dual_lr": self.config.dual_lr,
             "dual_max": self.config.dual_max,
         }
+        # Older constrained checkpoints used a hardcoded length coefficient of one.
+        state = {"length_cost_coef": 1.0, **state}
         mismatches = [
             f"{key}: checkpoint={state.get(key)!r}, current={value!r}"
             for key, value in expected.items()
@@ -978,6 +986,7 @@ class ConstrainedHintReward:
                     self.config.tau,
                     self.config.gamma,
                     dual_lambda,
+                    length_cost_coef=self.config.length_cost_coef,
                 )
                 invalid = 0.0
                 reason = ""
