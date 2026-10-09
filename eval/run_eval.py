@@ -63,7 +63,7 @@ from utils import (
 # completions -- the corpus becomes the variable under study and `sft` should join
 # VARIANT_REQUIRED below, exactly as `sdft` did for its privileged context.
 ALGOS = (
-    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "sac", "sft"
+    "base", "grpo", "ppo", "ppo_pi", "ppo_val", "gold", "sdft", "rlsd", "sac", "sft"
 )
 
 # Bumped whenever summary.json gains or changes a field. Summaries written before this
@@ -78,6 +78,7 @@ SUMMARY_SCHEMA_VERSION = 3
 # identifies GOLD. Requiring a variant prevents distinct runs from silently sharing a
 # results folder.
 VARIANT_REQUIRED = {
+    "rlsd": "the PI source, e.g. --variant answer, hint, or hint_trained",
     "ppo_pi": "the critic's privileged context, e.g. --variant answer or --variant none",
     "sdft": "the privileged context, e.g. --variant hint or --variant self_rollout",
     "sac": "the PI, soft-V estimator, and Q head, e.g. --variant full_topk_linear",
