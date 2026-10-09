@@ -397,6 +397,51 @@ else:
         )
 
 
+# %% -------------------- RLSD BEST-CHECKPOINT TABLES --------------------
+# Best checkpoints are selected on each evaluation dataset itself.
+RLSD_BEST_K = 1  # Choose 1, 8, or 16.
+RLSD_METRIC = f"pass@{RLSD_BEST_K}"
+RLSD_DATASETS = [AIME_DATASET, "hmmt_feb_2025"]
+if RLSD_BEST_K not in {1, 8, 16}:
+    raise ValueError(f"RLSD_BEST_K must be one of 1, 8, or 16; got {RLSD_BEST_K}")
+
+for eval_dataset in RLSD_DATASETS:
+    rlsd = load_aime(RESULTS / eval_dataset)
+    if not rlsd.empty:
+        rlsd = rlsd.loc[rlsd["algo"].eq("rlsd")].copy()
+    if rlsd.empty:
+        print(f"No RLSD results yet: {RESULTS / eval_dataset}")
+        continue
+    if RLSD_METRIC not in rlsd or rlsd[RLSD_METRIC].notna().sum() == 0:
+        print(f"No RLSD results with {RLSD_METRIC} for {eval_dataset}.")
+        continue
+
+    # Keep distinct PI variants and generator/training runs separate.
+    rlsd_best = (
+        rlsd.dropna(subset=[RLSD_METRIC])
+        .sort_values([RLSD_METRIC, "checkpoint", "step"],
+                     ascending=[False, True, True], na_position="last")
+        .groupby(["model", "train_dataset", "variant", "run"], dropna=False)
+        .head(1)
+    )
+    for model, model_results in rlsd_best.groupby("model", sort=True):
+        table = (
+            model_results.sort_values(["variant", "run", "train_dataset"])
+            .reindex(columns=[
+                "variant", "run", "step", "train_dataset",
+                "pass@1", "pass@8", "pass@16",
+            ])
+            .rename(columns={"step": "checkpoint"})
+            .reset_index(drop=True)
+        )
+        display(
+            table.style
+            .set_caption(f"RLSD · {eval_dataset} · {model} — best {RLSD_METRIC}")
+            .format({f"pass@{k}": "{:.3f}" for k in (1, 8, 16)}, na_rep="—")
+            .background_gradient(subset=[RLSD_METRIC], cmap="Blues", vmin=0, vmax=1)
+        )
+
+
 # %% -------------------- PLOT HMMT LEARNING CURVES --------------------
 if hmmt.empty:
     print(f"No HMMT February 2025 results yet: {HMMT_DIR}")
