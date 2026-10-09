@@ -17,7 +17,10 @@ def ablation_summary(tmp_path, monkeypatch):
         "--bootstrap-samples", "20", "--k", "1",
     ])
     variants = [("fresh_base", "base")]
-    for arm, cost, gamma in [("full", 1, 6), ("no_transfer", 1, 0), ("no_length", 0, 6)]:
+    for arm, cost, gamma in [
+        ("full", 1, 6), ("no_transfer", 1, 0), ("no_length", 0, 6),
+        ("sufficiency_only", 0, 0),
+    ]:
         run = tmp_path / arm
         run.mkdir()
         (run / "run_meta.json").write_text(json.dumps({
@@ -32,6 +35,9 @@ def ablation_summary(tmp_path, monkeypatch):
             variants.append((f"{arm}-step{step}", str(checkpoint)))
             if arm != "full":
                 args.compare.append(f"{arm}-step{step}=full-step{step}")
+    for step in (20, 40):
+        for arm in ("full", "no_transfer", "no_length"):
+            args.compare.append(f"{arm}-step{step}=sufficiency_only-step{step}")
     cohort = Dataset.from_list([{"question_id": q, "difficulty": "hard"} for q in ("q1", "q2")])
     hints, sufficiency, transfer = [], [], []
     for label, _ in variants:
@@ -74,7 +80,8 @@ def test_joint_summary_keeps_controls_and_compares_ablations(ablation_summary):
 
 
 def test_matched_plot_writes_figures_and_rejects_unmatched_inputs(ablation_summary, tmp_path):
-    specs = ["full=full", "no_transfer=no_transfer", "no_length=no_length"]
+    specs = viz.default_arm_specs(ablation_summary)
+    assert specs[-1] == "sufficiency_only=sufficiency_only"
     arms = viz.collect_series(ablation_summary, specs)
     out = tmp_path / "plots"
     viz.plot(ablation_summary, arms, "full", out)
@@ -92,3 +99,17 @@ def test_matched_plot_writes_figures_and_rejects_unmatched_inputs(ablation_summa
         changed = copy.deepcopy(ablation_summary)
         del changed["paired_comparisons"]["no_length-step20_minus_full-step20"]
         viz.contrast_series(changed, arms, "full")
+
+
+def test_sufficiency_reference_and_legacy_three_arm_detection(ablation_summary):
+    arms = viz.collect_series(ablation_summary, viz.default_arm_specs(ablation_summary))
+    contrasts = viz.contrast_series(ablation_summary, arms, "sufficiency_only")
+    assert set(contrasts) == {"full", "no_transfer", "no_length"}
+    assert contrasts["no_length"][0][1]["training_aligned_sufficiency"][
+        "mean_delta_candidate_minus_reference"
+    ] == -.5
+    old = copy.deepcopy(ablation_summary)
+    old["generator_order"] = [label for label in old["generator_order"]
+                              if not label.startswith("sufficiency_only-")]
+    assert len(viz.default_arm_specs(old)) == 3
+    assert len(viz.collect_series(old, viz.default_arm_specs(old))) == 3

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate all three hint objective arms on matched checkpoints, then plot.
+# Evaluate matched hint objective arms, optionally including sufficiency only.
 set -euo pipefail
 
 usage() {
@@ -11,14 +11,17 @@ Set CUDA_VISIBLE_DEVICES externally (e.g. 4,5 for parallel scoring).
 
 Options:
   --steps N [N ...]    Matched positive checkpoint steps (default: 20 40 60 80 100).
-  --run-root PATH      Directory containing the three training runs for this model.
+  --run-root PATH      Directory containing the training runs for this model.
   --output-dir PATH    Evaluation output (default: results/hint_gen_ablations/MODEL/seed42).
   --phase PHASE        sweep (default) or summarize; both are followed by plotting.
+  --include-sufficiency-only
+                       Add the gamma=0, length-cost-coef=0 arm and its contrasts.
   --dry-run           Print commands without executing them.
   -h, --help          Show this help.
 
 Other options (e.g. --num-problems 128) are forwarded to eval.hint_gen_compare.
-The script supplies checkpoint labels and matched contrasts for all three arms.
+The three original arms are always included. The optional fourth arm reuses their
+existing evaluation caches when the output directory and settings are unchanged.
 VLLM_USE_V2_MODEL_RUNNER defaults to 0 unless already set.
 USAGE
 }
@@ -41,11 +44,13 @@ output_dir="$repo_root/results/hint_gen_ablations/$model/seed42"
 steps=(20 40 60 80 100)
 phase=sweep
 dry_run=false
+include_sufficiency_only=false
 extra_options=()
 while (( $# > 0 )); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
+    --include-sufficiency-only) include_sufficiency_only=true; shift ;;
     --steps)
       shift
       steps=()
@@ -91,6 +96,15 @@ for step in "${steps[@]}"; do
     --compare "no_transfer-step$step=full-step$step"
     --compare "no_length-step$step=full-step$step"
   )
+  if "$include_sufficiency_only"; then
+    checkpoint_options+=(
+      --checkpoint "sufficiency_only-step$step=$run_root/deepmath_t0.7_g0_c0_lora_r16/checkpoint-$step"
+      --compare "sufficiency_only-step$step=full-step$step"
+      --compare "full-step$step=sufficiency_only-step$step"
+      --compare "no_length-step$step=sufficiency_only-step$step"
+      --compare "no_transfer-step$step=sufficiency_only-step$step"
+    )
+  fi
 done
 
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-0}"

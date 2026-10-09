@@ -171,7 +171,7 @@ class CompositeHintRewardTest(unittest.TestCase):
 
 class ConstrainedHintRewardTest(unittest.TestCase):
     def test_ablations_remove_only_requested_reward_term_and_keep_measurements(self):
-        for cost_coef, gamma in [(1.0, 0.0), (0.0, 6.0)]:
+        for cost_coef, gamma in [(1.0, 0.0), (0.0, 6.0), (0.0, 0.0)]:
             with self.subTest(cost_coef=cost_coef, gamma=gamma):
                 backend = FakeBackend(sufficiency=0.75, transfer=0.2)
                 reward = ConstrainedHintReward(ConstrainedHintRewardConfig(
@@ -197,6 +197,15 @@ class ConstrainedHintRewardTest(unittest.TestCase):
     def test_zero_transfer_weight_is_invariant_to_measured_transfer(self):
         self.assertEqual(constrained_reward(.75, .2, .01, .7, 0, 2),
                          constrained_reward(.75, .2, 100, .7, 0, 2))
+
+    def test_sufficiency_only_rewards_success_independently_of_both_costs(self):
+        low_cost = constrained_reward(.75, .01, .001, .7, 0, 2, length_cost_coef=0)
+        high_cost = constrained_reward(.75, 1, 100, .7, 0, 2, length_cost_coef=0)
+        better_success = constrained_reward(1, 1, 100, .7, 0, 2, length_cost_coef=0)
+        self.assertEqual(low_cost, high_cost)
+        self.assertAlmostEqual(better_success - high_cost, .5)
+        # Preserve the existing projected-dual behavior, including zero lambda.
+        self.assertEqual(constrained_reward(1, 1, 100, .7, 0, 0, length_cost_coef=0), 0)
 
     def test_length_coefficient_resume_compatibility(self):
         original = ConstrainedHintReward(ConstrainedHintRewardConfig(model="m", dataset="d"), FakeBackend())

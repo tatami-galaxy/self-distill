@@ -21,6 +21,13 @@ PANELS = (
 )
 
 
+def default_arm_specs(summary):
+    specs = ["full=full", "no_transfer=no_transfer", "no_length=no_length"]
+    if any(label.startswith("sufficiency_only-step") for label in summary["generator_order"]):
+        specs.append("sufficiency_only=sufficiency_only")
+    return specs
+
+
 def collect_series(summary, arm_specs):
     if "pass@1" not in summary["no_hint_self_teacher"]:
         raise ValueError("Ablation plots require an evaluation with --k 1 (optionally other k values)")
@@ -179,7 +186,7 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     summary = json.loads(args.summary.read_text())
-    specs = args.arm or ["full=full", "no_transfer=no_transfer", "no_length=no_length"]
+    specs = args.arm or default_arm_specs(summary)
     arms = collect_series(summary, specs)
     plot(summary, arms, args.reference, args.output_dir or args.summary.parent / "ablations")
 

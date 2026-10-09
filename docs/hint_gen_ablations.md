@@ -8,13 +8,15 @@ C(h) = generated_hint_tokens / hint_budget
 lambda <- clip(lambda + dual_lr * (tau - mean(S)), 0, dual_max)
 ```
 
-Sufficiency remains active in every arm. The two ablations remove one penalty:
+Sufficiency remains active in every arm. The four arms complete a 2×2 ablation
+of the explicit length and transfer penalties:
 
 | Arm | `--length-cost-coef` | `--gamma` |
 | --- | --- | --- |
 | Full objective | 1 | 6 |
 | No transfer penalty | 1 | 0 |
 | No length penalty | 0 | 6 |
+| Sufficiency only | 0 | 0 |
 
 All components are still measured during training, including transfer at gamma=0.
 The no-length arm retains the 128-token hard cap and the original brief-hint prompt:
@@ -60,11 +62,41 @@ CUDA_VISIBLE_DEVICES=4 VLLM_USE_V2_MODEL_RUNNER=0 \
   --teacher-gpu-memory-utilization 0.8 --teacher-max-num-seqs 32
 ```
 
+## Train sufficiency only
+
+Set both coefficients to zero, preserving tau, the adaptive multiplier, validity
+rules, and the other training settings. This starts a fresh LoRA run from the base
+model. Repeat with `ablation_model=Qwen3-4B` for the larger model.
+
+```sh
+ablation_model=Qwen3-1.7B
+CUDA_VISIBLE_DEVICES=4 VLLM_USE_V2_MODEL_RUNNER=0 \
+.venv/bin/python -m train.opsd.train_hint_gen.train_constrained_hint_gen \
+  --model "Qwen/$ablation_model" --dataset deepmath \
+  --tau 0.7 --gamma 0 --length-cost-coef 0 --hint-budget 128 \
+  --use-lora --lora-r 16 --lora-alpha 32 --lora-dropout 0 \
+  --learning-rate 1e-5 --max-steps 100 --save-steps 10 --seed 42 \
+  --num-generations 8 --per-device-train-batch-size 1 --gradient-accumulation-steps 4 \
+  --dual-init 1 --dual-lr 0.05 --dual-max 20 \
+  --teacher-backend vllm --teacher-gpu 5 \
+  --teacher-rollouts 4 --transfer-rollouts 4 \
+  --teacher-max-completion-length 8192 --teacher-temperature 1 --teacher-top-k 20 \
+  --teacher-gpu-memory-utilization 0.8 --teacher-max-num-seqs 32
+```
+
+For valid hints the reward is now `lambda * (S - tau)`. Length and transfer are
+still measured but do not affect this reward. Invalid hints keep the existing
+relative penalty and count as zero sufficiency in the dual update. The hard
+128-token cap and brief-hint prompt remain. This is an ablation of the constrained
+objective, not a change to fixed-weight accuracy maximization: lambda can reach
+zero, at which point valid hints have equal rewards until the dual rises again.
+
 Default run directories under `/mnt/data/ujan/self-distill/outputs/hint_gen/<model>/`:
 
 - Full: `deepmath_t0.7_g6_lora_r16` (existing baseline).
 - No transfer: `deepmath_t0.7_g0_lora_r16`.
 - No length: `deepmath_t0.7_g6_c0_lora_r16`.
+- Sufficiency only: `deepmath_t0.7_g0_c0_lora_r16`.
 
 The default length coefficient is one, preserving the old objective and output
 names. Run metadata and dual state record the coefficient; incompatible resumes
@@ -89,13 +121,42 @@ CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-1.7B
 CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-4B
 ```
 
+To add the sufficiency-only checkpoints, use the same output directory and
+evaluation settings with `--include-sufficiency-only`:
+
+```sh
+CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-1.7B \
+  --include-sufficiency-only
+CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-4B \
+  --include-sufficiency-only
+```
+
+This reuses the frozen cohort, old hints and condition scores, and shared controls;
+only the new generator arm needs inference. The joint summary and figures are
+rebuilt for all four arms. Keep the flag on subsequent invocations to retain that
+four-arm view; omitting it rebuilds the original three-arm view without deleting
+the cached sufficiency-only data. All selected checkpoints must exist.
+
+Additional paired contrasts compare sufficiency-only against full, and each of
+the original arms against sufficiency-only. In particular, `no_length` versus
+`sufficiency_only` isolates adding transfer pressure when length cost is absent;
+`no_transfer` versus `sufficiency_only` isolates adding length pressure when
+transfer cost is absent. To plot those contrasts instead of differences from full:
+
+```sh
+.venv/bin/python -m eval.viz.hint_gen_ablations \
+  --summary results/hint_gen_ablations/Qwen3-1.7B/seed42/summary.json \
+  --reference sufficiency_only \
+  --output-dir results/hint_gen_ablations/Qwen3-1.7B/seed42/versus_sufficiency_only
+```
+
 Outputs default to `results/hint_gen_ablations/<model>/seed42/`. The wrapper uses
 the same 64-question, four-hint, four-teacher-rollout settings described above,
 and defaults `VLLM_USE_V2_MODEL_RUNNER` to 0 unless already set. GPU visibility is
 inherited from the caller. It stops on evaluation failure before plotting.
 
 Use `--steps` to change the matched checkpoints, `--run-root` to change the
-directory containing the three runs, and `--output-dir` to choose another result
+directory containing the training runs, and `--output-dir` to choose another result
 directory. Other evaluator options are forwarded. For example:
 
 ```sh
@@ -106,8 +167,9 @@ CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-4B \
 ```
 
 `--dry-run` prints the evaluation and plotting commands without running them.
-Include step 10 only if available in all three runs. Evaluate one model size and
+Include step 10 only if available in every selected run. Evaluate one model size and
 training seed per summary. The plotter expects `PREFIX-stepN` labels;
+The default plotter includes sufficiency-only automatically when present;
 custom prefixes can be supplied with repeated `--arm NAME=PREFIX` and
 `--reference NAME`. It checks matched steps, training seeds, targets, and budgets.
 
@@ -144,7 +206,7 @@ all-output scores, and lexical validation does not establish semantic secrecy.
 
 Intervals are pointwise and resample questions; independent hint/sample indices
 are not paired outcomes. They do not estimate variation from retraining. Replicate
-all three arms across seeds before making a robustness claim. The default cohort
+all selected arms across seeds before making a robustness claim. The default cohort
 is a training-source diagnostic subset; a held-out study needs an explicitly
 excluded question split. A no-length arm that saturates the token cap motivates a
 separate matched larger-budget experiment, rather than changing just that arm.
