@@ -180,6 +180,88 @@ script command**, retaining all sampling/cohort arguments and checkpoints, with
 only local JSON and optionally reads checkpoint dual states; unavailable dual
 states are displayed as gaps. Existing older summaries need resummarization.
 
+## Rerun with matched initial penalty strength
+
+The original coefficient pair (length=1, transfer=6) gives substantially different
+within-question reward variation. The calibrated experiment fixes length at 1 and
+sets a model-specific transfer weight using **only the fresh-base hints**:
+
+```text
+sigma_C = mean_question std_valid_hints(C), population std (ddof=0)
+sigma_T = mean_question std_valid_hints(max(0, mean_rollout(raw_T)))
+gamma_matched = sigma_C / sigma_T
+```
+
+Both statistics use exactly the same questions, with at least two valid hints each.
+Invalid hints are excluded because training replaces their composite rewards with
+the invalid-output ranking penalty. Transfer averages complete student trajectories
+equally before clamping, matching the trainer. Between-question variation is not
+used: GRPO ranks hints within a question. Coefficients remain fixed during training.
+
+The bundled JSON files in `train/opsd/train_hint_gen/calibrations/` record the
+coefficient, source fingerprints, calibration settings, and eligible group counts:
+
+| Model | Length coefficient | Transfer coefficient | Eligible questions | sigma_C | sigma_T |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3-1.7B | 1 | 39.970506147850585 | 50/64 | 0.164095 | 0.00410540 |
+| Qwen3-4B | 1 | 25.92151878848775 | 64/64 | 0.090045 | 0.00347374 |
+
+This matches **estimated initial reward variation**, not gradient magnitudes or
+signal-to-noise ratios, and does not force equality as the policies change. The
+calibration has four hints per question versus eight in training; 1.7B also loses
+14 groups to insufficient valid hints. Treat these as finite-sample calibration
+estimates. The existing evaluation cohort is now also a calibration cohort, so it
+remains a diagnostic rather than an independent held-out test.
+
+Run the four fresh arms sequentially for each model (change physical GPUs as needed):
+
+```sh
+bash train/opsd/train_hint_gen/run_signal_matched.sh Qwen3-1.7B \
+  --train-gpu 4 --teacher-gpu 5
+bash train/opsd/train_hint_gen/run_signal_matched.sh Qwen3-4B \
+  --train-gpu 4 --teacher-gpu 5
+```
+
+The arms are full `(1, gamma_matched)`, length-only / `no_transfer` `(1, 0)`,
+transfer-only / `no_length` `(0, gamma_matched)`, and sufficiency-only `(0, 0)`.
+All retain the original sufficiency target, dual update, 128-token cap, and training
+recipe (seed 42, 100 steps). Length-only and sufficiency-only repeat the original
+settings. Each run starts from the base model. Outputs go to
+`/mnt/data/ujan/self-distill/outputs/hint_gen/<model>/signal_matched_seed42/<arm>/`;
+each run includes a copy of the frozen calibration alongside its normal metadata.
+
+Use `--dry-run` to inspect commands. Use `--arms full no_length` to select arms,
+for example after completing the other two. The runner checks all selected
+destinations before training and refuses nonempty run directories. `--run-root`
+sets a different parent of the arm directories; `--calibration` selects another
+compatible frozen calibration file. Evaluation expects all four arms to exist.
+
+After training, evaluate matched steps 20, 40, 60, 80, and 100:
+
+```sh
+CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-1.7B --signal-matched
+CUDA_VISIBLE_DEVICES=4,5 bash eval/run_hint_gen_ablations.sh Qwen3-4B --signal-matched
+```
+
+This mode uses a separate `results/hint_gen_ablations/<model>/signal_matched_seed42/`
+directory and includes all four arms automatically. It retains the same evaluation
+sampling settings. Besides the full-objective and sufficiency-only contrasts,
+the summary includes `no_length-stepN_minus_no_transfer-stepN`: the direct
+transfer-only versus length-only comparison. In this mode, `--run-root` is the
+parent containing `full/`, `no_transfer/`, `no_length/`, and `sufficiency_only/`.
+
+To reproduce the calibration without GPU inference:
+
+```sh
+.venv/bin/python -m eval.calibrate_hint_gen_penalties \
+  --results-dir results/hint_gen_ablations/Qwen3-1.7B/seed42 \
+  --output /tmp/Qwen3-1.7B-calibration.json
+```
+
+Repeat with `Qwen3-4B`. Do not recalibrate from trained checkpoints or change the
+coefficient during a run. Compare sufficiency alongside transfer: stronger transfer
+pressure may change constraint attainment even with the same target and dual rule.
+
 ## Read the results
 
 `summary.json` preserves all-output, admissible-only, and difficulty-stratified

@@ -16,6 +16,9 @@ Options:
   --phase PHASE        sweep (default) or summarize; both are followed by plotting.
   --include-sufficiency-only
                        Add the gamma=0, length-cost-coef=0 arm and its contrasts.
+  --signal-matched    Evaluate all four calibrated arms in signal_matched_seed42/.
+                       Uses a separate results directory; --run-root then names
+                       the parent of full/no_transfer/no_length/sufficiency_only.
   --dry-run           Print commands without executing them.
   -h, --help          Show this help.
 
@@ -45,12 +48,16 @@ steps=(20 40 60 80 100)
 phase=sweep
 dry_run=false
 include_sufficiency_only=false
+signal_matched=false
+run_root_set=false
+output_dir_set=false
 extra_options=()
 while (( $# > 0 )); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
     --include-sufficiency-only) include_sufficiency_only=true; shift ;;
+    --signal-matched) signal_matched=true; shift ;;
     --steps)
       shift
       steps=()
@@ -69,8 +76,8 @@ while (( $# > 0 )); do
         exit 2
       fi
       case "$1" in
-        --run-root) run_root="$2" ;;
-        --output-dir) output_dir="$2" ;;
+        --run-root) run_root="$2"; run_root_set=true ;;
+        --output-dir) output_dir="$2"; output_dir_set=true ;;
         --phase) phase="$2" ;;
       esac
       shift 2
@@ -87,18 +94,33 @@ if [[ "$phase" != sweep && "$phase" != summarize ]]; then
   exit 2
 fi
 
+full_run="$run_root/deepmath_t0.7_g6_lora_r16"
+no_transfer_run="$run_root/deepmath_t0.7_g0_lora_r16"
+no_length_run="$run_root/deepmath_t0.7_g6_c0_lora_r16"
+sufficiency_run="$run_root/deepmath_t0.7_g0_c0_lora_r16"
+if "$signal_matched"; then
+  include_sufficiency_only=true
+  if ! "$run_root_set"; then run_root="$run_root/signal_matched_seed42"; fi
+  if ! "$output_dir_set"; then output_dir="$repo_root/results/hint_gen_ablations/$model/signal_matched_seed42"; fi
+  full_run="$run_root/full"
+  no_transfer_run="$run_root/no_transfer"
+  no_length_run="$run_root/no_length"
+  sufficiency_run="$run_root/sufficiency_only"
+fi
+
 checkpoint_options=()
 for step in "${steps[@]}"; do
   checkpoint_options+=(
-    --checkpoint "full-step$step=$run_root/deepmath_t0.7_g6_lora_r16/checkpoint-$step"
-    --checkpoint "no_transfer-step$step=$run_root/deepmath_t0.7_g0_lora_r16/checkpoint-$step"
-    --checkpoint "no_length-step$step=$run_root/deepmath_t0.7_g6_c0_lora_r16/checkpoint-$step"
+    --checkpoint "full-step$step=$full_run/checkpoint-$step"
+    --checkpoint "no_transfer-step$step=$no_transfer_run/checkpoint-$step"
+    --checkpoint "no_length-step$step=$no_length_run/checkpoint-$step"
     --compare "no_transfer-step$step=full-step$step"
     --compare "no_length-step$step=full-step$step"
+    --compare "no_length-step$step=no_transfer-step$step"
   )
   if "$include_sufficiency_only"; then
     checkpoint_options+=(
-      --checkpoint "sufficiency_only-step$step=$run_root/deepmath_t0.7_g0_c0_lora_r16/checkpoint-$step"
+      --checkpoint "sufficiency_only-step$step=$sufficiency_run/checkpoint-$step"
       --compare "sufficiency_only-step$step=full-step$step"
       --compare "full-step$step=sufficiency_only-step$step"
       --compare "no_length-step$step=sufficiency_only-step$step"

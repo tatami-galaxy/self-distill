@@ -399,21 +399,21 @@ else:
 
 # %% -------------------- RLSD BEST-CHECKPOINT TABLES --------------------
 # Best checkpoints are selected on each evaluation dataset itself.
-RLSD_BEST_K = 1  # Choose 1, 8, or 16.
-RLSD_METRIC = f"pass@{RLSD_BEST_K}"
+# Stored pass@1 is the average correctness over the 16 sampled responses.
+RLSD_METRIC = "pass@1"
 RLSD_DATASETS = [AIME_DATASET, "hmmt_feb_2025"]
-if RLSD_BEST_K not in {1, 8, 16}:
-    raise ValueError(f"RLSD_BEST_K must be one of 1, 8, or 16; got {RLSD_BEST_K}")
 
 for eval_dataset in RLSD_DATASETS:
-    rlsd = load_aime(RESULTS / eval_dataset)
-    if not rlsd.empty:
-        rlsd = rlsd.loc[rlsd["algo"].eq("rlsd")].copy()
+    results = load_aime(RESULTS / eval_dataset)
+    if results.empty:
+        print(f"No results yet: {RESULTS / eval_dataset}")
+        continue
+    rlsd = results.loc[results["algo"].eq("rlsd")].copy()
+    base = results.loc[results["algo"].eq("base")].copy()
     if rlsd.empty:
         print(f"No RLSD results yet: {RESULTS / eval_dataset}")
-        continue
-    if RLSD_METRIC not in rlsd or rlsd[RLSD_METRIC].notna().sum() == 0:
-        print(f"No RLSD results with {RLSD_METRIC} for {eval_dataset}.")
+    if RLSD_METRIC not in results:
+        print(f"No avg@16 ({RLSD_METRIC}) results for {eval_dataset}.")
         continue
 
     # Keep distinct PI variants and generator/training runs separate.
@@ -424,21 +424,24 @@ for eval_dataset in RLSD_DATASETS:
         .groupby(["model", "train_dataset", "variant", "run"], dropna=False)
         .head(1)
     )
-    for model, model_results in rlsd_best.groupby("model", sort=True):
+    rlsd_comparison = pd.concat([base, rlsd_best], ignore_index=True)
+    for model, model_results in rlsd_comparison.groupby("model", sort=True):
         table = (
-            model_results.sort_values(["variant", "run", "train_dataset"])
+            model_results.sort_values(["algo", "variant", "run", "train_dataset"])
             .reindex(columns=[
-                "variant", "run", "step", "train_dataset",
-                "pass@1", "pass@8", "pass@16",
+                "algo", "variant", "run", "step", "train_dataset", RLSD_METRIC,
             ])
-            .rename(columns={"step": "checkpoint"})
+            .rename(columns={
+                "algo": "algorithm", "step": "checkpoint", RLSD_METRIC: "avg@16",
+            })
             .reset_index(drop=True)
         )
+        table["algorithm"] = table["algorithm"].replace({"base": "Base", "rlsd": "RLSD"})
         display(
             table.style
-            .set_caption(f"RLSD · {eval_dataset} · {model} — best {RLSD_METRIC}")
-            .format({f"pass@{k}": "{:.3f}" for k in (1, 8, 16)}, na_rep="—")
-            .background_gradient(subset=[RLSD_METRIC], cmap="Blues", vmin=0, vmax=1)
+            .set_caption(f"RLSD · {eval_dataset} · {model} — best avg@16 vs. base")
+            .format({"avg@16": "{:.3f}"}, na_rep="—")
+            .background_gradient(subset=["avg@16"], cmap="Blues", vmin=0, vmax=1)
         )
 
 
